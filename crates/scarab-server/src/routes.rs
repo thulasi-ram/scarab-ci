@@ -726,6 +726,13 @@ fn route_list(routes: Routes) -> Routes {
             &ops::SETTINGS_READ,
             plugins::get_plugin,
         )
+        // ADR-0086 §1: a plugin's endpoint, authenticated by the caller's
+        // `oauth` token for it (`plugin_endpoint`).
+        .post(
+            "/v1/orgs/{org}/plugin-installations/{id}/endpoints/{*endpoint_path}",
+            &ops::PLUGIN_ENDPOINT,
+            crate::plugin_endpoint::plugin_endpoint,
+        )
         .get(
             "/v1/orgs/{org}/plugin-installations/{id}",
             &ops::SETTINGS_READ,

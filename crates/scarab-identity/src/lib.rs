@@ -355,6 +355,14 @@ pub trait SessionStore: Send + Sync {
 /// "this is a Scarab credential, and it is loose".
 pub const API_TOKEN_PREFIX: &str = "scarab_pat_";
 
+/// The prefix of an `oauth` PrincipalToken's access secret (ADR-0086 §6):
+/// accepted only at the one Plugin endpoint it was granted for, never on the
+/// core routes.
+pub const OAUTH_ACCESS_TOKEN_PREFIX: &str = "scarab_oat_";
+
+/// The prefix of an OAuth grant's refresh secret (ADR-0086 §6).
+pub const OAUTH_REFRESH_TOKEN_PREFIX: &str = "scarab_ort_";
+
 /// How long a token may be issued for, in days. An expiry is **mandatory**
 /// (see [`PrincipalToken`]); this only bounds how far out it may be pushed.
 pub const MAX_API_TOKEN_DAYS: u32 = 365;

@@ -1357,6 +1357,21 @@ pub static TOKEN_MINT_OWN: Op = op(
     &["body:/org", "body:/project", "body:/name"],
 )
 .not_by_token();
+// The endpoint extension point (ADR-0086 §1): a caller's own `oauth` token
+// for that endpoint authenticates it, never a session or an issued token.
+pub static PLUGIN_ENDPOINT: Op = op(
+    "plugin.endpoint",
+    "Call a plugin's endpoint",
+    Class::NotGoverned(
+        "the caller's oauth token for this endpoint is the authority, held to the operations \
+         it was granted; nothing it does can raise or satisfy a step-up",
+    ),
+    "ADR-0086 §1-§2",
+    ANYONE,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:id", "path:endpoint_path"],
+);
 pub static PLUGIN_FETCH: Op = op(
     "plugin.fetch",
     "Fetch a plugin manifest to review",

@@ -762,6 +762,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "repo.dispatch",
         "NG",
     ),
+    (
+        "POST",
+        "/v1/orgs/{org}/plugin-installations/{id}/endpoints/{*endpoint_path}",
+        "plugin.endpoint",
+        "NG",
+    ),
     ("POST", "/webhooks/github", "webhook.github", "NG"),
     ("POST", "/webhooks/forgejo", "webhook.forgejo", "NG"),
 ];
@@ -916,7 +922,7 @@ fn route_table_equals_the_openapi_spec() {
         .map(|r| {
             (
                 r.method.as_str().to_ascii_lowercase(),
-                r.path.replace("{*name}", "{name}"),
+                r.path.replace("{*", "{"),
             )
         })
         .collect();

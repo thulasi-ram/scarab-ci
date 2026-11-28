@@ -106,6 +106,7 @@ pub mod people;
 /// ADR-0072: PluginInstallations — fetch a manifest to review, install,
 /// uninstall and the kill switch.
 pub mod plugin_api;
+pub mod plugin_endpoint;
 pub mod plugin_gates;
 /// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
 /// baseline, isolation probe, one workload per installation.
@@ -257,6 +258,12 @@ pub struct AppState {
     /// bound destination that is or resolves to loopback is refused. Only a
     /// test whose fake upstream listens on 127.0.0.1 turns it on.
     pub broker_upstream_loopback_allowed: bool,
+    /// The endpoint's request limits on this replica (ADR-0086 §4).
+    pub plugin_endpoint_limits: Arc<plugin_endpoint::PluginEndpointLimits>,
+    /// Tests only: the base URL every installation's endpoint Service is
+    /// reached at, instead of its Service in the plugin namespace. Never set
+    /// from configuration.
+    pub plugin_endpoint_upstream_override: Option<String>,
     /// Proves who calls the broker (ADR-0072 §11): TokenReview in production
     /// (slice d2), static dev tokens under `SCARAB_DEV_INSECURE`. `None` makes
     /// every authenticated broker call a 401 — nothing proven, nothing taken.
@@ -460,6 +467,8 @@ impl AppState {
             delegated_calls: None,
             broker_journal_queue: broker_proxy::JOURNAL_QUEUE,
             broker_upstream_loopback_allowed: false,
+            plugin_endpoint_limits: Arc::default(),
+            plugin_endpoint_upstream_override: None,
             plugin_tokens: None,
             plugin_api_tokens: None,
             plugin_policy: Arc::new(plugins::PluginPolicy::off()),
@@ -680,6 +689,14 @@ impl AppState {
     /// small pool — instead of [`Self::with_plugins`]'s.
     pub fn with_broker_plugin_store(mut self, store: Arc<dyn scarab_plugin::PluginStore>) -> Self {
         self.broker_plugins = Some(store);
+        self
+    }
+
+    /// Reach every installation's endpoint at `base` instead of its Service:
+    /// for a test whose fake Plugin listens on the host. Never set by
+    /// configuration.
+    pub fn with_plugin_endpoint_upstream(mut self, base: impl Into<String>) -> Self {
+        self.plugin_endpoint_upstream_override = Some(base.into());
         self
     }
 
@@ -17518,6 +17535,7 @@ impl utoipa::Modify for StepUpResponses {
         mint_api_token,
         list_api_tokens,
         revoke_api_token,
+        plugin_endpoint::plugin_endpoint,
         mint_own_api_token,
         list_own_api_tokens,
         revoke_own_api_token,
