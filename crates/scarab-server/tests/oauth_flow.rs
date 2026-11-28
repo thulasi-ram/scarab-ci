@@ -160,6 +160,9 @@ fn form_field(body: &str, name: &str) -> Option<String> {
 }
 
 async fn provider(id_token: Option<IdToken>) -> Provider {
+    // Generate the RSA keys now, off the runtime, so the first `/token` request
+    // does not pay for them while the server under test waits on its timeout.
+    tokio::task::spawn_blocking(keys).await.unwrap();
     // Bind first: the issuer URL is part of the id_token the same server signs.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -388,10 +391,17 @@ async fn api_login(app: &axum::Router, code: &str) -> axum::response::Response {
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    serde_json::from_slice(&bytes).unwrap()
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        let n = bytes.len().min(300);
+        panic!(
+            "response body is not JSON (status {status}, {e}): {}",
+            String::from_utf8_lossy(&bytes[..n])
+        )
+    })
 }
 
 /// Whether the session may write: `Owner` creates the run, a `Viewer` is
