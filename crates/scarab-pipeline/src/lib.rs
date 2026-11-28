@@ -827,7 +827,9 @@ pub struct StepSpec {
     pub forge_token: Option<ForgeToken>,
     /// The Step receives the Run's registry credential (ADR-0018, amendment
     /// of 2026-11-12): resolved when each Attempt launches from the
-    /// `REGISTRY_AUTH` secret (Repo scope, then Org scope), else the
+    /// `REGISTRY_AUTH` secret (a Step that the Environment admits, approved
+    /// or with no approvers, uses the Run's Environment chain; any other Step
+    /// uses the repository default, then the org default), else the
     /// credential the forge derives for its own registry, and mounted as a
     /// dockerconfigjson at `/scarab/registry/config.json` with
     /// `DOCKER_CONFIG` pointing at it. Never an environment variable. A
@@ -1255,7 +1257,19 @@ pub enum OriginKind {
     /// The Environment approval gate an Environment added to the Run
     /// (ADR-0078 §2): `name` is the Environment, `content_hash` is empty.
     Environment,
+    /// The Run-start approval gate the org's Fork Run approval setting adds
+    /// in front of every root Step of a Run of fork code (ADR-0086 §9): a
+    /// `manual` gate, `name` is the setting that applied, `content_hash` is
+    /// empty. It is never an Environment approval gate
+    /// ([`StepSpec::counts_as_environment_approval_gate`]). This release
+    /// only reads it, so that it can load and hold such a Run created by a
+    /// later release; nothing here writes it.
+    ForkRunApprovalGate,
 }
+
+/// The wire name of [`OriginKind::ForkRunApprovalGate`], for code that reads
+/// a stored IR as JSON.
+pub const FORK_RUN_APPROVAL_GATE_KIND: &str = "fork_run_approval_gate";
 
 /// One link of a compiled Step's [`origin`](StepSpec::origin).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1295,9 +1309,20 @@ impl StepSpec {
     /// **Environment approval gate** (ADR-0078 §1): a `manual` gate that Run
     /// creation marked one, or left unmarked. A gate is unmarked only in a
     /// Run created before the mark existed, when every `manual` gate of a
-    /// governed Run needed the approvers, so it counts as one.
+    /// governed Run needed the approvers, so it counts as one. A Fork Run
+    /// approval gate never counts, whatever its mark.
     pub fn counts_as_environment_approval_gate(&self) -> bool {
-        self.gate.as_deref() == Some("manual") && self.environment_approval_gate != Some(false)
+        self.gate.as_deref() == Some("manual")
+            && self.environment_approval_gate != Some(false)
+            && !self.is_fork_run_approval_gate()
+    }
+
+    /// Whether this Step is the Run-start approval gate Fork Run approval
+    /// added ([`OriginKind::ForkRunApprovalGate`]).
+    pub fn is_fork_run_approval_gate(&self) -> bool {
+        self.origin
+            .iter()
+            .any(|link| link.kind == OriginKind::ForkRunApprovalGate)
     }
 
     /// Is this an image-less invoke step (a compile-time library inline point)?
@@ -10498,6 +10523,51 @@ mod tests {
         let errs = errors("steps: [{ id: a, gate: manual, environment_approval_gate: false }]");
         let refused = "step `a`: `environment_approval_gate` is written by the compiler";
         assert!(errs.iter().any(|e| e.contains(refused)), "{errs:?}");
+    }
+
+    /// A Run IR written by the release that adds Fork Run approval (ADR-0086
+    /// §9) loads here: `OriginEntry` is strict, so without the kind the whole
+    /// IR is refused and the Run cannot be read after a rollback. Its gate
+    /// is never an Environment approval gate, marked or not; a gate added by
+    /// an Environment, or one with no origin, still counts when unmarked.
+    #[test]
+    fn a_fork_run_approval_gate_decodes_and_is_never_an_environment_approval_gate() {
+        let gate = |kind: Option<&str>, mark: Option<bool>| -> StepSpec {
+            let mut step = json!({ "id": "g", "gate": "manual" });
+            if let Some(kind) = kind {
+                step["origin"] = json!([{ "kind": kind, "name": "n", "content_hash": "" }]);
+            }
+            if let Some(mark) = mark {
+                step["environment_approval_gate"] = json!(mark);
+            }
+            let ir =
+                json!({ "steps": [step, { "id": "ship", "image": "busybox", "needs": ["g"] }] });
+            let ir: PipelineIr = serde_json::from_value(ir)
+                .unwrap_or_else(|e| panic!("kind {kind:?} mark {mark:?}: {e}"));
+            ir.steps[0].clone()
+        };
+        // (origin kind, mark, is the fork gate, counts as an Environment approval gate)
+        for (kind, mark, fork, counts) in [
+            (Some("fork_run_approval_gate"), None, true, false),
+            (Some("fork_run_approval_gate"), Some(true), true, false),
+            (Some("fork_run_approval_gate"), Some(false), true, false),
+            (Some("environment"), None, false, true),
+            (None, None, false, true),
+            (None, Some(false), false, false),
+        ] {
+            let g = gate(kind, mark);
+            assert_eq!(g.is_fork_run_approval_gate(), fork, "{kind:?} {mark:?}");
+            assert_eq!(
+                g.counts_as_environment_approval_gate(),
+                counts,
+                "{kind:?} {mark:?}"
+            );
+        }
+        // The const code reads a stored IR with is the kind's wire name.
+        assert_eq!(
+            serde_json::to_value(OriginKind::ForkRunApprovalGate).unwrap(),
+            json!(FORK_RUN_APPROVAL_GATE_KIND)
+        );
     }
 
     #[test]

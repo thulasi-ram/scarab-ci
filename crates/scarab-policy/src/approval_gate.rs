@@ -16,12 +16,15 @@ use crate::run_create::uses_environment_authority;
 /// already has it, this id with `-2`, `-3`, ... appended.
 pub const ADDED_GATE_ID: &str = "environment-approval";
 
+/// A `manual` gate that can be an Environment approval gate: any but the
+/// Run-start approval gate Fork Run approval adds, which is never one and
+/// does not count as the `manual` gate upstream of a Step (ADR-0086 §9).
 fn is_manual_gate(s: &StepSpec) -> bool {
-    s.gate.as_deref() == Some("manual")
+    s.gate.as_deref() == Some("manual") && !s.is_fork_run_approval_gate()
 }
 
 /// Whether a `gate: manual` is upstream of Step `step` of `ir`, through
-/// `needs`, transitively.
+/// `needs`, transitively. A Fork Run approval gate does not count.
 pub fn manual_gate_upstream(ir: &PipelineIr, step: &str) -> bool {
     let by_id: HashMap<&str, &StepSpec> = ir.steps.iter().map(|s| (s.id.as_str(), s)).collect();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -107,10 +110,15 @@ pub fn environment_approval_gates(ir: &PipelineIr) -> Vec<String> {
 /// Mark each `manual` gate of `ir` with whether it is an Environment
 /// approval gate ([`StepSpec::environment_approval_gate`]), for a Run that
 /// an Environment governs. Run creation calls it once; the mark is stored
-/// with the Run and never decided again.
+/// with the Run and never decided again. A Fork Run approval gate is marked
+/// `false`.
 pub fn mark_environment_approval_gates(ir: &mut PipelineIr) {
     let approval: BTreeSet<String> = environment_approval_gates(ir).into_iter().collect();
-    for s in ir.steps.iter_mut().filter(|s| is_manual_gate(s)) {
+    for s in ir
+        .steps
+        .iter_mut()
+        .filter(|s| s.gate.as_deref() == Some("manual"))
+    {
         s.environment_approval_gate = Some(approval.contains(&s.id));
     }
 }
@@ -406,5 +414,83 @@ steps:
         assert!(manual_gate_upstream(&ir, "b"));
         assert!(!manual_gate_upstream(&ir, "c"));
         assert!(!manual_gate_upstream(&ir, "approve"));
+    }
+
+    /// The gate Fork Run approval puts in front of a Run of fork code
+    /// (ADR-0086 §9) is released by anyone with write on the repository, so
+    /// it never stands in for the Environment's approval: an authority Step
+    /// behind it alone still misses its gate and gets the Environment's, the
+    /// fork gate is marked `false`, and it is not one of a Step's upstream
+    /// approval gates even unmarked. Behind a plain `manual` gate as well,
+    /// the Step is gated as before.
+    #[test]
+    fn a_fork_run_approval_gate_is_never_the_environments_gate() {
+        let fork_gate = |ir: &mut PipelineIr| {
+            let g = ir.steps.iter_mut().find(|s| s.id == "fork").unwrap();
+            g.origin = vec![OriginEntry {
+                kind: OriginKind::ForkRunApprovalGate,
+                name: "fork_run_approval".into(),
+                source: None,
+                content_hash: String::new(),
+            }];
+        };
+        // (pipeline, the Step that uses the authority is missing its gate)
+        for (yaml, missing) in [
+            (
+                r#"
+environment: prod
+steps:
+  - { id: fork, gate: manual }
+  - { id: ship, image: busybox, secrets: [TOKEN], needs: [fork] }
+"#,
+                true,
+            ),
+            (
+                r#"
+environment: prod
+steps:
+  - { id: fork, gate: manual }
+  - { id: approve, gate: manual, needs: [fork] }
+  - { id: ship, image: busybox, secrets: [TOKEN], needs: [approve] }
+"#,
+                false,
+            ),
+        ] {
+            let mut ir = ir(yaml);
+            fork_gate(&mut ir);
+            assert!(step(&ir, "fork").is_fork_run_approval_gate());
+
+            // A Run created before the mark existed: the fork gate unmarked.
+            assert!(
+                upstream_approval_gates(&ir, "ship")
+                    .iter()
+                    .all(|g| g.id != "fork"),
+                "{yaml}"
+            );
+            assert_eq!(manual_gate_upstream(&ir, "ship"), !missing, "{yaml}");
+            assert_eq!(
+                steps_missing_approval_gate(&ir, &[]),
+                if missing {
+                    vec!["ship".to_string()]
+                } else {
+                    vec![]
+                },
+                "{yaml}"
+            );
+
+            mark_environment_approval_gates(&mut ir);
+            assert_eq!(step(&ir, "fork").environment_approval_gate, Some(false));
+            assert!(!environment_approval_gates(&ir).contains(&"fork".to_string()));
+            if !missing {
+                assert_eq!(step(&ir, "approve").environment_approval_gate, Some(true));
+            }
+
+            let added = add_environment_approval_gate(&mut ir, "prod", None, &[]);
+            assert_eq!(
+                added.map(|a| a.fronts),
+                missing.then(|| vec!["ship".to_string()]),
+                "{yaml}"
+            );
+        }
     }
 }

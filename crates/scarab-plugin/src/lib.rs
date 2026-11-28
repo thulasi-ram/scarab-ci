@@ -263,6 +263,17 @@ pub struct PluginManifest {
     /// does not change.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub gates: BTreeMap<String, GateDefinition>,
+    /// Where core calls this Plugin, as a later release declares it
+    /// (ADR-0086 §1). This release does not act on it: it decodes and keeps
+    /// it, from any format a manifest is read in, so an installation a later
+    /// release made still reads after a rollback; gives the Plugin no
+    /// endpoint and no trust tier for it; and refuses to install or upgrade
+    /// to a manifest that has it ([`admit_for_mmp`]), so it never hashes
+    /// one. Absent from a manifest that has none, so the SHA-256 of every
+    /// other manifest does not change. A JSON value: the store keeps the
+    /// manifest as JSONB, which keeps neither key order nor layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<serde_json::Value>,
 }
 
 impl PluginManifest {
@@ -611,6 +622,13 @@ pub fn image_repository(image: &str) -> &str {
 /// caller having validated first.
 pub fn admit_for_mmp(manifest: &PluginManifest) -> Result<(), PluginError> {
     manifest.validate()?;
+    if manifest.extensions.is_some() {
+        return Err(PluginError::InvalidManifest(
+            "the manifest declares `extensions`, which this Scarab release does not support; \
+             install or upgrade it on a release that does"
+                .into(),
+        ));
+    }
     let refused: Vec<&str> = manifest
         .capabilities
         .iter()
@@ -945,7 +963,42 @@ mod tests {
             }],
             config_keys: vec!["ARGOCD_UI_URL".into()],
             gates: BTreeMap::new(),
+            extensions: None,
         }
+    }
+
+    /// A manifest a later release wrote with `extensions` decodes the way
+    /// the store reads it (a JSON value from JSONB) and from text, keeps the
+    /// field when written back, validates and is refused at admission. A
+    /// manifest without it writes no `extensions` key, so its SHA-256 (over
+    /// what serde writes) is what it was.
+    #[test]
+    fn extensions_from_a_later_release_are_kept_and_not_admitted() {
+        let base = serde_json::to_string(&argo_like()).unwrap();
+        assert!(!base.contains("extensions"), "{base}");
+        let back: PluginManifest = serde_json::from_str(&base).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), base);
+
+        let extensions = serde_json::json!([
+            { "point": "endpoint", "path": "mcp", "operations": { "call": { "method": "POST" } } }
+        ]);
+        let mut row = serde_json::to_value(argo_like()).unwrap();
+        row["extensions"] = extensions.clone();
+        // As `installation_from_row` decodes the manifest column.
+        let stored: PluginManifest = serde_json::from_value(row.clone()).unwrap();
+        assert_eq!(stored.extensions.as_ref(), Some(&extensions));
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            row,
+            "kept when written back"
+        );
+        let from_text: PluginManifest = serde_json::from_str(&row.to_string()).unwrap();
+        assert_eq!(from_text, stored);
+        assert_eq!(stored.validate(), Ok(()));
+        assert!(
+            matches!(admit_for_mmp(&stored), Err(PluginError::InvalidManifest(e)) if e.contains("extensions")),
+            "a manifest with extensions is not installed by this release"
+        );
     }
 
     #[test]

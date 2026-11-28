@@ -12,8 +12,9 @@
 
 use std::collections::BTreeMap;
 
-use scarab_engine::{Db, RunId};
+use scarab_engine::{Db, EventPayload, RunId};
 use scarab_forge::{PullRequestOrigin, RepoRef};
+use scarab_project::EnvironmentProtectionRules;
 use scarab_server::{dispatch_run, AdmissionPorts, DispatchError, DispatchKind};
 use scarab_testkit::{FakeClock, FakeForge, InMemoryDb, InMemoryEnvironmentGovernance};
 
@@ -51,7 +52,16 @@ async fn dispatch(
     db: &InMemoryDb,
     git_ref: &str,
 ) -> Result<RunId, DispatchError> {
-    let envs = prod();
+    dispatch_into(forge, db, git_ref, prod()).await
+}
+
+/// [`dispatch`] into the Environment store `envs`.
+async fn dispatch_into(
+    forge: &FakeForge,
+    db: &InMemoryDb,
+    git_ref: &str,
+    envs: InMemoryEnvironmentGovernance,
+) -> Result<RunId, DispatchError> {
     dispatch_run(
         forge,
         db,
@@ -75,6 +85,30 @@ async fn locked_out(db: &InMemoryDb, run: &RunId) -> bool {
         .unwrap()
         .expect("prod governs the Run")
         .locked_out
+}
+
+/// The ref the dispatched Run records, which `allowed_refs` matches.
+async fn recorded_ref(db: &InMemoryDb, run: &RunId) -> String {
+    db.run_deploy_context(run)
+        .await
+        .unwrap()
+        .expect("prod governs the Run")
+        .git_ref
+}
+
+/// The commit the dispatched Run is pinned to.
+async fn pinned_sha(db: &InMemoryDb, run: &RunId) -> String {
+    db.events(run)
+        .await
+        .unwrap()
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventPayload::Raw(v) if v.get("trigger").is_some() => {
+                v["trigger"]["event"]["sha"].as_str().map(str::to_string)
+            }
+            _ => None,
+        })
+        .expect("a trigger event was recorded")
 }
 
 #[tokio::test]
@@ -235,4 +269,148 @@ async fn a_forge_that_cannot_say_refuses_the_dispatch() {
         db.list_runs(100).await.unwrap().is_empty(),
         "no Run is created"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The ref a dispatch records (git-bug 879300d)
+// ---------------------------------------------------------------------------
+
+/// A bare name that only a branch has is recorded as that branch, at its
+/// commit.
+#[tokio::test]
+async fn a_bare_name_that_is_only_a_branch_records_the_branch() {
+    let forge = FakeForge::new()
+        .with_file(".scarab/deploy.yaml", DEPLOY_YAML)
+        .with_branch("release/1", HEAD)
+        .with_tag("v1", FORK);
+    let db = InMemoryDb::new();
+
+    let run = dispatch(&forge, &db, "release/1").await.expect("dispatch");
+    assert_eq!(recorded_ref(&db, &run).await, "refs/heads/release/1");
+    assert_eq!(pinned_sha(&db, &run).await, HEAD);
+}
+
+/// A bare name that only a tag has is recorded as that tag, at its commit.
+/// Before the fix it was recorded as `refs/heads/<name>`, so a tag a writer
+/// made on their own commit passed `allowed_refs` for a branch glob.
+#[tokio::test]
+async fn a_bare_name_that_is_only_a_tag_records_the_tag() {
+    let forge = FakeForge::new()
+        .with_file(".scarab/deploy.yaml", DEPLOY_YAML)
+        .with_branch("main", HEAD)
+        .with_tag("release/evil", FORK);
+    let db = InMemoryDb::new();
+
+    let run = dispatch(&forge, &db, "release/evil")
+        .await
+        .expect("dispatch");
+    assert_eq!(recorded_ref(&db, &run).await, "refs/tags/release/evil");
+    assert_eq!(pinned_sha(&db, &run).await, FORK);
+
+    let branches_only = InMemoryEnvironmentGovernance::new().with_project_overlay(
+        "acme",
+        "web",
+        "prod",
+        EnvironmentProtectionRules {
+            allowed_refs: vec!["refs/heads/release/*".to_string()],
+            ..Default::default()
+        },
+    );
+    let db = InMemoryDb::new();
+    let err = dispatch_into(&forge, &db, "release/evil", branches_only)
+        .await
+        .expect_err("a tag does not pass a branch glob");
+    match err {
+        DispatchError::RefNotAllowed(r) => assert_eq!(r, "refs/tags/release/evil"),
+        other => panic!("expected RefNotAllowed, got {other}"),
+    }
+    assert!(db.list_runs(100).await.unwrap().is_empty(), "no Run");
+}
+
+/// A bare name that is both a branch and a tag is refused, and the message
+/// names both full refs.
+#[tokio::test]
+async fn a_bare_name_that_is_both_a_branch_and_a_tag_is_refused() {
+    let forge = FakeForge::new()
+        .with_file(".scarab/deploy.yaml", DEPLOY_YAML)
+        .with_branch("main", HEAD)
+        .with_tag("main", FORK);
+    let db = InMemoryDb::new();
+
+    let err = dispatch(&forge, &db, "main").await.expect_err("ambiguous");
+    assert!(
+        matches!(&err, DispatchError::AmbiguousRef(name) if name == "main"),
+        "got {err}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("refs/heads/main") && message.contains("refs/tags/main"),
+        "{message}"
+    );
+    assert!(db.list_runs(100).await.unwrap().is_empty(), "no Run");
+
+    // The full refs pick one each.
+    let forge = forge
+        .with_commit("refs/heads/main", HEAD)
+        .with_commit("refs/tags/main", FORK);
+    let run = dispatch(&forge, &db, "refs/heads/main")
+        .await
+        .expect("dispatch");
+    assert_eq!(recorded_ref(&db, &run).await, "refs/heads/main");
+    assert_eq!(pinned_sha(&db, &run).await, HEAD);
+    let run = dispatch(&forge, &db, "refs/tags/main")
+        .await
+        .expect("dispatch");
+    assert_eq!(recorded_ref(&db, &run).await, "refs/tags/main");
+    assert_eq!(pinned_sha(&db, &run).await, FORK);
+}
+
+/// `HEAD` is recorded as the default branch the forge reports, not as
+/// `refs/heads/HEAD`.
+#[tokio::test]
+async fn head_records_the_default_branch() {
+    let forge = FakeForge::new()
+        .with_file(".scarab/deploy.yaml", DEPLOY_YAML)
+        .with_branch("trunk", HEAD);
+    forge.set_default_branch("trunk");
+    let db = InMemoryDb::new();
+
+    let run = dispatch(&forge, &db, "HEAD").await.expect("dispatch");
+    assert_eq!(recorded_ref(&db, &run).await, "refs/heads/trunk");
+    assert_eq!(pinned_sha(&db, &run).await, HEAD);
+}
+
+/// A fully-qualified branch or tag the repository does not have is refused,
+/// not recorded as fork code.
+#[tokio::test]
+async fn a_full_ref_the_repository_does_not_have_is_refused() {
+    let forge = FakeForge::new()
+        .with_file(".scarab/deploy.yaml", DEPLOY_YAML)
+        .with_branch("main", HEAD)
+        .with_tag("v1", HEAD);
+    let db = InMemoryDb::new();
+    for missing in ["refs/heads/gone", "refs/tags/v2"] {
+        let err = dispatch(&forge, &db, missing)
+            .await
+            .expect_err("no such ref");
+        assert!(
+            matches!(&err, DispatchError::RefNotFound(r) if r == missing),
+            "{missing}: got {err}"
+        );
+    }
+    assert!(db.list_runs(100).await.unwrap().is_empty(), "no Run");
+}
+
+/// The typed ref is trimmed before it is looked up and recorded.
+#[tokio::test]
+async fn a_typed_ref_is_trimmed() {
+    let forge = FakeForge::new()
+        .with_file(".scarab/deploy.yaml", DEPLOY_YAML)
+        .with_branch("release/1", HEAD);
+    let db = InMemoryDb::new();
+    let run = dispatch(&forge, &db, "  release/1\n")
+        .await
+        .expect("dispatch");
+    assert_eq!(recorded_ref(&db, &run).await, "refs/heads/release/1");
+    assert_eq!(pinned_sha(&db, &run).await, HEAD);
 }

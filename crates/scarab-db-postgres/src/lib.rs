@@ -4914,9 +4914,11 @@ fn run_status_str(s: RunStatus) -> &'static str {
 ///   its `failed` steps, the first by the time its row last changed (its
 ///   move to `failed`), then by id.
 /// - `environment_approval_gates`: for a `suspended` run an Environment
-///   governs, the `manual` gates of its stored IR not marked `false`
-///   (as `StepSpec::counts_as_environment_approval_gate` counts them).
+///   governs, the `manual` gates of its stored IR not marked `false` and not
+///   Fork Run approval gates (an `origin` link of that kind, ADR-0086 §9), as
+///   `StepSpec::counts_as_environment_approval_gate` counts them.
 fn run_summaries_sql(page: &str) -> String {
+    let fork = scarab_pipeline::FORK_RUN_APPROVAL_GATE_KIND;
     format!(
         "WITH page AS ({page})
          SELECT r.id, r.status, r.created_at, r.updated_at, r.tenant_org, r.tenant_project,
@@ -4930,7 +4932,12 @@ fn run_summaries_sql(page: &str) -> String {
                           AND jsonb_typeof(r.ir->'steps') = 'array'
                      THEN ARRAY(SELECT s->>'id' FROM jsonb_array_elements(r.ir->'steps') s
                                 WHERE s->>'gate' = 'manual'
-                                  AND s->'environment_approval_gate' IS DISTINCT FROM 'false'::jsonb)
+                                  AND s->'environment_approval_gate' IS DISTINCT FROM 'false'::jsonb
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM jsonb_array_elements(
+                                          CASE WHEN jsonb_typeof(s->'origin') = 'array'
+                                               THEN s->'origin' ELSE '[]'::jsonb END) o
+                                      WHERE o->>'kind' = '{fork}'))
                 END AS environment_approval_gates
          FROM page r
          LEFT JOIN LATERAL (

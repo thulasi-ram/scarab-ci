@@ -37,14 +37,32 @@ steps:
 "#;
 
 /// The slice of the Forgejo REST API the dispatch path touches:
-/// `latest_commit` (commits list) and `read_file_at_ref` (raw contents).
+/// `latest_commit` (commits list), `ref_commit` (one branch) and
+/// `read_file_at_ref` (raw contents).
 /// Everything else (e.g. commit-status posts after the run settles) is
 /// accepted by the fallback.
 async fn fake_forgejo() -> String {
+    use axum::response::IntoResponse;
     async fn commits() -> axum::Json<serde_json::Value> {
         axum::Json(serde_json::json!([
             { "sha": SHA, "commit": { "message": "e2e fixture commit" } }
         ]))
+    }
+    // `GET branches/{name}`: the one branch, `main`, at the fixture commit.
+    // Dispatch looks a bare ref name up as a branch and as a tag; `tags/main`
+    // and every other GET fall through to a 404, so `main` is a branch only.
+    async fn branch(
+        Path((_o, _r, name)): Path<(String, String, String)>,
+    ) -> axum::response::Response {
+        if name == "main" {
+            axum::Json(serde_json::json!({ "name": "main", "commit": { "id": SHA } }))
+                .into_response()
+        } else {
+            axum::response::Response::builder()
+                .status(404)
+                .body(axum::body::Body::from("{}"))
+                .unwrap()
+        }
     }
     async fn raw(Path((_o, _r, path)): Path<(String, String, String)>) -> axum::response::Response {
         if path == ".scarab/e2e.yaml" {
@@ -74,6 +92,7 @@ async fn fake_forgejo() -> String {
 
     let app = axum::Router::new()
         .route("/api/v1/repos/{owner}/{repo}/commits", get(commits))
+        .route("/api/v1/repos/{owner}/{repo}/branches/{*name}", get(branch))
         .route("/api/v1/repos/{owner}/{repo}/raw/{*path}", get(raw))
         .fallback(fallback)
         .with_state(());

@@ -2921,3 +2921,131 @@ async fn run_summaries_carry_the_list_facts(db: &dyn Db) {
 }
 
 contract_test!(run_list_facts, run_summaries_carry_the_list_facts);
+
+/// The runs list says a suspended Run an Environment governs waits on an
+/// Environment approval gate for each `manual` gate not marked `false` and
+/// not a Fork Run approval gate (ADR-0086 §9), whatever its mark: that gate
+/// is released by write on the repository, so labelling it the
+/// Environment's would send the wrong people to approve it. A step whose
+/// `origin` is missing, null, empty, not an array, or holds no link of that
+/// kind has no fork link. The SQL and the in-memory store agree on each.
+async fn run_summaries_never_count_a_fork_run_approval_gate(db: &dyn Db) {
+    use serde_json::json;
+    let fork = || json!([{ "kind": "fork_run_approval_gate", "name": "all", "content_hash": "" }]);
+    // (case, the gate Step as stored, it counts as an Environment approval gate)
+    let cases = [
+        (
+            "environment-marked",
+            json!({ "id": "g", "gate": "manual", "environment_approval_gate": true,
+                    "origin": [{ "kind": "environment", "name": "production", "content_hash": "" }] }),
+            true,
+        ),
+        (
+            "fork-unmarked",
+            json!({ "id": "g", "gate": "manual", "origin": fork() }),
+            false,
+        ),
+        (
+            "fork-marked-false",
+            json!({ "id": "g", "gate": "manual", "environment_approval_gate": false, "origin": fork() }),
+            false,
+        ),
+        (
+            "fork-marked-true",
+            json!({ "id": "g", "gate": "manual", "environment_approval_gate": true, "origin": fork() }),
+            false,
+        ),
+        (
+            "fork-after-a-library-link",
+            json!({ "id": "g", "gate": "manual", "origin": [
+                { "kind": "library", "name": "lib", "content_hash": "abc" },
+                { "kind": "fork_run_approval_gate", "name": "all", "content_hash": "" }] }),
+            false,
+        ),
+        (
+            "plain-marked-false",
+            json!({ "id": "g", "gate": "manual", "environment_approval_gate": false }),
+            false,
+        ),
+        (
+            "no-origin-key",
+            json!({ "id": "g", "gate": "manual" }),
+            true,
+        ),
+        (
+            "origin-null",
+            json!({ "id": "g", "gate": "manual", "origin": null }),
+            true,
+        ),
+        (
+            "origin-empty",
+            json!({ "id": "g", "gate": "manual", "origin": [] }),
+            true,
+        ),
+        (
+            "origin-not-an-array",
+            json!({ "id": "g", "gate": "manual", "origin": "fork_run_approval_gate" }),
+            true,
+        ),
+        (
+            "origin-link-not-an-object",
+            json!({ "id": "g", "gate": "manual", "origin": ["fork_run_approval_gate"] }),
+            true,
+        ),
+    ];
+    for (case, gate, _) in &cases {
+        let run = RunId(format!("r-{case}"));
+        db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+        db.set_run_tenant(&run, "acme", "web").await.unwrap();
+        db.store_run_ir(
+            &run,
+            &json!({ "ir_version": 1, "steps": [{ "id": "build", "image": "busybox" }, gate] }),
+        )
+        .await
+        .unwrap();
+        db.set_run_deploy_context(
+            &run,
+            &scarab_engine::DeployContext {
+                org: "acme".into(),
+                project: "web".into(),
+                environment: "production".into(),
+                git_ref: "refs/heads/main".into(),
+                locked_out: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.record_transition(&run, RunStatus::Pending, RunStatus::Running)
+            .await
+            .unwrap();
+        db.record_transition(&run, RunStatus::Running, RunStatus::Suspended)
+            .await
+            .unwrap();
+    }
+
+    let rows = db
+        .list_runs_for_tenant("acme", "web", &Default::default(), 50)
+        .await
+        .unwrap();
+    for (case, _, counts) in &cases {
+        let run = RunId(format!("r-{case}"));
+        let row = rows
+            .iter()
+            .find(|r| r.run == run)
+            .unwrap_or_else(|| panic!("{case}: not listed"));
+        assert_eq!(
+            row.environment_approval_gates,
+            if *counts {
+                vec![StepId("g".into())]
+            } else {
+                vec![]
+            },
+            "{case}"
+        );
+    }
+}
+
+contract_test!(
+    run_list_fork_gate,
+    run_summaries_never_count_a_fork_run_approval_gate
+);

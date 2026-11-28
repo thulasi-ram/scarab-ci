@@ -209,11 +209,14 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
             let head_repo = p
                 .pointer("/pull_request/head/repo/full_name")
                 .and_then(Value::as_str);
-            let fork = match (base_repo, head_repo) {
-                (Some(base), Some(head_repo)) => head_repo != base,
-                // Absent head repo (deleted fork) → treat as a fork (untrusted).
-                _ => head_repo.is_none(),
-            };
+            // Not a fork only when both names are present and equal. An absent
+            // head repo (a deleted fork) or an absent base name is a fork
+            // (untrusted). The server then confirms a same-repo head branch
+            // with the forge before it trusts it.
+            let fork = !matches!(
+                (base_repo, head_repo),
+                (Some(base), Some(head_repo)) if head_repo == base
+            );
             // The PR title — source of the run Headline (ADR-0057) — and the base
             // branch (`base ← head` display). Display/audit only; both are
             // deliberately kept out of Event::context(). Absent → empty.
@@ -1267,6 +1270,78 @@ impl ForgePort for GithubForge {
         Ok(filter_refs(refs, query))
     }
 
+    /// `GET /repos/{o}/{r}/git/ref/{heads|tags}/{name}`, which matches the
+    /// name exactly (`404` when there is no such ref). An answer whose `ref`
+    /// is not `refs/{heads|tags}/{name}` is read as no such ref. An annotated
+    /// tag's ref points at a tag object, read with `git/tags/{sha}` to reach
+    /// the commit; a tag of a tree or a blob names no commit.
+    async fn ref_commit(
+        &self,
+        repo: &RepoRef,
+        kind: RefKind,
+        name: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        let Some(path) = scarab_forge::ref_name_path(name) else {
+            return Ok(None);
+        };
+        let token = self.auth_token_for(repo).await?;
+        let namespace = match kind {
+            RefKind::Branch => "heads",
+            RefKind::Tag => "tags",
+        };
+        let url = self.url(&format!(
+            "/repos/{}/{}/git/ref/{namespace}/{path}",
+            repo.owner, repo.name
+        ));
+        let (status, body) = self
+            .get_conditional(&url, "application/vnd.github+json", &token)
+            .await?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(ForgeError::Api(format!(
+                "{status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        let body: Value =
+            serde_json::from_slice(&body).map_err(|e| ForgeError::Api(format!("bad JSON: {e}")))?;
+        let full_name = format!("refs/{namespace}/{name}");
+        if body.get("ref").and_then(Value::as_str) != Some(full_name.as_str()) {
+            return Ok(None);
+        }
+        let mut object = body.get("object").cloned().unwrap_or(Value::Null);
+        // A tag of a tag is read again; a few levels at most.
+        for _ in 0..4 {
+            let (Some(object_type), Some(sha)) = (
+                object.get("type").and_then(Value::as_str),
+                object.get("sha").and_then(Value::as_str),
+            ) else {
+                return Err(ForgeError::Api("ref.object missing".into()));
+            };
+            match object_type {
+                "commit" => return Ok(Some(sha.to_string())),
+                "tag" => {
+                    let url = self.url(&format!(
+                        "/repos/{}/{}/git/tags/{}",
+                        repo.owner,
+                        repo.name,
+                        scarab_forge::encode_url_component(sha)
+                    ));
+                    object = self
+                        .get_json_conditional(&url, &token)
+                        .await?
+                        .get("object")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
     /// A no-op by design (ADR-0046): the GitHub App receives every
     /// installation event through its single App webhook — installing the App
     /// *is* webhook registration. Kept in the port because Forgejo needs it
@@ -1890,6 +1965,22 @@ mod tests {
         });
         let event = normalize(&delivery("pull_request", fork)).unwrap();
         assert!(event.is_fork_code(), "head repo != base → fork");
+        // A base repository name missing from the delivery is a fork too,
+        // whatever the head repo says.
+        let no_base = json!({
+            "action": "opened",
+            "pull_request": {
+                "number": 7,
+                "head": { "sha": "abc1234", "ref": "main", "repo": { "full_name": "acme/app" } }
+            },
+            "repository": { "name": "app", "owner": { "login": "acme" } }
+        });
+        assert!(
+            normalize(&delivery("pull_request", no_base))
+                .unwrap()
+                .is_fork_code(),
+            "no base name → fork"
+        );
         // A fork PR's head branch is the fork's branch name, as GitHub sends it.
         assert!(
             matches!(&event, Event::PullRequest { head_branch, .. } if head_branch == "main"),

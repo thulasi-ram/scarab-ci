@@ -586,7 +586,10 @@ against the builds'; …`, which names the same secret.
   credential only when the org trusts the library's source with the registry credential
   ([Libraries](/scarab-ci/usage/libraries/#trusting-a-library-with-the-registry-credential)); a
   step written in your Pipeline file never receives one. Each time it launches, Scarab resolves
-  the `REGISTRY_AUTH` secret (Repo scope, then Org scope) and mounts it as
+  the `REGISTRY_AUTH` secret: a Step that the Environment admits (approved, or no approvers) uses
+  the Run's Environment chain
+  ([Secrets](/scarab-ci/usage/secrets/#scoping-and-inheritance)); any other Step uses the
+  repository default, then the org default. Scarab mounts it as
   `/scarab/registry/config.json`, with `DOCKER_CONFIG` pointing at that directory. It is never an
   environment variable, and Scarab replaces it with `***` in the step's log. With no
   `REGISTRY_AUTH` secret, the step gets the credential the forge derives for its own registry

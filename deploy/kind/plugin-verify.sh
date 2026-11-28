@@ -111,9 +111,9 @@ cleanup() {
     echo "---- tail of the server log ----" >&2
     ( kc logs -n "$ns" deploy/"$release" --tail=60 >&2 ) || true
     if [ -n "${id:-}" ]; then
-      echo "---- plugin Pod (plugin-$id) ----" >&2
+      echo "---- plugin Pod (installation $id) ----" >&2
       ( kc -n "$plugins_ns" get pods -l "scarab.io/plugin-installation=$id" -o wide >&2 ) || true
-      ( kc -n "$plugins_ns" logs "deploy/plugin-$id" --all-containers --tail=60 >&2 ) || true
+      ( kc -n "$plugins_ns" logs -l "scarab.io/plugin-installation=$id" --all-containers --tail=60 >&2 ) || true
     fi
   fi
   exit "$code"
@@ -196,7 +196,7 @@ print("    ok: %d requests, all authorized" % len(seen))
 # server Service's ClusterIPs (by IP, so no DNS policy is in the way): the API
 # must answer (the network works), the broker must not.
 step "the broker port refuses a Pod that is no plugin workload"
-reach_image="$(kc -n "$plugins_ns" get deploy "plugin-$id" -o jsonpath='{.spec.template.spec.initContainers[0].image}')"
+reach_image="$(kc -n "$plugins_ns" get deploy -l "scarab.io/plugin-installation=$id" -o jsonpath='{.items[0].spec.template.spec.initContainers[0].image}')"
 api_ip="$(kc -n "$ns" get svc "$release" -o jsonpath='{.spec.clusterIP}')"
 api_port="$(kc -n "$ns" get svc "$release" -o jsonpath='{.spec.ports[0].port}')"
 broker_ip="$(kc -n "$ns" get svc "$release-broker" -o jsonpath='{.spec.clusterIP}')"
@@ -241,11 +241,11 @@ code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token"
 [ "$code" = 403 ] || fail "whoami after the kill answered $code, expected 403"
 echo "    ok: the broker refuses the killed installation (403)"
 for i in $(seq 1 60); do
-  replicas="$(kc -n "$plugins_ns" get deployment "plugin-$id" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo gone)"
+  replicas="$(kc -n "$plugins_ns" get deployment -l "scarab.io/plugin-installation=$id" -o jsonpath='{.items[0].spec.replicas}' 2>/dev/null || echo gone)"
   [ "$replicas" = 0 ] && break
-  [ "$i" = 60 ] && fail "plugin-$id still has replicas=$replicas a minute after the kill"
+  [ "$i" = 60 ] && fail "plugin $id Deployment still has replicas=$replicas a minute after the kill"
   sleep 2
 done
-echo "    ok: plugin-$id scaled to 0"
+echo "    ok: plugin $id scaled to 0"
 
 echo "==> plugin-argocd PASSED ($org/$name, installation $id; the killed installation stays recorded)"

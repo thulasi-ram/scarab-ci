@@ -129,10 +129,19 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
             let head_repo = p
                 .pointer("/pull_request/head/repo/full_name")
                 .and_then(Value::as_str);
-            let fork = match (base_repo, head_repo) {
-                (Some(base), Some(head_repo)) => head_repo != base,
-                _ => head_repo.is_none(),
-            };
+            // The repository's own code only when the head is a branch of
+            // this repository: the head repo is this one and `head.ref` names
+            // a branch. An AGit-flow pull request (pushed to `refs/for/…`) has
+            // its head in this repository but on no branch; it is fork code,
+            // as is a delivery missing either repository name.
+            let head_ref = p
+                .pointer("/pull_request/head/ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let fork = !matches!(
+                (base_repo, head_repo),
+                (Some(base), Some(head_repo)) if head_repo == base
+            ) || !scarab_forge::pull_request_head_is_branch(head_ref);
             // The PR title — source of the run Headline (ADR-0057) — and the base
             // branch (`base ← head` display). Forgejo carries both like GitHub.
             // Display/audit only; both stay out of Event::context(). Absent → empty.
@@ -918,6 +927,43 @@ impl ForgePort for ForgejoForge {
         Ok(filter_refs(refs, query))
     }
 
+    /// `GET /repos/{o}/{r}/branches/{name}` or `/tags/{name}` (`404` when there
+    /// is no such ref). The tip is read as [`list_refs`](Self::list_refs) reads
+    /// it: `commit.id` for a branch, `commit.sha` for a tag, which is the
+    /// commit an annotated tag points at. An answer for another name is read
+    /// as no such ref.
+    async fn ref_commit(
+        &self,
+        repo: &RepoRef,
+        kind: RefKind,
+        name: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        let Some(path) = scarab_forge::ref_name_path(name) else {
+            return Ok(None);
+        };
+        let coll = match kind {
+            RefKind::Branch => "branches",
+            RefKind::Tag => "tags",
+        };
+        let url = self.url(&format!(
+            "/repos/{}/{}/{coll}/{path}",
+            repo.owner, repo.name
+        ));
+        let resp = self.send(|| self.client.get(&url)).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body = ok_json(resp).await?;
+        if body.get("name").and_then(Value::as_str) != Some(name) {
+            return Ok(None);
+        }
+        body.pointer("/commit/sha")
+            .or_else(|| body.pointer("/commit/id"))
+            .and_then(Value::as_str)
+            .map(|sha| Some(sha.to_string()))
+            .ok_or_else(|| ForgeError::Api(format!("{coll} entry `{name}` has no commit")))
+    }
+
     /// REAL webhook registration (ADR-0046): Forgejo has no single-app
     /// webhook, so each repo gets one. Idempotent: the repo ends with exactly
     /// one hook for `callback_url`.
@@ -1370,6 +1416,59 @@ mod tests {
                     && base == "develop"
                     && head_branch == "fix/login-redirect"
         ));
+    }
+
+    /// A pull request whose head is in this repository is its own code only
+    /// when `head.ref` names a branch. An AGit-flow pull request (pushed to
+    /// `refs/for/<branch>` with read access) has its head here on no branch.
+    /// The `head.ref` values below are the shapes the code refuses; what a
+    /// live Forgejo sends for an AGit pull request is not recorded in this
+    /// repository (git-bug 14a694f).
+    #[test]
+    fn a_same_repository_pull_request_is_fork_code_unless_its_head_is_a_branch() {
+        let pr = |head: Value| {
+            json!({
+                "action": "opened",
+                "number": 9,
+                "pull_request": { "head": head },
+                "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" }
+            })
+        };
+        let own = pr(json!({
+            "sha": "abc1234", "ref": "feature", "repo": { "full_name": "acme/app" }
+        }));
+        assert!(!normalize(&delivery("pull_request", own))
+            .unwrap()
+            .is_fork_code());
+        for head_ref in [
+            Some("refs/pull/9/head"),
+            Some("refs/for/main/topic"),
+            Some(""),
+            None,
+        ] {
+            let mut head = json!({ "sha": "abc1234", "repo": { "full_name": "acme/app" } });
+            if let Some(r) = head_ref {
+                head["ref"] = json!(r);
+            }
+            assert!(
+                normalize(&delivery("pull_request", pr(head)))
+                    .unwrap()
+                    .is_fork_code(),
+                "head.ref {head_ref:?} is not a branch: fork code"
+            );
+        }
+        // A delivery missing the base repository's name is fork code too.
+        let no_base = json!({
+            "action": "opened",
+            "number": 9,
+            "pull_request": { "head": {
+                "sha": "abc1234", "ref": "feature", "repo": { "full_name": "acme/app" }
+            } },
+            "repository": { "name": "app", "owner": { "login": "acme" } }
+        });
+        assert!(normalize(&delivery("pull_request", no_base))
+            .unwrap()
+            .is_fork_code());
     }
 
     /// The push `after` and the pull request head SHA become the Run's pinned

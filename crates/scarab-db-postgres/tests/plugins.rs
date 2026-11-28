@@ -47,6 +47,7 @@ fn manifest() -> PluginManifest {
         }],
         config_keys: vec![],
         gates: Default::default(),
+        extensions: None,
     }
 }
 

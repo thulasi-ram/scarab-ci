@@ -438,11 +438,13 @@ removing trust does not.
 ## Trusting a library with the registry credential
 
 A step with `registry_auth: true` may receive the Run's registry credential: the `REGISTRY_AUTH`
-secret (Repo scope, then Org scope), or the credential the forge derives for its own registry.
-Only a step from a library installed from a source your org trusts with the registry credential
-receives one; a step written in a Pipeline file, or reached through `invoke: file:`, runs your
-repository's own command and never does. The forge-derived credential can write packages, so it
-needs the source trusted with forge credentials as well. No source is trusted by default:
+secret, or the credential the forge derives for its own registry. For the secret, a Step that the
+Environment admits (approved, or no approvers) uses the Run's Environment chain; any other Step
+uses the repository default, then the org default. Only a step from a library installed from a
+source your org trusts with the registry credential receives one; a step written in a Pipeline
+file, or reached through `invoke: file:`, runs your repository's own command and never does. The
+forge-derived credential can write packages, so it needs the source trusted with forge
+credentials as well. No source is trusted by default:
 
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \

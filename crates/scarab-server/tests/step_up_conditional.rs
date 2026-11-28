@@ -1306,6 +1306,7 @@ fn plugin_installation() -> scarab_plugin::PluginInstallation {
             }],
             config_keys: vec![],
             gates: Default::default(),
+            extensions: None,
         },
         manifest_sha256: "0".repeat(64),
         source: None,

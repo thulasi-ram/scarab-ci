@@ -15,16 +15,19 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use scarab_engine::{
-    Attempt, AttemptId, AttemptOutcome, Db, EventKind, EventPayload, Executor, RegistryAuthConfig,
-    RunId, SandboxConfig, StepId, StepRun, StepSpec, StepStatus, Timestamp, EVENT_VERSION,
+    Attempt, AttemptId, AttemptOutcome, Db, DeployContext, EventKind, EventPayload, ExecError,
+    Executor, RegistryAuthConfig, RunId, SandboxConfig, StepId, StepRun, StepSpec, StepStatus,
+    Timestamp, EVENT_VERSION,
 };
 use scarab_forge::{Event, RepoRef};
 use scarab_policy::library::{
     content_hash, trust_key, LibraryStore, LibraryVersion, NewInstallation, Replaces, TrustGrant,
     TrustedSource,
 };
-use scarab_secrets::SecretScope;
+use scarab_project::{EnvironmentProjectEligibility, EnvironmentProtectionRules};
+use scarab_secrets::{Secret, SecretError, SecretProvider, SecretScope};
 use scarab_server::forge_token::ForgeCredentialExecutor;
 use scarab_server::{trigger_runs_from_event, AdmissionPorts, TriggerOutcome};
 use scarab_testkit::{
@@ -372,9 +375,45 @@ async fn executor(
     secrets: FakeSecrets,
     fork: bool,
 ) -> ForgeCredentialExecutor {
+    executor_with(inner, libs, Arc::new(secrets), fork, None).await
+}
+
+/// [`executor`] over any secret store, for a Run with the deploy context
+/// `deploy` when given. Its Environment exists and admits every Project, so
+/// the launch's re-admission passes and the credential is what is judged.
+async fn executor_with(
+    inner: Arc<FakeExecutor>,
+    libs: Arc<InMemoryLibraries>,
+    secrets: Arc<dyn SecretProvider>,
+    fork: bool,
+    deploy: Option<DeployContext>,
+) -> ForgeCredentialExecutor {
+    let mut governance = InMemoryEnvironmentGovernance::new();
+    if let Some(ctx) = &deploy {
+        governance = governance.with_environment(
+            &ctx.org,
+            &ctx.environment,
+            EnvironmentProjectEligibility::AllProjects,
+        );
+    }
+    executor_over(inner, libs, secrets, fork, deploy, governance).await
+}
+
+/// [`executor_with`] over the Environment store `governance`.
+async fn executor_over(
+    inner: Arc<FakeExecutor>,
+    libs: Arc<InMemoryLibraries>,
+    secrets: Arc<dyn SecretProvider>,
+    fork: bool,
+    deploy: Option<DeployContext>,
+    governance: InMemoryEnvironmentGovernance,
+) -> ForgeCredentialExecutor {
     let db = Arc::new(InMemoryDb::new());
     let run = RunId("r1".into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    if let Some(ctx) = &deploy {
+        db.set_run_deploy_context(&run, ctx).await.unwrap();
+    }
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
@@ -391,9 +430,9 @@ async fn executor(
         db.clone(),
     ));
     ForgeCredentialExecutor::new(inner, forge, logs)
-        .with_secrets(Arc::new(secrets))
+        .with_secrets(secrets)
         .with_libraries(db.clone(), libs)
-        .with_environment_governance(db, Arc::new(InMemoryEnvironmentGovernance::new()))
+        .with_environment_governance(db, Arc::new(governance))
 }
 
 /// Revoking the source's sandbox trust stops the next launch (a retry, a
@@ -586,6 +625,235 @@ async fn a_launch_after_the_registry_credential_trust_is_revoked_gets_no_credent
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
     assert_eq!((auth.registry_auth_json, auth.derived_auth), (None, None));
     assert!(!auth.credential_eligible, "trust revoked: not eligible");
+}
+
+// ---------------------------------------------------------------------------
+// REGISTRY_AUTH through the Run's Environment (git-bug 34c7122)
+// ---------------------------------------------------------------------------
+
+/// Run `r1` deploys `acme/web` to `prod`, locked out of its secrets when
+/// `locked_out`.
+fn prod(locked_out: bool) -> DeployContext {
+    DeployContext {
+        org: "acme".into(),
+        project: "web".into(),
+        environment: "prod".into(),
+        git_ref: "refs/heads/main".into(),
+        locked_out,
+    }
+}
+
+fn prod_project() -> SecretScope {
+    SecretScope::EnvironmentProject {
+        org: "acme".into(),
+        project: "web".into(),
+        environment: "prod".into(),
+    }
+}
+
+fn org_prod() -> SecretScope {
+    SecretScope::OrgEnvironment {
+        org: "acme".into(),
+        environment: "prod".into(),
+    }
+}
+
+fn repo_scope() -> SecretScope {
+    SecretScope::Repo {
+        org: "acme".into(),
+        repo: "web".into(),
+    }
+}
+
+/// The build library trusted with the registry credential and with forge
+/// credentials, so a launch that wrongly falls through past the secret
+/// reaches the forge-derived credential and shows it.
+async fn fully_trusted() -> Arc<InMemoryLibraries> {
+    Arc::new(
+        build_library(&[
+            TrustGrant::BuildSandbox,
+            TrustGrant::RegistryCredential,
+            TrustGrant::ForgeCredentials,
+        ])
+        .await,
+    )
+}
+
+/// The `REGISTRY_AUTH` value the push Step of Run `r1` launched with, over
+/// `secrets`, in a Run with deploy context `deploy`.
+async fn launched_registry_auth(
+    secrets: FakeSecrets,
+    deploy: Option<DeployContext>,
+) -> Option<String> {
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = executor_with(
+        inner.clone(),
+        fully_trusted().await,
+        Arc::new(secrets),
+        false,
+        deploy,
+    )
+    .await;
+    let handle = exec
+        .launch(&step_run("push"), &push_spec(true))
+        .await
+        .unwrap();
+    inner
+        .launched_spec(&handle)
+        .unwrap()
+        .registry_auth
+        .unwrap()
+        .registry_auth_json
+}
+
+/// A Run in an Environment takes the repository's value for it, then the
+/// org's value for it, before the repository's own value: the order a
+/// declared secret resolves in. Before the fix only the Repo and Org scopes
+/// were read, so an Environment's value never reached the Step.
+#[tokio::test]
+async fn registry_auth_takes_the_environments_value_first() {
+    let env_project = r#"{"auths":{"prod.corp":{"auth":"ZW52"}}}"#;
+    let org_env = r#"{"auths":{"prod.corp":{"auth":"b3Jn"}}}"#;
+    let repo = r#"{"auths":{"registry.corp":{"auth":"cmVw"}}}"#;
+
+    let all = FakeSecrets::new()
+        .with_secret(&prod_project(), "REGISTRY_AUTH", env_project.as_bytes())
+        .with_secret(&org_prod(), "REGISTRY_AUTH", org_env.as_bytes())
+        .with_secret(&repo_scope(), "REGISTRY_AUTH", repo.as_bytes());
+    assert_eq!(
+        launched_registry_auth(all, Some(prod(false)))
+            .await
+            .as_deref(),
+        Some(env_project),
+        "the repository's value for the Environment comes first"
+    );
+
+    let org_and_repo = FakeSecrets::new()
+        .with_secret(&org_prod(), "REGISTRY_AUTH", org_env.as_bytes())
+        .with_secret(&repo_scope(), "REGISTRY_AUTH", repo.as_bytes());
+    assert_eq!(
+        launched_registry_auth(org_and_repo, Some(prod(false)))
+            .await
+            .as_deref(),
+        Some(org_env),
+        "the org's value for the Environment comes before the repository's own"
+    );
+}
+
+/// A push Step its Environment does not admit yet resolves the repository's
+/// value, not the Environment's. The Environment has approvers and the Run
+/// has no stored pipeline, so no approval gate is upstream of the Step and
+/// it is before approval. Only a Step the Environment admits (approved, or
+/// no approvers) reads the Environment's chain.
+#[tokio::test]
+async fn a_push_step_before_approval_takes_the_repository_value() {
+    let env_project = r#"{"auths":{"prod.corp":{"auth":"ZW52"}}}"#;
+    let repo = r#"{"auths":{"registry.corp":{"auth":"cmVw"}}}"#;
+    let secrets = FakeSecrets::new()
+        .with_secret(&prod_project(), "REGISTRY_AUTH", env_project.as_bytes())
+        .with_secret(&repo_scope(), "REGISTRY_AUTH", repo.as_bytes());
+    let governance = InMemoryEnvironmentGovernance::new().with_project_overlay(
+        "acme",
+        "web",
+        "prod",
+        EnvironmentProtectionRules {
+            approvers: vec!["amy".to_string()],
+            ..Default::default()
+        },
+    );
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = executor_over(
+        inner.clone(),
+        fully_trusted().await,
+        Arc::new(secrets),
+        false,
+        Some(prod(false)),
+        governance,
+    )
+    .await;
+    let handle = exec
+        .launch(&step_run("push"), &push_spec(true))
+        .await
+        .unwrap();
+    let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
+    assert_eq!(
+        auth.registry_auth_json.as_deref(),
+        Some(repo),
+        "a Step before approval does not read the Environment's value"
+    );
+}
+
+/// A secret store whose every read fails.
+struct UnreadableSecrets;
+
+#[async_trait]
+impl SecretProvider for UnreadableSecrets {
+    async fn get(&self, _scope: &SecretScope, _key: &str) -> Result<Secret, SecretError> {
+        Err(SecretError::Backend("the secret store went away".into()))
+    }
+    async fn put(&self, _scope: &SecretScope, _secret: Secret) -> Result<(), SecretError> {
+        Err(SecretError::Backend("the secret store went away".into()))
+    }
+    async fn list_scoped(&self, _scope: &SecretScope) -> Result<Vec<String>, SecretError> {
+        Err(SecretError::Backend("the secret store went away".into()))
+    }
+    async fn delete(&self, _scope: &SecretScope, _key: &str) -> Result<(), SecretError> {
+        Err(SecretError::Backend("the secret store went away".into()))
+    }
+}
+
+/// A store error fails the launch. Before the fix it fell through to the
+/// Org scope and then to the forge-derived credential, so an outage mounted
+/// a credential for another registry than the one the secret names.
+#[tokio::test]
+async fn a_secret_store_error_fails_the_launch() {
+    for deploy in [None, Some(prod(false))] {
+        let inner = Arc::new(FakeExecutor::new());
+        let exec = executor_with(
+            inner.clone(),
+            fully_trusted().await,
+            Arc::new(UnreadableSecrets),
+            false,
+            deploy.clone(),
+        )
+        .await;
+        let launched = exec.launch(&step_run("push"), &push_spec(true)).await;
+        assert!(
+            matches!(&launched, Err(ExecError::Other(e)) if e.contains("REGISTRY_AUTH")),
+            "deploy context {deploy:?}: {launched:?}"
+        );
+        let handle = scarab_engine::ports::ExecHandle("fake://r1/image/push/a1".into());
+        assert_eq!(inner.launch_count(&handle), 0, "nothing launched");
+    }
+}
+
+/// A `REGISTRY_AUTH` value that is not UTF-8 refuses the launch. Before the
+/// fix it was skipped and the org's value was mounted in its place.
+#[tokio::test]
+async fn a_non_utf8_registry_auth_is_refused() {
+    let secrets = FakeSecrets::new()
+        .with_secret(&repo_scope(), "REGISTRY_AUTH", &[0xff, 0xfe, b'{'])
+        .with_secret(
+            &SecretScope::Org { org: "acme".into() },
+            "REGISTRY_AUTH",
+            REGISTRY_AUTH,
+        );
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = executor_with(
+        inner.clone(),
+        fully_trusted().await,
+        Arc::new(secrets),
+        false,
+        None,
+    )
+    .await;
+    let launched = exec.launch(&step_run("push"), &push_spec(true)).await;
+    assert!(
+        matches!(&launched, Err(ExecError::Refused(r)) if r.contains("not UTF-8")),
+        "{launched:?}"
+    );
+    let handle = scarab_engine::ports::ExecHandle("fake://r1/image/push/a1".into());
+    assert_eq!(inner.launch_count(&handle), 0, "nothing launched");
 }
 
 // ---------------------------------------------------------------------------

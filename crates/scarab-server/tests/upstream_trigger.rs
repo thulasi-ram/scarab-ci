@@ -336,3 +336,151 @@ steps:
     assert_eq!((older.len(), newer.len()), (1, 1));
     assert_eq!(w.db.superseded_by(&newer[0]).await.unwrap(), older);
 }
+
+// ---------------------------------------------------------------------------
+// A dispatch of fork code starts no follow-up (git-bug d910337)
+// ---------------------------------------------------------------------------
+
+/// `ci` as a dispatchable pipeline.
+const CI_MANUAL: &str = r#"
+on:
+  manual: {}
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+"#;
+
+const OTHER: &str = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+
+impl World {
+    /// Dispatch `ci` at `git_ref` by hand.
+    async fn dispatch(&self, git_ref: &str) -> RunId {
+        scarab_server::dispatch_run(
+            &self.forge,
+            &self.db,
+            &self.clock,
+            AdmissionPorts::governance(None),
+            "alice".into(),
+            repo(),
+            git_ref.into(),
+            "ci".into(),
+            Default::default(),
+            scarab_server::DispatchKind::Manual,
+            None,
+        )
+        .await
+        .expect("dispatch")
+    }
+}
+
+/// A dispatch of a commit no branch or tag names is fork code: its Run
+/// starts no follow-up, though the follow-up reads the same commit.
+#[tokio::test]
+async fn a_fork_code_dispatch_starts_no_follow_up() {
+    let mut w = World::new(&[
+        (".scarab/ci.yaml", CI_MANUAL),
+        (".scarab/deploy.yaml", DEPLOY),
+    ]);
+    w.forge = std::mem::take(&mut w.forge).with_branch("main", OTHER);
+    let run = w.dispatch(SHA).await;
+    w.finish(&run, ExecState::Succeeded).await;
+    assert_eq!(w.drain().await, 0);
+    assert!(w.runs_of("deploy").await.is_empty());
+}
+
+/// A dispatch of the repository's own code starts its follow-up as before.
+#[tokio::test]
+async fn an_own_code_dispatch_starts_its_follow_up() {
+    let mut w = World::new(&[
+        (".scarab/ci.yaml", CI_MANUAL),
+        (".scarab/deploy.yaml", DEPLOY),
+    ]);
+    w.forge = std::mem::take(&mut w.forge).with_branch("main", SHA);
+    let run = w.dispatch("main").await;
+    w.finish(&run, ExecState::Succeeded).await;
+    assert_eq!(w.drain().await, 1);
+    assert_eq!(w.runs_of("deploy").await.len(), 1);
+}
+
+/// Record `trigger` as Run `run`'s trigger.
+async fn record_trigger(db: &InMemoryDb, run: &str, trigger: serde_json::Value) {
+    use scarab_engine::{EventKind, EventPayload, Timestamp, EVENT_VERSION};
+    let id = RunId(run.into());
+    db.create_run(&id, 1, 1, Timestamp(0)).await.unwrap();
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: id,
+        kind: EventPayload::Raw(serde_json::json!({ "trigger": { "event": trigger } })),
+        at: Timestamp(0),
+    })
+    .await
+    .unwrap();
+}
+
+/// What a recorded trigger says about fork code, failing closed: a dispatch
+/// recorded before 0.8.4 has no `fork` and counts as fork code; a follow-up
+/// is what the Run its chain started from is; a chain with a missing Run or
+/// a cycle is fork code.
+#[tokio::test]
+async fn a_recorded_trigger_is_fork_code_unless_it_says_otherwise() {
+    use scarab_server::trigger_is_fork_code;
+    use serde_json::json;
+    let db = InMemoryDb::new();
+    let fork = |t: serde_json::Value| {
+        let db = &db;
+        async move { trigger_is_fork_code(db, &t).await.unwrap() }
+    };
+
+    assert!(
+        fork(json!({ "kind": "manual", "sha": SHA })).await,
+        "pre-0.8.4 dispatch"
+    );
+    assert!(
+        fork(json!({ "kind": "api", "sha": SHA })).await,
+        "pre-0.8.4 dispatch"
+    );
+    assert!(!fork(json!({ "kind": "manual", "fork": false })).await);
+    assert!(fork(json!({ "kind": "api", "fork": true })).await);
+    assert!(!fork(json!({ "kind": "push" })).await);
+    assert!(fork(json!({ "kind": "pull_request", "fork": true })).await);
+
+    record_trigger(&db, "own", json!({ "kind": "manual", "fork": false })).await;
+    record_trigger(&db, "old", json!({ "kind": "manual" })).await;
+    record_trigger(&db, "own-1", json!({ "kind": "upstream", "run": "own" })).await;
+    record_trigger(&db, "old-1", json!({ "kind": "upstream", "run": "old" })).await;
+    record_trigger(
+        &db,
+        "loop-a",
+        json!({ "kind": "upstream", "run": "loop-b" }),
+    )
+    .await;
+    record_trigger(
+        &db,
+        "loop-b",
+        json!({ "kind": "upstream", "run": "loop-a" }),
+    )
+    .await;
+
+    let upstream = |run: &str| json!({ "kind": "upstream", "run": run });
+    assert!(!fork(upstream("own")).await, "a follow-up of own code");
+    assert!(
+        !fork(upstream("own-1")).await,
+        "a follow-up of a follow-up of own code"
+    );
+    assert!(
+        fork(upstream("old")).await,
+        "a follow-up of a pre-0.8.4 dispatch"
+    );
+    assert!(
+        fork(upstream("old-1")).await,
+        "two links from a pre-0.8.4 dispatch"
+    );
+    assert!(
+        fork(upstream("gone")).await,
+        "an upstream Run that is not there"
+    );
+    assert!(
+        fork(json!({ "kind": "upstream" })).await,
+        "no upstream Run id"
+    );
+    assert!(fork(upstream("loop-a")).await, "a cycle");
+}
