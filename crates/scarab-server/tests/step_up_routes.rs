@@ -1341,6 +1341,12 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
         ("POST", "/v1/orgs/{org}/library-trust") => {
             Some(json!({"source": "github.com/acme/libs//push.yaml"}))
         }
+        ("PUT", "/v1/orgs/{org}/oauth/client-metadata-hosts/{host}") => {
+            return (
+                "/v1/orgs/acme/oauth/client-metadata-hosts/claude.ai".into(),
+                None,
+            )
+        }
         ("DELETE", _)
         | ("GET", _)
         | ("POST", "/v1/connections/{id}/resync")
@@ -1356,7 +1362,14 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
 /// its role — so nobody the handler would accept ever skips the step-up.
 #[tokio::test]
 async fn min_role_is_exactly_the_lowest_role_the_handler_accepts() {
-    let h = harness();
+    // The OAuth authorization server on: off, its handlers answer 404 before
+    // their role check, and this test is about that check.
+    let h = harness_with(|st| {
+        st.with_oauth_server(
+            std::sync::Arc::new(scarab_testkit::InMemoryOAuth::new()),
+            vec![9u8; 32],
+        )
+    });
     for r in crown_jewels() {
         let Some(min) = r.op.min_role else { continue };
         let below = match min {
