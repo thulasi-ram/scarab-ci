@@ -1426,6 +1426,8 @@ pub(crate) async fn uninstall_plugin(
         .ok_or(ApiError::NotFound)?;
     if let Some(id) = &installation_id {
         delete_delegated_caller_handles(&st, id, "uninstalled").await;
+        // Every connected app's grant for its endpoints goes with it.
+        crate::oauth_server::revoke_installation_grants(&st, id).await;
     }
     // Its connections went with it; their credentials live in another store.
     for credential_ref in &removed.connection_credential_refs {

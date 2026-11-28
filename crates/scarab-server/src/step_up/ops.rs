@@ -1372,6 +1372,73 @@ pub static PLUGIN_ENDPOINT: Op = op(
     &[],
     &["path:org", "path:id", "path:endpoint_path"],
 );
+// The OAuth authorization server (ADR-0086 §7).
+pub static OAUTH_AUTHORIZATION_REQUEST: Op = op(
+    "oauth.authorization_request",
+    "Check an OAuth authorization request",
+    Class::NotGoverned("reads the client's metadata and describes the request; grants nothing"),
+    "ADR-0086 §7",
+    ANYONE,
+    OrgOf::None,
+    &[],
+    &["body:/client_id", "body:/resource"],
+)
+.browser_only();
+// Every consent asks for a passkey of its own, bound to this client, this
+// endpoint and these operations (the digest covers the whole body).
+pub static OAUTH_CONSENT: Op = op(
+    "oauth.consent",
+    "Connect an app to a plugin endpoint",
+    Class::CrownJewel(A),
+    "ADR-0086 §7: granting a token is a crown jewel, as minting one is",
+    VIEWER,
+    OrgOf::None,
+    &[],
+    &["body:/client_id", "body:/resource"],
+)
+.browser_only();
+pub static OAUTH_TOKEN: Op = op(
+    "oauth.token",
+    "Exchange an OAuth code or refresh secret",
+    Class::NotGoverned("the code verifier or the refresh secret is the credential; a machine call"),
+    "ADR-0086 §7",
+    ANYONE,
+    OrgOf::None,
+    &["/code", "/code_verifier", "/refresh_token"],
+    &[],
+);
+pub static OAUTH_GRANT_REVOKE_OWN: Op = op(
+    "oauth.grant.revoke_own",
+    "Disconnect one of your connected apps",
+    Class::Exempt("revocation tightens"),
+    "ADR-0086 §7",
+    ANYONE,
+    OrgOf::None,
+    &[],
+    &["path:id"],
+)
+// Its handler checks ownership only, so it refuses a token.
+.not_by_token();
+pub static OAUTH_CLIENT_METADATA_HOST_ADD: Op = op(
+    "oauth.client_metadata_host.add",
+    "Allow a host to serve OAuth client metadata",
+    Class::CrownJewel(W),
+    "ADR-0086 §7: adding a host loosens",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:host"],
+);
+pub static OAUTH_CLIENT_METADATA_HOST_REMOVE: Op = op(
+    "oauth.client_metadata_host.remove",
+    "Stop allowing a host to serve OAuth client metadata",
+    Class::Exempt("removing a host tightens"),
+    "ADR-0086 §7",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:host"],
+);
 pub static PLUGIN_FETCH: Op = op(
     "plugin.fetch",
     "Fetch a plugin manifest to review",
@@ -1856,6 +1923,8 @@ mod tests {
             vec![
                 "identity.link",
                 "identity.unlink",
+                "oauth.authorization_request",
+                "oauth.consent",
                 "passkey.add",
                 "secret.match",
                 "secret.match_limits",
@@ -1881,6 +1950,7 @@ mod tests {
             not_by_token,
             vec![
                 "connection.assign_org",
+                "oauth.grant.revoke_own",
                 "token.mint",
                 "token.mint_own",
                 "token.revoke_own"

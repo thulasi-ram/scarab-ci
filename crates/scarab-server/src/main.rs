@@ -1287,6 +1287,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cloud provider can verify Scarab-minted tokens. The signing key is loaded
     // from the configured PEM — persistent across restarts/replicas — and any
     // failure here is a boot failure, not a degraded warn (ADR-0048).
+    // The OAuth authorization server for plugin endpoints (ADR-0086 §7):
+    // config refused boot when it is on without its refresh key.
+    if let Some(oauth_server) = &config.oauth_server {
+        state = state.with_oauth_server(
+            pg.clone(),
+            oauth_server.refresh_key.expose().as_bytes().to_vec(),
+        );
+        tracing::info!("OAuth authorization server on (plugin endpoints)");
+    }
     if let Some(issuer) = oidc_issuer.clone() {
         state = state.with_oidc(issuer);
         tracing::info!("OIDC issuer enabled (persistent signing key)");

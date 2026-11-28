@@ -99,6 +99,7 @@ pub mod log_tail;
 pub mod logs;
 pub mod metrics;
 pub mod oauth;
+pub mod oauth_server;
 pub mod oidc;
 /// ADR-0071: the minimal org-level Environment — its admin/read API.
 pub mod org_environments;
@@ -264,6 +265,11 @@ pub struct AppState {
     /// reached at, instead of its Service in the plugin namespace. Never set
     /// from configuration.
     pub plugin_endpoint_upstream_override: Option<String>,
+    /// The OAuth authorization server's records (ADR-0086 §7). `None`, or
+    /// `oauth_refresh_key` `None`: the server is off and its routes 404.
+    pub oauth: Option<Arc<dyn scarab_identity::OAuthStore>>,
+    /// The key refresh secrets are derived with (`SCARAB_OAUTH_REFRESH_KEY`).
+    pub oauth_refresh_key: Option<Arc<Vec<u8>>>,
     /// Proves who calls the broker (ADR-0072 §11): TokenReview in production
     /// (slice d2), static dev tokens under `SCARAB_DEV_INSECURE`. `None` makes
     /// every authenticated broker call a 401 — nothing proven, nothing taken.
@@ -469,6 +475,8 @@ impl AppState {
             broker_upstream_loopback_allowed: false,
             plugin_endpoint_limits: Arc::default(),
             plugin_endpoint_upstream_override: None,
+            oauth: None,
+            oauth_refresh_key: None,
             plugin_tokens: None,
             plugin_api_tokens: None,
             plugin_policy: Arc::new(plugins::PluginPolicy::off()),
@@ -689,6 +697,18 @@ impl AppState {
     /// small pool — instead of [`Self::with_plugins`]'s.
     pub fn with_broker_plugin_store(mut self, store: Arc<dyn scarab_plugin::PluginStore>) -> Self {
         self.broker_plugins = Some(store);
+        self
+    }
+
+    /// Turn the OAuth authorization server on (ADR-0086 §7): its records in
+    /// `store`, refresh secrets derived with `refresh_key`.
+    pub fn with_oauth_server(
+        mut self,
+        store: Arc<dyn scarab_identity::OAuthStore>,
+        refresh_key: Vec<u8>,
+    ) -> Self {
+        self.oauth = Some(store);
+        self.oauth_refresh_key = Some(Arc::new(refresh_key));
         self
     }
 
@@ -17259,7 +17279,9 @@ const TAG_GROUPS: &[(&str, &str)] = &[
 /// listing rather than a repo one. Returns `None` for a path no rule claims —
 /// a test turns that into a build failure rather than an untagged operation.
 fn tag_for_path(path: &str) -> Option<&'static str> {
-    let group = if path.starts_with("/webhooks/") {
+    let group = if path.starts_with("/oauth/") || path.contains("/oauth/") {
+        "Auth & Identity"
+    } else if path.starts_with("/webhooks/") {
         "Webhooks"
     } else if path.starts_with("/v1/connections") || path.starts_with("/v1/forges/") {
         "Forge Connections"
@@ -17369,6 +17391,7 @@ impl utoipa::Modify for TagGroups {
 fn is_public_path(path: &str) -> bool {
     path.starts_with("/webhooks/")
         || path.starts_with("/.well-known/")
+        || path.starts_with("/oauth/")
         || path.starts_with("/v1/auth/")
         || matches!(
             path,
@@ -17536,6 +17559,16 @@ impl utoipa::Modify for StepUpResponses {
         list_api_tokens,
         revoke_api_token,
         plugin_endpoint::plugin_endpoint,
+        oauth_server::authorization_server_metadata,
+        oauth_server::protected_resource_metadata,
+        oauth_server::describe_authorization_request,
+        oauth_server::consent,
+        oauth_server::token,
+        oauth_server::list_connected_apps,
+        oauth_server::revoke_connected_app,
+        oauth_server::list_client_metadata_hosts,
+        oauth_server::put_client_metadata_host,
+        oauth_server::delete_client_metadata_host,
         mint_own_api_token,
         list_own_api_tokens,
         revoke_own_api_token,

@@ -142,6 +142,53 @@ fn route_list(routes: Routes) -> Routes {
         .get("/metrics", &ops::SERVER_READ, metrics)
         .get("/openapi.json", &ops::SERVER_READ, openapi)
         .get("/.well-known/jwks.json", &ops::SERVER_READ, jwks)
+        // ADR-0086 §7: the OAuth authorization server for plugin endpoints.
+        .get(
+            "/.well-known/oauth-authorization-server",
+            &ops::SERVER_READ,
+            crate::oauth_server::authorization_server_metadata,
+        )
+        .get(
+            "/.well-known/oauth-protected-resource/v1/orgs/{org}/plugin-installations/{id}/endpoints/{*endpoint_path}",
+            &ops::SERVER_READ,
+            crate::oauth_server::protected_resource_metadata,
+        )
+        .post(
+            "/v1/oauth/authorization-requests",
+            &ops::OAUTH_AUTHORIZATION_REQUEST,
+            crate::oauth_server::describe_authorization_request,
+        )
+        .post(
+            "/v1/oauth/consent",
+            &ops::OAUTH_CONSENT,
+            crate::oauth_server::consent,
+        )
+        .post("/oauth/token", &ops::OAUTH_TOKEN, crate::oauth_server::token)
+        .get(
+            "/v1/me/connected-apps",
+            &ops::ACCOUNT_READ,
+            crate::oauth_server::list_connected_apps,
+        )
+        .delete(
+            "/v1/me/connected-apps/{id}",
+            &ops::OAUTH_GRANT_REVOKE_OWN,
+            crate::oauth_server::revoke_connected_app,
+        )
+        .get(
+            "/v1/orgs/{org}/oauth/client-metadata-hosts",
+            &ops::SETTINGS_READ,
+            crate::oauth_server::list_client_metadata_hosts,
+        )
+        .put(
+            "/v1/orgs/{org}/oauth/client-metadata-hosts/{host}",
+            &ops::OAUTH_CLIENT_METADATA_HOST_ADD,
+            crate::oauth_server::put_client_metadata_host,
+        )
+        .delete(
+            "/v1/orgs/{org}/oauth/client-metadata-hosts/{host}",
+            &ops::OAUTH_CLIENT_METADATA_HOST_REMOVE,
+            crate::oauth_server::delete_client_metadata_host,
+        )
         .get(
             "/.well-known/openid-configuration",
             &ops::SERVER_READ,
