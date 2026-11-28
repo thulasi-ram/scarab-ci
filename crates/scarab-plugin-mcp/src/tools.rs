@@ -741,14 +741,19 @@ async fn get_step_logs(api: &ScarabApi<'_>, args: &Value) -> Outcome {
 async fn get_step_results(api: &ScarabApi<'_>, args: &Value) -> Outcome {
     let run_id = need_str(args, "run_id")?;
     let step_arg = need_str(args, "step")?;
-    let query = match opt_count(args, "attempt")? {
+    seg("step", step_arg)?;
+    let attempt = opt_count(args, "attempt")?;
+    // The path takes the Step's key. An authored id can hold a `/` (an
+    // inlined library Step such as `image/push`), which a proxy may decode.
+    let run = api
+        .get_json(&format!("/v1/runs/{}", seg("run_id", run_id)?))
+        .await?;
+    let step = find_step(&run, step_arg)
+        .ok_or_else(|| ToolOutcome::failed("The Run has no Step with that key or id."))?;
+    let key = step.get("key").and_then(Value::as_str).unwrap_or(step_arg);
+    let query = match attempt {
         None => String::new(),
         Some(n) => {
-            let run = api
-                .get_json(&format!("/v1/runs/{}", seg("run_id", run_id)?))
-                .await?;
-            let step = find_step(&run, step_arg)
-                .ok_or_else(|| ToolOutcome::failed("The Run has no Step with that key or id."))?;
             let (id, _, _) = attempt_id(step, Some(n))?;
             format!("?attempt={}", encode_component(&id))
         }
@@ -757,7 +762,7 @@ async fn get_step_results(api: &ScarabApi<'_>, args: &Value) -> Outcome {
         .get_json(&format!(
             "/v1/runs/{}/steps/{}/results{query}",
             seg("run_id", run_id)?,
-            seg("step", step_arg)?
+            seg("step", key)?
         ))
         .await?;
     Ok(answer("step results", &v))
