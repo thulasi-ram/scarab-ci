@@ -716,19 +716,22 @@ endpoint has no such label, so it still takes no ingress. A broker peer given as
 admits every address in that range to the endpoint port, not only the
 server. The endpoint's request limits are counted per server replica.
 
-To roll back: scale the server to zero, back up the database, run
+To roll back: scale the server to zero, back up the database, run, in this order,
+[`rollback/0114_revert.sql`](../../../crates/scarab-db-postgres/rollback/0114_revert.sql)
+(set the Fork Run approval setting to `off` in every org first),
 [`rollback/0113_revert.sql`](../../../crates/scarab-db-postgres/rollback/0113_revert.sql)
-(it revokes every connected app's access token), then
+(it revokes every connected app's access token),
+[`rollback/0112_revert.sql`](../../../crates/scarab-db-postgres/rollback/0112_revert.sql)
+and then
 [`rollback/0111_revert.sql`](../../../crates/scarab-db-postgres/rollback/0111_revert.sql)
 (`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0111_revert.sql`; a second run
 changes nothing), then install the 0.8.4 chart. A 0.8.4 server would let a
 token with an operation list use every operation, so the revert revokes those
-tokens before it drops the columns; their owners mint new ones. Run
-[`rollback/0112_revert.sql`](../../../crates/scarab-db-postgres/rollback/0112_revert.sql)
-between those two: it drops the PluginApi tables and their journal, and refuses to run
-while a plugin that registers an endpoint is installed, since a 0.8.3 server
-cannot read its manifest. Uninstall those plugins first. To go back to 0.8.2,
-run `0110_revert.sql` next.
+tokens before it drops the columns; their owners mint new ones. The 0112
+revert drops the PluginApi tables and their journal. Uninstall endpoint plugins
+before rolling back: the 0112 revert refuses to run while one is installed. The
+rollback target is 0.8.4, not 0.8.3. To go back to 0.8.2, run `0110_revert.sql`
+next.
 
 ### Upgrading from 0.8.3: rollback target for Fork Run approval
 

@@ -2,7 +2,7 @@
 //! `GET` and `PUT /v1/orgs/{org}/security/fork-run-approval`.
 //!
 //! Three values: `off`, `agent_started` (the default: a Run of fork code
-//! started through an `oauth` PrincipalToken, which nothing mints yet) and
+//! started through an `oauth` PrincipalToken, which the OAuth authorization server mints when it is enabled) and
 //! `all`. For each Run of fork code the setting gates, Run creation puts
 //! one `manual` gate in front of every root Step
 //! ([`add_fork_run_approval_gate`](scarab_policy::fork_run_approval_gate::add_fork_run_approval_gate)),

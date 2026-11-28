@@ -22,7 +22,7 @@ const CHOICES: { id: ForkRunApprovalChoice; name: string; what: string }[] = [
     name: "Runs an app started",
     what:
       "A Run of fork code waits when an app connected to Scarab, such as an AI agent, " +
-      "started it. No app can connect to this server yet, so today no Run waits. The default.",
+      "started it. While no app is connected, no Run waits. The default.",
   },
   {
     id: "all",
