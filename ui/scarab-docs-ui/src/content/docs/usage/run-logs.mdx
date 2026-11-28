@@ -72,7 +72,7 @@ percent-encoded (see [Step keys](/scarab-ci/get-started/deploy-helm/#step-keys))
 | Call | What it returns |
 |------|-----------------|
 | `GET /v1/runs/{id}/steps/{step}/logs` | one step's log as Server-Sent Events. `?attempt=` picks one try, `?tail=<bytes>` asks for the end of the log only (at most 64 MiB), `?from=<event id>` resumes |
-| `GET /v1/runs/{id}/steps/{step}/logs/raw?attempt=<id>` | one try's whole log as `text/plain`, sent as an attachment, each note written as a line `[scarab] <text>`. `?markers=none` returns the stored output bytes only. `?sidecar=<index>` reads a sidecar's log for the same try. `attempt` is required |
+| `GET /v1/runs/{id}/steps/{step}/logs/raw?attempt=<id>` | one try's whole log as `text/plain`, sent as an attachment, each note written as a line `[scarab] <text>`. `?markers=none` returns the stored output bytes only. `?sidecar=<index>` reads a sidecar's log for the same try. `attempt` is an attempt id such as `a1` (listed as `steps[].attempt_list[].id` by `GET /v1/runs/{id}`), not a number; without it, the Step's latest attempt. An unknown id answers 404 and lists the Step's attempt ids |
 | `GET /v1/runs/{id}/services/{service}/logs` | one shared service's log, with the same `?tail=` and `?from=` |
 | `GET /v1/runs/{id}/services/{service}/logs/raw?take=<n>` | one shared service's whole log in Take `n` as `text/plain`, sent as an attachment named `scarab-<run>-<service>-take<n>.log` (a character outside `A-Z`, `a-z`, `0-9`, `_` and `-` becomes `_`). Without `?take=`, the current Take. `?markers=none` as above |
 | `GET /v1/runs/{id}/logs` | every step's log, as `scarab logs` reads it. Event ids, no `?tail=` |

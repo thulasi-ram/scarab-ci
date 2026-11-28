@@ -2083,6 +2083,9 @@ fn service_status_dto(s: &scarab_engine::RunService) -> ServiceStatusDto {
 
 pub enum ApiError {
     NotFound,
+    /// A 404 whose text tells the caller what to change (e.g. the valid
+    /// attempt ids).
+    NotFoundWith(String),
     Unauthorized,
     Forbidden,
     BadRequest(String),
@@ -2188,6 +2191,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
+            ApiError::NotFoundWith(m) => (StatusCode::NOT_FOUND, m).into_response(),
             ApiError::Unauthorized => {
                 (StatusCode::UNAUTHORIZED, "authentication required").into_response()
             }
@@ -3491,10 +3495,12 @@ async fn get_step_logs(
     .await
 }
 
-/// The selector for a raw log download: the attempt is required.
+/// The selector for a raw log download: the attempt id, default the Step's
+/// latest attempt.
 #[derive(Debug, Deserialize)]
 struct RawLogsQuery {
-    attempt: String,
+    #[serde(default)]
+    attempt: Option<String>,
     #[serde(default)]
     sidecar: Option<usize>,
     /// `none`: the stored output bytes only, no marker lines.
@@ -3622,14 +3628,14 @@ async fn raw_log_response(
     params(
         ("id" = String, Path, description = "run id"),
         ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded"),
-        ("attempt" = String, Query, description = "the attempt id (required)"),
+        ("attempt" = Option<String>, Query, description = "the attempt id (for example `a1`, from `steps[].attempt_list[].id` of `GET /v1/runs/{id}`), not a number; default = the step's latest attempt"),
         ("sidecar" = Option<usize>, Query, description = "a sidecar service by its index in the step's services (default = the step's main container)"),
         ("markers" = Option<String>, Query, description = "`none`: the stored output bytes exactly, with no `[scarab] …` marker lines; default: marker rows are written as `[scarab] <text>` lines")
     ),
     responses(
         (status = 200, description = "the try's log as text/plain, sent as an attachment; the X-Scarab-Log-Markers header counts the log's marker rows", content_type = "text/plain"),
-        (status = 400, description = "no attempt given, or `markers` is not `none` or `lines`"),
-        (status = 404, description = "no such run, step or attempt")
+        (status = 400, description = "`markers` is not `none` or `lines`"),
+        (status = 404, description = "no such run or step, the step has no attempt yet, or `attempt` is not one of the step's attempt ids (the message lists them)")
     )
 )]
 async fn get_step_logs_raw(
@@ -3650,13 +3656,36 @@ async fn get_step_logs_raw(
         .into_iter()
         .find(|s| s.step == step)
         .ok_or(ApiError::NotFound)?;
-    let attempt = scarab_engine::AttemptId(q.attempt);
-    let try_no = sr
-        .attempts
-        .iter()
-        .position(|a| a.id == attempt)
-        .ok_or(ApiError::NotFound)?
-        + 1;
+    let ids = || {
+        sr.attempts
+            .iter()
+            .map(|a| a.id.0.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let try_no = match &q.attempt {
+        None => {
+            if sr.attempts.is_empty() {
+                return Err(ApiError::NotFoundWith(
+                    "the step has no attempt yet".to_string(),
+                ));
+            }
+            sr.attempts.len()
+        }
+        Some(given) => sr
+            .attempts
+            .iter()
+            .position(|a| a.id.0 == *given)
+            .map(|i| i + 1)
+            .ok_or_else(|| {
+                ApiError::NotFoundWith(format!(
+                    "no attempt `{given}`: `attempt` takes an attempt id (for example `a1`), \
+                     not a number. This step's attempt ids: {}",
+                    ids()
+                ))
+            })?,
+    };
+    let attempt = sr.attempts[try_no - 1].id.clone();
     let read_step = match q.sidecar {
         Some(i) => crate::logs::sidecar_stream_key(&step, i),
         None => step.clone(),

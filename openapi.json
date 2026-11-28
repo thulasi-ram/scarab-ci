@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
     },
-    "version": "0.8.4"
+    "version": "0.9.0"
   },
   "paths": {
     "/.well-known/jwks.json": {
@@ -9354,8 +9354,8 @@
           {
             "name": "attempt",
             "in": "query",
-            "description": "the attempt id (required)",
-            "required": true,
+            "description": "the attempt id (for example `a1`, from `steps[].attempt_list[].id` of `GET /v1/runs/{id}`), not a number; default = the step's latest attempt",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -9388,10 +9388,10 @@
             }
           },
           "400": {
-            "description": "no attempt given, or `markers` is not `none` or `lines`"
+            "description": "`markers` is not `none` or `lines`"
           },
           "404": {
-            "description": "no such run, step or attempt"
+            "description": "no such run or step, the step has no attempt yet, or `attempt` is not one of the step's attempt ids (the message lists them)"
           }
         },
         "security": [

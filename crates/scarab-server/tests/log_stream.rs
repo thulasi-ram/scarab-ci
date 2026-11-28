@@ -327,8 +327,17 @@ async fn raw_download_streams_the_whole_try_as_an_attachment() {
     let a1_len = 300 * KIB;
     assert_eq!(&bytes[..], full[a1_len..].as_bytes());
 
-    let (status, _) = get(&app, "/v1/runs/r1/steps/build/logs/raw", None).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "the attempt is required");
+    // No `attempt`: the latest one, a2.
+    let (status, body) = get(&app, "/v1/runs/r1/steps/build/logs/raw", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_bytes(), full[a1_len..].as_bytes());
+    // A number is not an attempt id: the 404 names the ids that are.
+    let (status, body) = get(&app, "/v1/runs/r1/steps/build/logs/raw?attempt=1", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.contains("attempt id") && body.contains("a1, a2"),
+        "{body}"
+    );
     let (status, _) = get(&app, "/v1/runs/r1/steps/build/logs/raw?attempt=ghost", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = get(&app, "/v1/runs/r1/steps/ghost/logs/raw?attempt=a1", None).await;

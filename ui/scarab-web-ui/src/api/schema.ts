@@ -14116,9 +14116,9 @@ export interface operations {
     };
     get_step_logs_raw: {
         parameters: {
-            query: {
-                /** @description the attempt id (required) */
-                attempt: string;
+            query?: {
+                /** @description the attempt id (for example `a1`, from `steps[].attempt_list[].id` of `GET /v1/runs/{id}`), not a number; default = the step's latest attempt */
+                attempt?: string;
                 /** @description a sidecar service by its index in the step's services (default = the step's main container) */
                 sidecar?: number;
                 /** @description `none`: the stored output bytes exactly, with no `[scarab] …` marker lines; default: marker rows are written as `[scarab] <text>` lines */
@@ -14144,14 +14144,14 @@ export interface operations {
                     "text/plain": unknown;
                 };
             };
-            /** @description no attempt given, or `markers` is not `none` or `lines` */
+            /** @description `markers` is not `none` or `lines` */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description no such run, step or attempt */
+            /** @description no such run or step, the step has no attempt yet, or `attempt` is not one of the step's attempt ids (the message lists them) */
             404: {
                 headers: {
                     [name: string]: unknown;

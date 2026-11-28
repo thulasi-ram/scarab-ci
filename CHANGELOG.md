@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-28
+
 ### Breaking changes
 
 - **The OIDC issuer's key id changes.** The `kid` of the signing key, in the JWKS and in every
@@ -175,6 +177,22 @@ release.yml uses that version's section as the GitHub Release text. See
 - **A step launch reads only its Run's trigger record.** Deciding a Step's OIDC token, its fork
   status and its follow-ups read the one event Run creation records, not the Run's whole event
   log, at each launch.
+- **The raw step log needs no `attempt`.** `GET /v1/runs/{id}/steps/{step}/logs/raw` returns the
+  Step's latest attempt when `?attempt=` is left out; it answered 400 "missing field `attempt`".
+  `attempt` is an attempt id such as `a1`, not a number. An unknown value answers 404 and lists
+  the Step's attempt ids (#224).
+
+### Bug Fixes
+
+- **The MCP `get_step_results` tool works for a Step whose id holds a `/`.** An inlined library
+  Step such as `image/push` put the `/` in the request path, and behind a proxy that decodes `%2F`
+  the call got a 307, then a 404. The tool now reads the Run and sends the Step's key, as
+  `get_step_logs` does (#224).
+
+### Tests
+
+- **The stub identity provider's keys exist before it serves.** The login-flow tests no longer
+  fail at random when a request reaches the stub before its keys are generated.
 
 ## [0.8.4] - 2026-11-28
 
@@ -3029,7 +3047,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.4...v0.9.0
 [0.8.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.1...v0.8.2

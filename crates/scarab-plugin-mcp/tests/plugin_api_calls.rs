@@ -87,6 +87,17 @@ async fn answer(State(b): State<Broker>, req: Request) -> Response {
         )
             .into_response(),
         ("GET", "/v1/runs/r1") => Json(run()).into_response(),
+        ("GET", "/v1/runs/rlib") => Json(json!({
+            "id": "rlib",
+            "status": "failed",
+            "steps": [{
+                "key": "image-push",
+                "id": "image/push",
+                "status": "failed",
+                "attempt_list": [{ "id": "a1", "outcome": "failed" }]
+            }]
+        }))
+        .into_response(),
         ("GET", p) if p.ends_with("/logs/raw") => log_text().into_response(),
         ("GET", p) if p.ends_with("/runs") => Json(json!({ "runs": [] })).into_response(),
         ("GET", _) => Json(json!([])).into_response(),
@@ -431,4 +442,42 @@ fn the_manifest_routes_protocol_notifications_with_no_operations() {
         assert_eq!(routed[0]["match"]["method"], "POST", "{method}");
         assert_eq!(routed[0]["may"], json!([]), "{method}");
     }
+}
+
+#[tokio::test]
+async fn get_step_results_sends_the_steps_key_never_its_authored_id() {
+    let (base, b) = broker().await;
+    let http = reqwest::Client::new();
+    let token = token_file("authored-id");
+    let api = ScarabApi {
+        http: &http,
+        base: &base,
+        api_token_file: &token,
+        handle: HANDLE,
+        timeout: Duration::from_secs(10),
+    };
+    for args in [
+        json!({ "run_id": "rlib", "step": "image/push" }),
+        json!({ "run_id": "rlib", "step": "image/push", "attempt": 1 }),
+    ] {
+        let outcome = tools::call(&api, "get_step_results", &args).await;
+        assert!(!outcome.is_error, "{args}: {}", outcome.text);
+        let paths: Vec<String> = b.take().into_iter().map(|c| c.path).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/v1/runs/rlib".to_string(),
+                "/v1/runs/rlib/steps/image-push/results".to_string()
+            ],
+            "{args}"
+        );
+    }
+    let unknown = tools::call(
+        &api,
+        "get_step_results",
+        &json!({ "run_id": "rlib", "step": "nope" }),
+    )
+    .await;
+    assert!(unknown.is_error);
+    assert!(unknown.text.contains("no Step"), "{}", unknown.text);
 }
