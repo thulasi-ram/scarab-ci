@@ -1,42 +1,53 @@
 ---
 title: Fork Run approval
-description: An org setting that holds every Run of fork code at an approval gate until someone with write on the repository approves it. Approving it starts the Run and unlocks nothing else.
+description: An org setting that holds Runs of fork code at an approval gate until someone with write on the repository approves them. Approving starts the Run and unlocks nothing else.
 ---
 
-Fork Run approval is an org setting. While it is on, a Run of **fork code** waits at an approval
-gate before any of its steps or shared services start. Someone with write on the repository
-approves it from the Run page, and the Run continues. It is off until an org admin turns it on.
+Fork Run approval is an org setting that decides which Runs of **fork code** wait at an approval
+gate before any of their steps or shared services start. Someone with write on the repository
+approves the gate from the Run page, and the Run continues.
+
+| Setting | Which Runs of fork code wait |
+|---------|------------------------------|
+| `off` | none |
+| `agent_started` (the default) | those an app connected to Scarab started for someone, such as an AI agent: a Run whose dispatch came through an `oauth` token |
+| `all` | every one, whoever or whatever started it |
+
+No server can issue an `oauth` token yet; that arrives with OAuth sign-in for apps. Until then no
+Run counts as started by an app, so under `agent_started` no Run waits. Choose `all` to hold Runs of
+fork code started by people, API tokens and pull requests from forks.
 
 A Run is fork code when it builds a pull request from another repository, or a commit that no
 branch or tag of the repository points at (see [Runs](/scarab-ci/usage/runs/#starting-a-run-by-hand)).
 Fork code gets no secrets whether or not this setting is on. The setting adds a person who
 decides whether the code runs at all.
 
-## Turning it on
+## Changing it
 
-In **Org settings › Security**, tick **Hold Runs of fork code for approval**. Only an org admin can
-change it, and only from a signed-in browser: an API token, a session sent as `Bearer`, or an app
-acting for you cannot. Turning it off asks you to confirm with your passkey; turning it on does
-not. Each change is recorded in the org's security events as `fork_run_approval.changed`, with the
-old and new value.
+In **Org settings › Security**, pick one of the three under **Fork Run approval**. Only an org admin
+can change it, and only from a signed-in browser: an API token, a session sent as `Bearer`, or an
+app acting for you cannot. A change that holds fewer Runs (`all` to `agent_started`, `all` to
+`off`, `agent_started` to `off`) asks you to confirm with your passkey; a change that holds more
+does not. Each change is recorded in the org's security events as `fork_run_approval.changed`,
+with the old and new setting.
 
 The API is `GET` and `PUT /v1/orgs/{org}/security/fork-run-approval`:
 
 ```bash
 curl -s "$SCARAB_ADDR/v1/orgs/acme/security/fork-run-approval" \
   -H "Authorization: Bearer $SCARAB_TOKEN"
-# {"enabled":true,"can_change":false}
+# {"setting":"all","can_change":false}
 ```
 
-Reading it needs the `settings.read` operation. The `PUT` body is `{"enabled": true}` or
-`{"enabled": false}`.
+Reading it needs the `settings.read` operation. The `PUT` body is
+`{"setting": "off" | "agent_started" | "all"}`.
 
 The setting applies to Runs created after the change. A Run created before it keeps its gate, or
 runs without one.
 
 ## The gate
 
-Scarab adds one `manual` gate, `fork-run-approval`, with no `needs`, and puts it in the `needs`
+For each Run of fork code the setting holds, Scarab adds one `manual` gate, `fork-run-approval`, with no `needs`, and puts it in the `needs`
 of every step that had none. Nothing in the Run starts before it is approved, and the Run's shared
 services wait too. The Run page labels the gate "added by Fork Run approval". A step whose
 `when:` is false at creation is left out, and a Run with no step that would start gets no gate.
@@ -88,5 +99,5 @@ A **Retry** of a failed step stays in the current version and does not ask again
 
 The setting is stored in migration 0114. 0.8.4 is the release to roll back to: it reads Runs that
 have the gate and holds them at it, and an earlier server cannot load such a Run. Before you roll
-back, turn the setting off in every org and approve or reject the gates still waiting. See the
+back, set it to `off` in every org and approve or reject the gates still waiting. See the
 chart README, "Upgrading from 0.8.4", for the revert script.

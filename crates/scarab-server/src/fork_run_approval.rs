@@ -1,8 +1,10 @@
 //! An org's **Fork Run approval** setting (ADR-0086 §9):
 //! `GET` and `PUT /v1/orgs/{org}/security/fork-run-approval`.
 //!
-//! While it is on, Run creation puts one `manual` gate in front of every
-//! root Step of a Run of fork code
+//! Three values: `off`, `agent_started` (the default: a Run of fork code
+//! started through an `oauth` PrincipalToken, which nothing mints yet) and
+//! `all`. For each Run of fork code the setting gates, Run creation puts
+//! one `manual` gate in front of every root Step
 //! ([`add_fork_run_approval_gate`](scarab_policy::fork_run_approval_gate::add_fork_run_approval_gate)),
 //! so nothing in the Run starts, its shared services included, until
 //! someone with write on the repository releases it. The gate unlocks
@@ -11,9 +13,11 @@
 //! Anyone who may read the org reads the setting (`settings.read`). Only an
 //! org admin changes it, only from a signed-in browser: no API token, no
 //! Bearer session and no app acting for someone may change it, so it is
-//! never part of a delegated grant. Turning it off asks for a passkey
-//! confirmation of its own; turning it on does not. Each change is recorded
-//! in the org's security events (`fork_run_approval.changed`).
+//! never part of a delegated grant. A change that gates fewer Runs (`all` →
+//! `agent_started`, `all` → `off`, `agent_started` → `off`) asks for a
+//! passkey confirmation of its own; one that gates more does not. Each
+//! change is recorded in the org's security events
+//! (`fork_run_approval.changed`).
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -28,13 +32,46 @@ use scarab_identity::{security_event_kind as kind, Action, ForkRunApproval};
 use crate::step_up::GuardCtx;
 use crate::{authenticate, refuse_reserved_org, ApiError, AppState};
 
+/// Which Runs of fork code wait at the Fork Run approval gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkRunApprovalSettingDto {
+    /// None.
+    Off,
+    /// Those started through an `oauth` token: an app acting for someone,
+    /// such as an agent. The default.
+    AgentStarted,
+    /// Every Run of fork code.
+    All,
+}
+
+impl From<ForkRunApproval> for ForkRunApprovalSettingDto {
+    fn from(s: ForkRunApproval) -> Self {
+        match s {
+            ForkRunApproval::Off => Self::Off,
+            ForkRunApproval::AgentStarted => Self::AgentStarted,
+            ForkRunApproval::All => Self::All,
+        }
+    }
+}
+
+impl From<ForkRunApprovalSettingDto> for ForkRunApproval {
+    fn from(s: ForkRunApprovalSettingDto) -> Self {
+        match s {
+            ForkRunApprovalSettingDto::Off => Self::Off,
+            ForkRunApprovalSettingDto::AgentStarted => Self::AgentStarted,
+            ForkRunApprovalSettingDto::All => Self::All,
+        }
+    }
+}
+
 /// An org's Fork Run approval setting: `GET` and `PUT`
 /// `/v1/orgs/{org}/security/fork-run-approval`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ForkRunApprovalDto {
-    /// A Run of fork code waits at a `manual` gate before any of its Steps
-    /// starts, until someone with write on the repository releases it.
-    pub enabled: bool,
+    /// Which Runs of fork code wait at a `manual` gate before any of their
+    /// Steps starts, until someone with write on the repository releases it.
+    pub setting: ForkRunApprovalSettingDto,
     /// The caller may change the setting: an admin of the org, in a
     /// signed-in browser.
     pub can_change: bool,
@@ -44,9 +81,9 @@ pub struct ForkRunApprovalDto {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForkRunApprovalUpdate {
-    /// `true` turns Fork Run approval on. `false` turns it off, which asks
+    /// The new setting. One that gates fewer Runs than the current one asks
     /// for a passkey confirmation.
-    pub enabled: bool,
+    pub setting: ForkRunApprovalSettingDto,
 }
 
 /// Is `caller` a person in a signed-in browser: no API token, no session
@@ -62,8 +99,8 @@ async fn is_org_admin(st: &AppState, caller: &crate::Caller, org: &str) -> Resul
         || caller.may(st, Action::Administer, &scope).await?)
 }
 
-/// The setting stored for `org`, off when it has none or the server keeps
-/// none.
+/// The setting stored for `org`; the default, `agent_started`, when it has
+/// none or the server keeps none.
 async fn org_setting(st: &AppState, org: &str) -> Result<ForkRunApproval, ApiError> {
     match st.fork_run_approval.as_deref() {
         Some(store) => Ok(store
@@ -76,7 +113,7 @@ async fn org_setting(st: &AppState, org: &str) -> Result<ForkRunApproval, ApiErr
 }
 
 /// An org's Fork Run approval setting, and whether the caller may change
-/// it. Off when no admin has turned it on.
+/// it. `agent_started` when no admin has changed it.
 #[utoipa::path(
     get,
     path = "/v1/orgs/{org}/security/fork-run-approval",
@@ -102,16 +139,17 @@ pub(crate) async fn get_fork_run_approval(
         && st.fork_run_approval.is_some()
         && is_org_admin(&st, &caller, &org).await?;
     Ok(Json(ForkRunApprovalDto {
-        enabled: setting.enabled,
+        setting: setting.into(),
         can_change,
     }))
 }
 
-/// Turn an org's Fork Run approval on or off. Org admin only, from a
-/// signed-in browser. Turning it off asks for a passkey confirmation of its
-/// own: a Run of fork code would start with no approval. Turning it on
-/// asks for none. A request that changes nothing asks for no confirmation
-/// and records nothing. Recorded in the org's security events
+/// Change an org's Fork Run approval setting. Org admin only, from a
+/// signed-in browser. A change that gates fewer Runs (`all` →
+/// `agent_started`, `all` → `off`, `agent_started` → `off`) asks for a
+/// passkey confirmation of its own; one that gates more asks for none. A
+/// request that changes nothing asks for no confirmation and records
+/// nothing. Recorded in the org's security events
 /// (`fork_run_approval.changed`) with the old and the new value. Runs
 /// created before the change keep or lack their gate.
 #[utoipa::path(
@@ -119,11 +157,11 @@ pub(crate) async fn get_fork_run_approval(
     path = "/v1/orgs/{org}/security/fork-run-approval",
     params(("org" = String, Path, description = "org")),
     request_body = ForkRunApprovalUpdate,
-    summary = "Turn an org's Fork Run approval on or off (admin; always-ask step-up to turn it off)",
+    summary = "Change an org's Fork Run approval setting (admin; always-ask step-up to loosen it)",
     responses(
         (status = 200, body = ForkRunApprovalDto),
-        (status = 400, description = "a body that is not `{\"enabled\": true}` or `{\"enabled\": false}`, or a reserved org (plain text)"),
-        (status = 403, description = "`browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an admin of the org; or `step_up_required` (mode `action`) to turn it off"),
+        (status = 400, description = "a body that is not `{\"setting\": \"off\" | \"agent_started\" | \"all\"}`, or a reserved org (plain text)"),
+        (status = 403, description = "`browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an admin of the org; or `step_up_required` (mode `action`) for a change that gates fewer Runs"),
         (status = 404, description = "the setting cannot be stored on this server")
     )
 )]
@@ -150,12 +188,12 @@ pub(crate) async fn put_fork_run_approval(
     let store = st.fork_run_approval.clone().ok_or(ApiError::NotFound)?;
     let Ok(update) = serde_json::from_slice::<ForkRunApprovalUpdate>(&body) else {
         return Err(ApiError::BadRequest(
-            "the body must be JSON of the form {\"enabled\": true} or {\"enabled\": false}".into(),
+            "the body must be JSON of the form {\"setting\": \"off\"}, \
+             {\"setting\": \"agent_started\"} or {\"setting\": \"all\"}"
+                .into(),
         ));
     };
-    let new = ForkRunApproval {
-        enabled: update.enabled,
-    };
+    let new = ForkRunApproval::from(update.setting);
     let old = store
         .fork_run_approval(&org)
         .await
@@ -164,7 +202,7 @@ pub(crate) async fn put_fork_run_approval(
     if new == old {
         guard.exempt("the setting does not change");
         return Ok(Json(ForkRunApprovalDto {
-            enabled: old.enabled,
+            setting: old.into(),
             can_change: true,
         })
         .into_response());
@@ -174,13 +212,13 @@ pub(crate) async fn put_fork_run_approval(
             .require(
                 &st,
                 vec![
-                    "enabled = true → false".to_string(),
-                    "a Run of fork code starts with no approval".to_string(),
+                    format!("setting = {} → {}", old.as_str(), new.as_str()),
+                    "fewer Runs of fork code wait for approval".to_string(),
                 ],
             )
             .await?;
     } else {
-        guard.exempt("turning Fork Run approval on only adds a gate");
+        guard.exempt("the new setting gates more Runs of fork code");
     }
 
     let subject = caller.principal.subject.clone();
@@ -205,8 +243,8 @@ pub(crate) async fn put_fork_run_approval(
         ev.confirmation_id = guard.confirmation_id();
         ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
         ev.detail = serde_json::json!({
-            "old": { "enabled": old.enabled },
-            "new": { "enabled": new.enabled },
+            "old": old.as_str(),
+            "new": new.as_str(),
         });
         // The change is stored; `op.authorised`, written before it when a
         // confirmation was asked for, already records it. This record is
@@ -216,7 +254,7 @@ pub(crate) async fn put_fork_run_approval(
         }
     }
     Ok(Json(ForkRunApprovalDto {
-        enabled: new.enabled,
+        setting: new.into(),
         can_change: true,
     })
     .into_response())

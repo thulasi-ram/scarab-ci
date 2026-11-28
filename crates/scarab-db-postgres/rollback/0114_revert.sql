@@ -4,7 +4,7 @@
 -- changes nothing.
 --
 -- Before running it:
---   1. turn Fork Run approval off in every org that has it on, and release
+--   1. set Fork Run approval to `off` in every org, and release
 --      or reject the Fork Run approval gates still waiting (a Run created
 --      while the setting was on keeps its gate after the revert);
 --   2. scale every Scarab server to zero (no server that ran 0114 may run
@@ -14,7 +14,7 @@
 -- (so psql exits non-zero when a statement fails).
 --
 -- What is lost: each org's setting. Upgrading again runs 0114 again, and
--- every org starts with the setting off. A Run that has the gate keeps it:
+-- every org starts on the default, `agent_started`. A Run that has the gate keeps it:
 -- 0.8.4 and later read it, an earlier server cannot load such a Run.
 --
 -- To go back further, run the revert script of every other migration above

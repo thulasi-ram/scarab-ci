@@ -1,12 +1,38 @@
-// Organization settings → Security → Fork Run approval: whether a Run of
-// fork code (a pull request from a fork, or a commit no branch or tag of the
-// repository names) waits at an approval gate before any of its steps or
-// services start. Members read it; an org admin turns it on or off from here.
-// Turning it off asks for a passkey confirmation through the client's step-up
-// retry; turning it on does not.
-import { createResource, createSignal, Show } from "solid-js";
-import { getForkRunApproval, setForkRunApproval } from "../api/client";
-import { Checkbox } from "./Field";
+// Organization settings → Security → Fork Run approval: which Runs of fork
+// code (a pull request from a fork, or a commit no branch or tag of the
+// repository names) wait at an approval gate before any of their steps or
+// services start. Members read it; an org admin changes it from here. A
+// change that holds fewer Runs asks for a passkey confirmation through the
+// client's step-up retry; one that holds more does not.
+import { createResource, createSignal, For, Show } from "solid-js";
+import {
+  getForkRunApproval,
+  setForkRunApproval,
+  type ForkRunApprovalChoice,
+} from "../api/client";
+
+const CHOICES: { id: ForkRunApprovalChoice; name: string; what: string }[] = [
+  {
+    id: "off",
+    name: "Off",
+    what: "No Run of fork code waits for approval.",
+  },
+  {
+    id: "agent_started",
+    name: "Runs an app started",
+    what:
+      "A Run of fork code waits when an app connected to Scarab, such as an AI agent, " +
+      "started it. No app can connect to this server yet, so today no Run waits. The default.",
+  },
+  {
+    id: "all",
+    name: "Every Run of fork code",
+    what: "Every Run of fork code waits, whoever or whatever started it.",
+  },
+];
+
+/** Gates fewer Runs: off < agent_started < all. */
+const RANK: Record<ForkRunApprovalChoice, number> = { off: 0, agent_started: 1, all: 2 };
 
 export default function ForkRunApproval(props: { org: string }) {
   const [setting, { mutate }] = createResource(() => props.org, getForkRunApproval);
@@ -14,18 +40,13 @@ export default function ForkRunApproval(props: { org: string }) {
   const [notice, setNotice] = createSignal<string | null>(null);
   const [refusal, setRefusal] = createSignal<string | null>(null);
 
-  const change = async (enabled: boolean) => {
+  const change = async (next: ForkRunApprovalChoice) => {
     setBusy(true);
     setNotice(null);
     setRefusal(null);
     try {
-      const next = await setForkRunApproval(props.org, enabled);
-      mutate(next);
-      setNotice(
-        next.enabled
-          ? "Saved. New Runs of fork code wait for approval."
-          : "Saved. New Runs of fork code start without approval.",
-      );
+      mutate(await setForkRunApproval(props.org, next));
+      setNotice("Saved. It applies to Runs created from now on.");
     } catch (e) {
       // Not an admin, a cancelled confirmation: the server's message.
       setRefusal(e instanceof Error ? e.message : "Could not save the setting.");
@@ -52,29 +73,40 @@ export default function ForkRunApproval(props: { org: string }) {
         <Show when={setting()}>
           {(s) => (
             <div class="sec-block">
-              <Checkbox
-                checked={s().enabled}
-                disabled={busy() || !s().can_change}
-                onChecked={(on) => void change(on)}
-                label="Hold Runs of fork code for approval"
-                help={
-                  <>
-                    A Run of code from a fork, or of a commit no branch or tag of the repository
-                    names, waits at an approval gate before any of its steps or services start.
-                    Anyone with write on the repository can approve it from the Run page. An API
-                    token's owner confirms each approval; an app connected to Scarab cannot
-                    approve. An approved Run still gets no Environment secrets, registry
-                    credentials or cloud roles. The gate fails the Run after 72 hours. A rerun
-                    waits for approval again.
-                  </>
-                }
-              />
+              <p class="subtle">
+                A Run of code from a fork, or of a commit no branch or tag of the repository names,
+                can wait at an approval gate before any of its steps or services start. Anyone with
+                write on the repository approves it from the Run page; an API token's owner
+                confirms each approval, and an app cannot approve. An approved Run still gets no
+                Environment secrets, registry credentials or cloud roles. The gate fails the Run
+                after 72 hours, and a rerun waits for approval again.
+              </p>
+              <div class="sec-pick" role="radiogroup" aria-label="Which Runs wait for approval">
+                <For each={CHOICES}>
+                  {(c) => (
+                    <label classList={{ on: s().setting === c.id }}>
+                      <input
+                        type="radio"
+                        name="fork-run-approval"
+                        value={c.id}
+                        checked={s().setting === c.id}
+                        disabled={busy() || !s().can_change}
+                        onChange={() => void change(c.id)}
+                      />
+                      <span class="conn-forge">
+                        <span class="tok-name">{c.name}</span>
+                        <span class="subtle">{c.what}</span>
+                      </span>
+                    </label>
+                  )}
+                </For>
+              </div>
               <p class="subtle">
                 Runs created before a change keep or lack their gate.
                 <Show when={!s().can_change}> Only an org admin, in a browser, can change this.</Show>
-                <Show when={s().can_change && s().enabled}>
+                <Show when={s().can_change && RANK[s().setting] > 0}>
                   {" "}
-                  Turning it off asks you to confirm with your passkey.
+                  A change that holds fewer Runs asks you to confirm with your passkey.
                 </Show>
               </p>
             </div>

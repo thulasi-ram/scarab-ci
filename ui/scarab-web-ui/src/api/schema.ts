@@ -1701,7 +1701,7 @@ export interface paths {
         };
         /** An org's Fork Run approval setting */
         get: operations["get_fork_run_approval"];
-        /** Turn an org's Fork Run approval on or off (admin; always-ask step-up to turn it off) */
+        /** Change an org's Fork Run approval setting (admin; always-ask step-up to loosen it) */
         put: operations["put_fork_run_approval"];
         post?: never;
         delete?: never;
@@ -3953,18 +3953,23 @@ export interface components {
              */
             can_change: boolean;
             /**
-             * @description A Run of fork code waits at a `manual` gate before any of its Steps
-             *     starts, until someone with write on the repository releases it.
+             * @description Which Runs of fork code wait at a `manual` gate before any of their
+             *     Steps starts, until someone with write on the repository releases it.
              */
-            enabled: boolean;
+            setting: components["schemas"]["ForkRunApprovalSettingDto"];
         };
+        /**
+         * @description Which Runs of fork code wait at the Fork Run approval gate.
+         * @enum {string}
+         */
+        ForkRunApprovalSettingDto: "off" | "agent_started" | "all";
         /** @description `PUT /v1/orgs/{org}/security/fork-run-approval` body. */
         ForkRunApprovalUpdate: {
             /**
-             * @description `true` turns Fork Run approval on. `false` turns it off, which asks
+             * @description The new setting. One that gates fewer Runs than the current one asks
              *     for a passkey confirmation.
              */
-            enabled: boolean;
+            setting: components["schemas"]["ForkRunApprovalSettingDto"];
         };
         /** @description The answer to a gate approval. */
         GateApprovalDto: {
@@ -11827,14 +11832,14 @@ export interface operations {
                     "application/json": components["schemas"]["ForkRunApprovalDto"];
                 };
             };
-            /** @description a body that is not `{"enabled": true}` or `{"enabled": false}`, or a reserved org (plain text) */
+            /** @description a body that is not `{"setting": "off" | "agent_started" | "all"}`, or a reserved org (plain text) */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description `browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an admin of the org; or `step_up_required` (mode `action`) to turn it off */
+            /** @description `browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an admin of the org; or `step_up_required` (mode `action`) for a change that gates fewer Runs */
             403: {
                 headers: {
                     [name: string]: unknown;

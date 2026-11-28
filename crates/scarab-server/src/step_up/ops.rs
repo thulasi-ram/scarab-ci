@@ -1152,12 +1152,13 @@ pub static LEAK_CHECK_LIMITS_PUT: Op = op(
 pub static FORK_RUN_APPROVAL_PUT: Op = op(
     "fork_run_approval.put",
     "Change the org's Fork Run approval setting",
-    // Turning it off asks for a passkey confirmation of its own: a Run of
-    // fork code would start with no approval. Turning it on, or a request
-    // that changes nothing, is exempt.
+    // A change that gates fewer Runs of fork code (`all` → `agent_started`,
+    // `all` → `off`, `agent_started` → `off`) asks for a passkey
+    // confirmation of its own. One that gates more, or a request that
+    // changes nothing, is exempt.
     Class::Conditional {
         mode: A,
-        rule: "turning it off",
+        rule: "the new setting gates fewer Runs of fork code",
     },
     "ADR-0086 §9: loosening the setting needs a step-up",
     ADMIN,

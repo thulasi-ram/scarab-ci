@@ -571,10 +571,12 @@ table; it waits at most 5 seconds for its lock, and on a busy database the
 server stops with `canceling statement due to lock timeout` and runs it again
 when the Pod restarts. It is numbered 0114 because 0112 and 0113 are taken by
 other changes of this release line; the migrator applies by version, so the
-gap does nothing. Every org starts with the setting off, so no Run changes
-until an admin turns it on (Org settings › Security).
+gap does nothing. Every org starts on the default, `agent_started`: a Run of
+fork code that an app started through an `oauth` token waits for approval.
+Nothing issues such a token yet, so no Run changes until an admin picks `all`
+(Org settings › Security).
 
-While the setting is on, a Run of fork code gets one `manual` gate,
+A Run of fork code the setting holds gets one `manual` gate,
 `fork-run-approval`, in front of every root step. A Rerun in such a Run waits
 at the gate again; a Retry does not.
 
@@ -584,7 +586,7 @@ Environment approval gate. A server before 0.8.4 cannot load such a Run, so
 do not roll back past 0.8.4 while one exists. On 0.8.4 an issued API token
 releases a plain gate without a confirmation, so the gate is weaker there.
 
-To roll back: turn Fork Run approval off in every org, approve or reject the
+To roll back: set Fork Run approval to `off` in every org, approve or reject the
 gates still waiting, scale the server to zero, back up the database, run
 [`rollback/0114_revert.sql`](../../../crates/scarab-db-postgres/rollback/0114_revert.sql)
 (`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0114_revert.sql`; a second run

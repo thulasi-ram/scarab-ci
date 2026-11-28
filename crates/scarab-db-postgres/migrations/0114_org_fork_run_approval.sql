@@ -1,8 +1,9 @@
 -- `org_fork_run_approval` holds each org's Fork Run approval setting
--- (ADR-0086 §9): whether a Run of fork code waits, before any of its Steps
+-- (ADR-0086 §9): which Runs of fork code wait, before any of their Steps
 -- starts, at a `manual` gate someone with write on the repository releases.
--- An org admin changes it in Org settings, Security. An org with no row has
--- the setting off.
+-- `off` (none), `agent_started` (those started through an `oauth` token) or
+-- `all`. An org admin changes it in Org settings, Security. An org with no
+-- row has `agent_started`.
 --
 -- Numbered 0114, not 0112: 0112 and 0113 are taken on other branches, and
 -- this file keeps clear of both. The migrator applies by version, so the gap
@@ -17,7 +18,7 @@ SET LOCAL lock_timeout = '5s';
 
 CREATE TABLE org_fork_run_approval (
     org        TEXT    PRIMARY KEY,
-    enabled    BOOLEAN NOT NULL,
+    setting    TEXT    NOT NULL CHECK (setting IN ('off', 'agent_started', 'all')),
     updated_by TEXT    NOT NULL,
     updated_at BIGINT  NOT NULL
 );

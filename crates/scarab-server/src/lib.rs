@@ -373,8 +373,8 @@ pub struct AppState {
     pub leak_check_limits: Option<Arc<dyn scarab_identity::LeakCheckLimitsStore>>,
     /// Each org's Fork Run approval setting (ADR-0086 §9,
     /// `/v1/orgs/{org}/security/fork-run-approval`), which Run creation
-    /// reads. `None` (a hand-built state): the setting is off in every org
-    /// and cannot be changed (PUT 404).
+    /// reads. `None` (a hand-built state): every org has the default,
+    /// `agent_started`, and the setting cannot be changed (PUT 404).
     pub fork_run_approval: Option<Arc<dyn scarab_identity::ForkRunApprovalStore>>,
     /// The label, annotation and toleration keys a step author's
     /// `k8s_overlay` may set, from the operator's placement config
@@ -5435,8 +5435,8 @@ pub struct AdmissionPorts<'a> {
     /// each Step's `placement_profiles` against its registry. `None`: not
     /// checked (another executor).
     pub placement: Option<&'a scarab_executor_k8s::PlacementConfig>,
-    /// Each org's Fork Run approval setting (ADR-0086 §9). `None`: off in
-    /// every org, so no Run gets the gate.
+    /// Each org's Fork Run approval setting (ADR-0086 §9). `None`: every
+    /// org has the default, `agent_started`.
     pub fork_run_approval: Option<&'a dyn scarab_identity::ForkRunApprovalStore>,
 }
 
@@ -7939,15 +7939,20 @@ fn environment_approval_ir(
 }
 
 /// `ir` with the Fork Run approval gate (ADR-0086 §9) when `event` builds
-/// fork code and `org` has Fork Run approval on: one `manual` gate in front
-/// of every root Step, so nothing in the Run starts, its shared services
-/// included, until someone with write on the repository releases it
+/// fork code and `org`'s setting gates it: `all` gates every Run of fork
+/// code, `agent_started` (the default, for an org with no stored setting)
+/// one started through an `oauth` PrincipalToken, as the dispatch's
+/// DelegationTrail on `event` records it, and `off` none. Nothing mints an
+/// `oauth` token yet, so until one can, `agent_started` gates no Run. The
+/// gate is one `manual` gate in front of every root Step, so nothing in the
+/// Run starts, its shared services included, until someone with write on
+/// the repository releases it
 /// ([`add_fork_run_approval_gate`](scarab_policy::fork_run_approval_gate::add_fork_run_approval_gate)).
 /// It is a setting, not a Policy: no Policy adds a gate (ADR-0075). The gate
 /// unlocks nothing: a released Run is still fork code, so Environment
 /// secrets, registry credentials and the OIDC subject stay locked out. A
 /// store that cannot answer refuses the Run: the gate is never skipped by
-/// default. `store` `None` (a hand-built state): off.
+/// default. `store` `None` (a hand-built state): the default applies.
 async fn fork_run_approval_ir(
     store: Option<&dyn scarab_identity::ForkRunApprovalStore>,
     event: &scarab_forge::Event,
@@ -7955,22 +7960,35 @@ async fn fork_run_approval_ir(
     mut ir: scarab_pipeline::PipelineIr,
     excluded: &[String],
 ) -> Result<scarab_pipeline::PipelineIr, TriggerError> {
-    let Some(store) = store.filter(|_| event.is_fork_code()) else {
+    if !event.is_fork_code() {
         return Ok(ir);
+    }
+    let setting = match store {
+        Some(store) => store
+            .fork_run_approval(org)
+            .await
+            .map_err(|e| {
+                TriggerError::Db(DbError::Other(format!(
+                    "fork run approval store: {e}; the Run was not created because the org's \
+                     Fork Run approval setting could not be read"
+                )))
+            })?
+            .unwrap_or_default(),
+        None => scarab_identity::ForkRunApproval::default(),
     };
-    let setting = store.fork_run_approval(org).await.map_err(|e| {
-        TriggerError::Db(DbError::Other(format!(
-            "fork run approval store: {e}; the Run was not created because the org's Fork Run \
-             approval setting could not be read"
-        )))
-    })?;
-    if setting.is_some_and(|s| s.enabled) {
+    let started_by = event.delegation_trail().map(|t| t.token_kind.as_str());
+    if setting.gates(started_by) {
         if let Some(gate) = scarab_policy::fork_run_approval_gate::add_fork_run_approval_gate(
             &mut ir,
             scarab_identity::FORK_RUN_APPROVAL_SETTING_NAME,
             excluded,
         ) {
-            tracing::info!(org, gate = %gate, "Fork Run approval added its gate to a Run of fork code");
+            tracing::info!(
+                org,
+                gate = %gate,
+                setting = setting.as_str(),
+                "Fork Run approval added its gate to a Run of fork code"
+            );
         }
     }
     Ok(ir)
@@ -17923,6 +17941,7 @@ impl utoipa::Modify for StepUpResponses {
         secret_match::LeakCheckLimitsUpdate,
         secret_match::LeakCheckCallerRole,
         fork_run_approval::ForkRunApprovalDto,
+        fork_run_approval::ForkRunApprovalSettingDto,
         fork_run_approval::ForkRunApprovalUpdate,
         SilenceCellRequest,
         ConnectionDto,

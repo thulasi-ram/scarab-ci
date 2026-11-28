@@ -12,6 +12,7 @@ import type { LeakCheckLimits } from "../leak-checks";
 
 export type RunStatus = components["schemas"]["RunStatusResponse"];
 export type ForkRunApprovalSetting = components["schemas"]["ForkRunApprovalDto"];
+export type ForkRunApprovalChoice = components["schemas"]["ForkRunApprovalSettingDto"];
 export type CreateRunRequest = components["schemas"]["CreateRunRequest"];
 export type RunSummary = components["schemas"]["RunSummaryDto"];
 export type CatalogEntry = components["schemas"]["CatalogEntry"];
@@ -2443,8 +2444,8 @@ export async function setLeakCheckLimits(
 }
 
 /** The org's Fork Run approval setting
- * (`GET /v1/orgs/{org}/security/fork-run-approval`): whether a Run of fork
- * code waits at an approval gate, and whether the caller may change it.
+ * (`GET /v1/orgs/{org}/security/fork-run-approval`): which Runs of fork code
+ * wait at an approval gate, and whether the caller may change it.
  * `null` when the caller may not read it or the server has no such route. */
 export async function getForkRunApproval(org: string): Promise<ForkRunApprovalSetting | null> {
   const res = await fetch(`/v1/orgs/${encodeURIComponent(org)}/security/fork-run-approval`);
@@ -2453,18 +2454,19 @@ export async function getForkRunApproval(org: string): Promise<ForkRunApprovalSe
   return (await res.json()) as ForkRunApprovalSetting;
 }
 
-/** An org admin turns Fork Run approval on or off
- * (`PUT …/security/fork-run-approval`). Turning it off asks for a passkey
- * confirmation, through the same step-up retry `send` does. A refusal (not
- * an admin, a cancelled confirmation) throws the server's own message. */
+/** An org admin changes the Fork Run approval setting
+ * (`PUT …/security/fork-run-approval`). A change that gates fewer Runs asks
+ * for a passkey confirmation, through the same step-up retry `send` does. A
+ * refusal (not an admin, a cancelled confirmation) throws the server's own
+ * message. */
 export async function setForkRunApproval(
   org: string,
-  enabled: boolean,
+  setting: ForkRunApprovalChoice,
 ): Promise<ForkRunApprovalSetting> {
   const res = await send(
     `/v1/orgs/${encodeURIComponent(org)}/security/fork-run-approval`,
     "PUT",
-    { enabled },
+    { setting },
   );
   return (await res.json()) as ForkRunApprovalSetting;
 }

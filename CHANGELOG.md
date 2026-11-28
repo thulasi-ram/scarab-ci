@@ -26,8 +26,9 @@ release.yml uses that version's section as the GitHub Release text. See
   `crates/scarab-db-postgres/rollback/0111_revert.sql` with the server scaled to zero. It revokes
   the tokens that carry an operation list. See the chart README, "Upgrading from 0.8.3".
 - **Migration 0114 adds the table `org_fork_run_approval`** (each org's Fork Run approval
-  setting, off for every org). No row is rewritten. A server that does not know 0114 does not
-  start on a database that ran it: to roll back, turn the setting off in every org, then run
+  setting; an org with no row has `agent_started`). No row is rewritten. A server that does not
+  know 0114 does not start on a database that ran it: to roll back, set it to `off` in every org,
+  then run
   `crates/scarab-db-postgres/rollback/0114_revert.sql` with the server scaled to zero. Roll back
   to 0.8.4, not further: 0.8.4 is the first release that can load a Run with the Fork Run approval
   gate. See the chart README, "Upgrading from 0.8.4".
@@ -82,15 +83,18 @@ release.yml uses that version's section as the GitHub Release text. See
   with a list is stored under a different hash, so a server older than this release cannot find
   it during a rolling upgrade. See
   [API tokens](/scarab-ci/usage/api-tokens/#operations).
-- **Fork Run approval.** An org setting, off by default: while it is on, every Run of fork code
-  waits at a `manual` gate, `fork-run-approval`, before any of its steps or shared services
-  start. Anyone with write on the repository approves it from the Run page; an API token's owner
-  confirms each approval, and an app connected through OAuth cannot approve. The gate fails the
-  Run after 72 hours. It never counts as an Environment approval gate, and approving it unlocks no
-  Environment secrets, registry credentials or OIDC roles: the Run is still fork code. A Rerun
-  waits at the gate again; a Retry does not. An org admin changes the setting from a browser in
-  Org settings › Security (`/v1/orgs/{org}/security/fork-run-approval`); turning it off asks for
-  a passkey confirmation. See [Fork Run approval](/scarab-ci/usage/fork-run-approval/).
+- **Fork Run approval.** An org setting that holds Runs of fork code at a `manual` gate,
+  `fork-run-approval`, before any of their steps or shared services start: `off`,
+  `agent_started` (the default: Runs an app started through an `oauth` token) or `all`. Nothing
+  issues an `oauth` token yet, so until OAuth sign-in for apps ships, `agent_started` holds no
+  Run; choose `all` to hold every Run of fork code. Anyone with write on the repository approves
+  the gate from the Run page; an API token's owner confirms each approval, and an app cannot
+  approve. The gate fails the Run after 72 hours. It never counts as an Environment approval gate,
+  and approving it unlocks no Environment secrets, registry credentials or OIDC roles: the Run is
+  still fork code. A Rerun waits at the gate again; a Retry does not. An org admin changes the
+  setting from a browser in Org settings › Security
+  (`/v1/orgs/{org}/security/fork-run-approval`); a change that holds fewer Runs asks for a passkey
+  confirmation. See [Fork Run approval](/scarab-ci/usage/fork-run-approval/).
 
 ### Enhancement
 

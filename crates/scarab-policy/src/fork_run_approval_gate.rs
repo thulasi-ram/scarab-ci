@@ -1,6 +1,7 @@
 //! The **Fork Run approval gate** (ADR-0086 §9): the one `manual` gate the
-//! org's Fork Run approval setting puts in front of every root Step of a Run
-//! of fork code, so nothing in the Run starts, its shared services included,
+//! org's Fork Run approval setting (`off`, `agent_started`, `all`) puts in
+//! front of every root Step of a Run of fork code it holds, so nothing in
+//! the Run starts, its shared services included,
 //! until someone with write on the repository releases it.
 //!
 //! It is never an Environment approval gate

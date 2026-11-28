@@ -6393,7 +6393,7 @@
         "tags": [
           "Auth & Identity"
         ],
-        "summary": "Turn an org's Fork Run approval on or off (admin; always-ask step-up to turn it off)",
+        "summary": "Change an org's Fork Run approval setting (admin; always-ask step-up to loosen it)",
         "operationId": "put_fork_run_approval",
         "parameters": [
           {
@@ -6428,10 +6428,10 @@
             }
           },
           "400": {
-            "description": "a body that is not `{\"enabled\": true}` or `{\"enabled\": false}`, or a reserved org (plain text)"
+            "description": "a body that is not `{\"setting\": \"off\" | \"agent_started\" | \"all\"}`, or a reserved org (plain text)"
           },
           "403": {
-            "description": "`browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an admin of the org; or `step_up_required` (mode `action`) to turn it off",
+            "description": "`browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an admin of the org; or `step_up_required` (mode `action`) for a change that gates fewer Runs",
             "content": {
               "application/json": {
                 "schema": {
@@ -11827,7 +11827,7 @@
         "type": "object",
         "description": "An org's Fork Run approval setting: `GET` and `PUT`\n`/v1/orgs/{org}/security/fork-run-approval`.",
         "required": [
-          "enabled",
+          "setting",
           "can_change"
         ],
         "properties": {
@@ -11835,22 +11835,31 @@
             "type": "boolean",
             "description": "The caller may change the setting: an admin of the org, in a\nsigned-in browser."
           },
-          "enabled": {
-            "type": "boolean",
-            "description": "A Run of fork code waits at a `manual` gate before any of its Steps\nstarts, until someone with write on the repository releases it."
+          "setting": {
+            "$ref": "#/components/schemas/ForkRunApprovalSettingDto",
+            "description": "Which Runs of fork code wait at a `manual` gate before any of their\nSteps starts, until someone with write on the repository releases it."
           }
         }
+      },
+      "ForkRunApprovalSettingDto": {
+        "type": "string",
+        "description": "Which Runs of fork code wait at the Fork Run approval gate.",
+        "enum": [
+          "off",
+          "agent_started",
+          "all"
+        ]
       },
       "ForkRunApprovalUpdate": {
         "type": "object",
         "description": "`PUT /v1/orgs/{org}/security/fork-run-approval` body.",
         "required": [
-          "enabled"
+          "setting"
         ],
         "properties": {
-          "enabled": {
-            "type": "boolean",
-            "description": "`true` turns Fork Run approval on. `false` turns it off, which asks\nfor a passkey confirmation."
+          "setting": {
+            "$ref": "#/components/schemas/ForkRunApprovalSettingDto",
+            "description": "The new setting. One that gates fewer Runs than the current one asks\nfor a passkey confirmation."
           }
         },
         "additionalProperties": false

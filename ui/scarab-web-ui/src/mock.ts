@@ -2648,18 +2648,18 @@ const leakCheckLimits: components["schemas"]["LeakCheckLimitsDto"] = {
   caller_role: "owner",
 };
 const forkRunApproval: components["schemas"]["ForkRunApprovalDto"] = {
-  enabled: false,
+  setting: "agent_started",
   can_change: true,
 };
 function mockForkRunApproval(method: string, body: string): Response {
   if (method === "PUT") {
-    const req = JSON.parse(body || "{}") as { enabled?: unknown };
-    if (typeof req.enabled !== "boolean") {
-      return new Response('the body must be JSON of the form {"enabled": true} or {"enabled": false}', {
+    const req = JSON.parse(body || "{}") as { setting?: unknown };
+    if (req.setting !== "off" && req.setting !== "agent_started" && req.setting !== "all") {
+      return new Response('the body must be JSON of the form {"setting": "off" | "agent_started" | "all"}', {
         status: 400,
       });
     }
-    forkRunApproval.enabled = req.enabled;
+    forkRunApproval.setting = req.setting as typeof forkRunApproval.setting;
   }
   return json(forkRunApproval);
 }
