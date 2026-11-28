@@ -13,9 +13,11 @@ approves the gate from the Run page, and the Run continues.
 | `agent_started` (the default) | those an app connected to Scarab started for someone, such as an AI agent: a Run whose dispatch came through an `oauth` token |
 | `all` | every one, whoever or whatever started it |
 
-No server can issue an `oauth` token yet; that arrives with OAuth sign-in for apps. Until then no
-Run counts as started by an app, so under `agent_started` no Run waits. Choose `all` to hold Runs of
-fork code started by people, API tokens and pull requests from forks.
+Only the OAuth authorization server for plugin endpoints issues an `oauth` token (see
+[Connected apps](/scarab-ci/usage/connected-apps/)), and it is off until the operator turns it on.
+A Run started through a plugin endpoint also counts as started by an app. While no app is
+connected, no Run waits under `agent_started`. Choose `all` to hold Runs of fork code started by
+people, API tokens and pull requests from forks.
 
 A Run is fork code when it builds a pull request from another repository, or a commit that no
 branch or tag of the repository points at (see [Runs](/scarab-ci/usage/runs/#starting-a-run-by-hand)).

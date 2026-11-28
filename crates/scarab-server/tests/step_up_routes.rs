@@ -774,6 +774,57 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "repo.dispatch",
         "NG",
     ),
+    (
+        "POST",
+        "/v1/orgs/{org}/plugin-installations/{id}/endpoints/{*endpoint_path}",
+        "plugin.endpoint",
+        "NG",
+    ),
+    (
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        "server.read",
+        "READ",
+    ),
+    (
+        "GET",
+        "/.well-known/oauth-protected-resource/v1/orgs/{org}/plugin-installations/{id}/endpoints/{*endpoint_path}",
+        "server.read",
+        "READ",
+    ),
+    (
+        "POST",
+        "/v1/oauth/authorization-requests",
+        "oauth.authorization_request",
+        "NG",
+    ),
+    ("POST", "/v1/oauth/consent", "oauth.consent", "CJ-A"),
+    ("POST", "/oauth/token", "oauth.token", "NG"),
+    ("GET", "/v1/me/connected-apps", "account.read", "READ"),
+    (
+        "DELETE",
+        "/v1/me/connected-apps/{id}",
+        "oauth.grant.revoke_own",
+        "EX",
+    ),
+    (
+        "GET",
+        "/v1/orgs/{org}/oauth/client-metadata-hosts",
+        "settings.read",
+        "READ",
+    ),
+    (
+        "PUT",
+        "/v1/orgs/{org}/oauth/client-metadata-hosts/{host}",
+        "oauth.client_metadata_host.add",
+        "CJ-W",
+    ),
+    (
+        "DELETE",
+        "/v1/orgs/{org}/oauth/client-metadata-hosts/{host}",
+        "oauth.client_metadata_host.remove",
+        "EX",
+    ),
     ("POST", "/webhooks/github", "webhook.github", "NG"),
     ("POST", "/webhooks/forgejo", "webhook.forgejo", "NG"),
 ];
@@ -928,7 +979,7 @@ fn route_table_equals_the_openapi_spec() {
         .map(|r| {
             (
                 r.method.as_str().to_ascii_lowercase(),
-                r.path.replace("{*name}", "{name}"),
+                r.path.replace("{*", "{"),
             )
         })
         .collect();

@@ -1433,7 +1433,8 @@ pub struct RunPipelineSource {
 /// How a write reached Scarab when a PrincipalToken made it rather than its
 /// Principal's own session (ADR-0086 §6). Recorded beside `by` on the events
 /// that name who acted, so the Run page can say "Rerun by alice through API
-/// token ci-bot". Absent for a browser or CLI session.
+/// token ci-bot", or "via claude.ai, through plugin:mcp". Absent for a
+/// browser or CLI session.
 ///
 /// Read-compatible both ways: an event without it reads as `None`, and a
 /// binary that predates a field of it ignores that field.
@@ -1447,6 +1448,10 @@ pub struct DelegationTrail {
     /// The OAuth client an `oauth` token was granted to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_client: Option<String>,
+    /// The Plugin installation (its id) the write came through, when a
+    /// Plugin made it with a DelegatedCallerHandle (ADR-0086 §4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_installation: Option<String>,
 }
 
 /// The discriminated payload carried by an [`EventKind`].

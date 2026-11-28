@@ -4335,6 +4335,11 @@ export interface components {
             /** @description Connection slot names. */
             connections: components["schemas"]["ManifestDiffGroupDto"];
             /**
+             * @description Endpoint operations by `<path>/<operation>`, each compared as its
+             *     whole definition; one that changed is both removed and added.
+             */
+            endpoint_operations: components["schemas"]["ManifestDiffGroupDto"];
+            /**
              * @description Gate names; a gate whose definition changed is both removed and
              *     added.
              */
@@ -5074,6 +5079,12 @@ export interface components {
             config_keys: string[];
             connections: components["schemas"]["ConnectionSlotDto"][];
             /**
+             * @description Each request its endpoints take, one line each: `<path>/<operation>:
+             *     <method> <JSON checks>; may <operations>; writes <n>`. Empty when it
+             *     registers no endpoint.
+             */
+            endpoint_operations: string[];
+            /**
              * @description The gates the plugin resolves, by name; empty without
              *     `resolve_gates`.
              */
@@ -5085,6 +5096,12 @@ export interface components {
              */
             image?: string | null;
             plugin: string;
+            /**
+             * @description `trusted_service` when the plugin registers an endpoint: it acts for
+             *     many callers, and runs only from a publisher the operator lists.
+             *     Absent otherwise.
+             */
+            trust_tier?: string | null;
         };
         /**
          * @description An installation's storage: a PersistentVolumeClaim an

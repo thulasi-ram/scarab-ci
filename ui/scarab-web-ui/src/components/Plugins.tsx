@@ -501,6 +501,19 @@ function ManifestReviewView(props: { fetched: FetchedPluginManifest }) {
             </ul>
           </Show>
         </dd>
+        <Show when={r().endpointOperations.length > 0}>
+          <dt>Endpoint</dt>
+          <dd>
+            <p class="subtle">
+              It takes requests from outside Scarab and acts for each signed-in caller, within
+              the operations listed here and what the caller allowed. It runs only from an image
+              repository your operator trusts.
+            </p>
+            <ul class="plg-review-list">
+              <For each={r().endpointOperations}>{(op) => <li class="mono">{op}</li>}</For>
+            </ul>
+          </dd>
+        </Show>
         <dt>Installed here</dt>
         <dd>
           <Show when={r().installed.length > 0} fallback={<span class="subtle">no installation of this plugin</span>}>

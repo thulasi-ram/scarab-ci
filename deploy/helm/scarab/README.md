@@ -639,8 +639,10 @@ other changes of this release line add. They can land in any order: the
 migrator runs every migration a database has not run, whatever its number,
 so a database that ran 0114 first still runs 0112 and 0113 when they arrive,
 and none of the three depends on another. Every org starts on the default, `agent_started`: a Run of
-fork code that an app started through an `oauth` token waits for approval.
-Nothing issues such a token yet, so no Run changes until an admin picks `all`
+fork code that an app started through an `oauth` token, or through a
+plugin endpoint, waits for approval. Only the OAuth authorization server for
+plugin endpoints issues such a token, and it is off until you set
+`oauthServer.enabled`; until then no Run changes unless an admin picks `all`
 (Org settings › Security).
 
 A Run of fork code the setting holds gets one `manual` gate,
@@ -686,13 +688,47 @@ any `manual` gate, a plain one included, now raises a confirmation request its
 owner confirms; a script that approved plain gates with a token must confirm
 each approval, or approve from a browser.
 
+Migration 0112 adds two tables, `delegated_caller_handles` and
+`delegated_call_journal`, for PluginApi: a plugin that registers an endpoint
+calls the public API on the broker listener for one caller at a time. No
+existing row is touched. A plugin whose manifest registers no endpoint works
+as before. A plugin that registers one (a `trusted_service` plugin) installs
+only from a digest of an image repository listed in
+`plugins.trustedPublishers`, which is empty by default. The handles and the
+journal live on the broker's own small database pool, but the API handlers a
+plugin's delegated calls run read and write through the server's main pool,
+as the public API does: a busy endpoint plugin shares that pool.
+
+Migration 0113 adds three tables for the OAuth authorization server that
+plugin endpoints use (`oauth_client_metadata_hosts`,
+`oauth_authorization_codes`, `oauth_grants`). It is off until you set
+`oauthServer.enabled` and `secrets.oauthRefreshKey`. A plugin whose manifest
+registers an endpoint gets a Service, `scarab-plugin-endpoint-<id>`; the
+server creates, changes or deletes Services only for such plugins, and the
+chart grants it `services` in the plugin namespace for that. The plugin
+namespace's baseline gains one NetworkPolicy, `plugin-endpoint-ingress`, on
+every release whether or not an endpoint plugin is installed: it is part of
+the baseline the runtime applies and checks for drift as a whole, and it
+selects only Pods labelled `scarab.io/plugin-endpoint=true`, admitting the
+server's Pods to their port 8080 and nothing else. A plugin without an
+endpoint has no such label, so it still takes no ingress. A broker peer given as
+`cidr:` (`SCARAB_PLUGIN_BROKER_PEER`, for a server outside the cluster)
+admits every address in that range to the endpoint port, not only the
+server. The endpoint's request limits are counted per server replica.
+
 To roll back: scale the server to zero, back up the database, run
+[`rollback/0113_revert.sql`](../../../crates/scarab-db-postgres/rollback/0113_revert.sql)
+(it revokes every connected app's access token), then
 [`rollback/0111_revert.sql`](../../../crates/scarab-db-postgres/rollback/0111_revert.sql)
 (`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0111_revert.sql`; a second run
 changes nothing), then install the 0.8.4 chart. A 0.8.4 server would let a
 token with an operation list use every operation, so the revert revokes those
-tokens before it drops the columns; their owners mint new ones. To go back to
-0.8.2, run `0110_revert.sql` next.
+tokens before it drops the columns; their owners mint new ones. Run
+[`rollback/0112_revert.sql`](../../../crates/scarab-db-postgres/rollback/0112_revert.sql)
+between those two: it drops the PluginApi tables and their journal, and refuses to run
+while a plugin that registers an endpoint is installed, since a 0.8.3 server
+cannot read its manifest. Uninstall those plugins first. To go back to 0.8.2,
+run `0110_revert.sql` next.
 
 ### Upgrading from 0.8.3: rollback target for Fork Run approval
 
@@ -1072,6 +1108,8 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `plugins.namespace` / `.createNamespace` | `scarab-plugins` / `true` | the shared plugin namespace; must enforce Pod Security `restricted`. A namespace of its own: the render fails on the release namespace, `scarab.namespace`, `default` or `kube-*` |
 | `plugins.brokerPort` | `8090` | the broker listener and its ClusterIP Service port |
 | `plugins.probeImage` | `""` = `busybox:1.36.1@sha256:73aa…` | the isolation probe's and the per-Pod self-check's image; digest-pin an override |
+| `oauthServer.enabled` / `secrets.oauthRefreshKey` | `false` / `""` | the OAuth authorization server for plugin endpoints; the key (at least 32 random bytes, the same on every replica) derives refresh secrets. The render fails without it unless `secrets.existingSecret` is set, which must then hold `SCARAB_OAUTH_REFRESH_KEY` |
+| `plugins.trustedPublishers` | `[]` | image repositories (`registry/namespace/name`, compared whole) a plugin that registers an endpoint (`trusted_service`) may run from, pinned by digest; empty trusts none |
 | `ingress.enabled` | `false` | expose the HTTP API. The web UI, the CLI and the results sidecar name a Step by its key and need nothing from the proxy; an API caller that sends a Step id holding `/` needs a proxy that passes `%2F` on unchanged (with Envoy Gateway, `escapedSlashesAction: KeepUnchanged` in a `ClientTrafficPolicy`) |
 | `scarab.resultsApiUrl` | `""` = `http://<fullname>.<ns>.svc` | where step Pods post results; leave it empty, or point it at the in-cluster Service, not at a gateway that redirects or rewrites paths |
 | `service.type` / `service.nodePort` | `ClusterIP` / `""` | the API Service; with `NodePort`, `nodePort` fixes the port (empty => assigned) |

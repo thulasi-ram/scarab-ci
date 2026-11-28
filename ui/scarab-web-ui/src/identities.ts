@@ -65,11 +65,11 @@ export function loginChoices(providers: ProviderLike[], next?: string): LoginCho
 }
 
 /** The longest `next` the server accepts (`oauth::MAX_NEXT_LEN`, bytes). */
-export const MAX_NEXT_LEN = 512;
+export const MAX_NEXT_LEN = 2048;
 
 /**
  * The server's `safe_next`, mirrored: a relative path starting with `/`, not
- * `//`, with no `\` and no control character, at most 512 bytes. The server
+ * `//`, with no `\` and no control character, at most 2048 bytes. The server
  * answers 400 to anything else — so a `next` that fails here is dropped
  * rather than sent, and the sign-in still works.
  */

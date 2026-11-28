@@ -99,6 +99,10 @@ pub enum OrgOf {
     Body(&'static str),
     /// A query parameter.
     Query(&'static str),
+    /// The org of the plugin endpoint whose canonical URL is the string at
+    /// this JSON pointer into the body (an OAuth `resource`); none when it is
+    /// not such a URL.
+    Resource(&'static str),
     /// The tenant of the run named by the `id` path parameter.
     Run,
     /// The Org of the forge connection named by the `id` path parameter
@@ -310,6 +314,53 @@ pub fn by_id(id: &str) -> Option<&'static Op> {
         .iter()
         .map(|e| e.op)
         .find(|op| op.id == id)
+}
+
+/// The only ApiOperations a Plugin's DelegatedCallerHandle may ever use
+/// (ADR-0086 §4): a closed list, so a new route is not delegable until it is
+/// added here on purpose. Reads of Runs, Steps, logs, workspaces, artifacts
+/// and repositories, and the Run writes an agent may make for its caller.
+/// Settings, access, security, account, Policy, Environment, token, plugin
+/// and library operations, an inline `run.create`, and the snapshot pin are
+/// not on it.
+pub const DELEGABLE_OPERATIONS: [&str; 10] = [
+    "repo.read",
+    "run.read",
+    "step.logs.read",
+    "step.workspace.read",
+    "run.artifacts.read",
+    "repo.dispatch",
+    "step.rerun",
+    "step.retry",
+    "run.cancel",
+    "gate.reject",
+];
+
+/// May a Plugin's DelegatedCallerHandle use `op` (ADR-0086 §4)? `Err`
+/// says why not. Only an operation on [`DELEGABLE_OPERATIONS`]; and, as a
+/// second guard should the list ever name one, never an operation that can
+/// need a step-up (a delegated call never raises or satisfies one, so
+/// `gate.approve` is never delegable), a passkey ceremony, or a browser-only
+/// or not-by-token operation. A manifest whose endpoint `may` names any
+/// other is refused at fetch, install and upgrade, and PluginApi serves no
+/// route of one.
+pub fn delegable(op: &Op) -> Result<(), &'static str> {
+    if !DELEGABLE_OPERATIONS.contains(&op.id) {
+        return Err("it is not one of the operations a plugin may use for its caller");
+    }
+    match op.class {
+        Class::CrownJewel(_) | Class::Conditional { .. } => {
+            return Err("it can need a step-up, which a delegated call never raises or satisfies")
+        }
+        Class::Ceremony => return Err("it is a passkey ceremony"),
+        Class::Read | Class::Exempt(_) | Class::NotGoverned(_) => {}
+    }
+    match op.machine {
+        StepUpMachineUse::BrowserOnly => return Err("only a person in a browser may do it"),
+        StepUpMachineUse::NotByToken => return Err("a token may never do it"),
+        StepUpMachineUse::Requestable => {}
+    }
+    Ok(())
 }
 
 /// [`Op::max_request_body`] unless an operation says otherwise.
@@ -1330,6 +1381,88 @@ pub static TOKEN_MINT_OWN: Op = op(
     &["body:/org", "body:/project", "body:/name"],
 )
 .not_by_token();
+// The endpoint extension point (ADR-0086 §1): a caller's own `oauth` token
+// for that endpoint authenticates it, never a session or an issued token.
+pub static PLUGIN_ENDPOINT: Op = op(
+    "plugin.endpoint",
+    "Call a plugin's endpoint",
+    Class::NotGoverned(
+        "the caller's oauth token for this endpoint is the authority, held to the operations \
+         it was granted; nothing it does can raise or satisfy a step-up",
+    ),
+    "ADR-0086 §1-§2",
+    ANYONE,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:id", "path:endpoint_path"],
+);
+// The OAuth authorization server (ADR-0086 §7).
+pub static OAUTH_AUTHORIZATION_REQUEST: Op = op(
+    "oauth.authorization_request",
+    "Check an OAuth authorization request",
+    Class::NotGoverned("reads the client's metadata and describes the request; grants nothing"),
+    "ADR-0086 §7",
+    ANYONE,
+    OrgOf::None,
+    &[],
+    &["body:/client_id", "body:/resource"],
+)
+.browser_only();
+// Every consent asks for a passkey of its own, bound to this client, this
+// endpoint and these operations (the digest covers the whole body).
+pub static OAUTH_CONSENT: Op = op(
+    "oauth.consent",
+    "Connect an app to a plugin endpoint",
+    Class::CrownJewel(A),
+    "ADR-0086 §7: granting a token is a crown jewel, as minting one is",
+    VIEWER,
+    OrgOf::Resource("/resource"),
+    &[],
+    &["body:/client_id", "body:/resource"],
+)
+.browser_only();
+pub static OAUTH_TOKEN: Op = op(
+    "oauth.token",
+    "Exchange an OAuth code or refresh secret",
+    Class::NotGoverned("the code verifier or the refresh secret is the credential; a machine call"),
+    "ADR-0086 §7",
+    ANYONE,
+    OrgOf::None,
+    &["/code", "/code_verifier", "/refresh_token"],
+    &[],
+);
+pub static OAUTH_GRANT_REVOKE_OWN: Op = op(
+    "oauth.grant.revoke_own",
+    "Disconnect one of your connected apps",
+    Class::Exempt("revocation tightens"),
+    "ADR-0086 §7",
+    ANYONE,
+    OrgOf::None,
+    &[],
+    &["path:id"],
+)
+// Its handler checks ownership only, so it refuses a token.
+.not_by_token();
+pub static OAUTH_CLIENT_METADATA_HOST_ADD: Op = op(
+    "oauth.client_metadata_host.add",
+    "Allow a host to serve OAuth client metadata",
+    Class::CrownJewel(W),
+    "ADR-0086 §7: adding a host loosens",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:host"],
+);
+pub static OAUTH_CLIENT_METADATA_HOST_REMOVE: Op = op(
+    "oauth.client_metadata_host.remove",
+    "Stop allowing a host to serve OAuth client metadata",
+    Class::Exempt("removing a host tightens"),
+    "ADR-0086 §7",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:host"],
+);
 pub static PLUGIN_FETCH: Op = op(
     "plugin.fetch",
     "Fetch a plugin manifest to review",
@@ -1815,6 +1948,8 @@ mod tests {
                 "fork_run_approval.put",
                 "identity.link",
                 "identity.unlink",
+                "oauth.authorization_request",
+                "oauth.consent",
                 "passkey.add",
                 "secret.match",
                 "secret.match_limits",
@@ -1840,6 +1975,7 @@ mod tests {
             not_by_token,
             vec![
                 "connection.assign_org",
+                "oauth.grant.revoke_own",
                 "token.mint",
                 "token.mint_own",
                 "token.revoke_own"

@@ -602,6 +602,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             // The CredentialBroker journal (ADR-0072 §5): its retention window.
             Some(pg.clone() as Arc<dyn scarab_plugin::PluginStore>),
+            // PluginApi's expired handles and its journal (ADR-0086 §4).
+            Some(pg.clone() as Arc<dyn scarab_plugin::DelegatedCallStore>),
             // Orphaned PluginConnection credentials (git-bug 4711823).
             Some(secrets.clone()),
             // Step-up rows (ADR-0073): expired challenges and confirmations,
@@ -611,6 +613,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pg.clone() as Arc<dyn scarab_identity::StepUpStore>,
             )),
             step_pods,
+            // Expired OAuth authorization codes (ADR-0086 §7), when the
+            // authorization server is on.
+            config
+                .oauth_server
+                .is_some()
+                .then(|| pg.clone() as Arc<dyn scarab_identity::OAuthStore>),
             Duration::from_secs(300),
         );
         if step_pod_sweep_on {
@@ -1072,6 +1080,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pg.clone(),
             scarab_server::plugins::PluginPolicy::from_config(&config.plugins),
         )
+        // DelegatedCallerHandles (ADR-0086 §3): minted on the main pool for
+        // the requests an endpoint forwards; the broker reads them on its own.
+        .with_delegated_calls(pg.clone())
         // The ForgeConnection registry (ADR-0046): RepoRef→Project resolution,
         // installation auto-registration, webhook replay dedup.
         .with_forge_connections(pg.clone())
@@ -1297,6 +1308,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cloud provider can verify Scarab-minted tokens. The signing key is loaded
     // from the configured PEM — persistent across restarts/replicas — and any
     // failure here is a boot failure, not a degraded warn (ADR-0048).
+    // The OAuth authorization server for plugin endpoints (ADR-0086 §7):
+    // config refused boot when it is on without its refresh key.
+    if let Some(oauth_server) = &config.oauth_server {
+        state = state.with_oauth_server(
+            pg.clone(),
+            oauth_server.refresh_key.expose().as_bytes().to_vec(),
+        );
+        tracing::info!("OAuth authorization server on (plugin endpoints)");
+    }
     if let Some(issuer) = oidc_issuer.clone() {
         state = state.with_oidc(issuer);
         tracing::info!("OIDC issuer enabled (persistent signing key)");
@@ -1425,10 +1445,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .acquire_timeout(scarab_server::broker::BROKER_POOL_ACQUIRE_TIMEOUT)
             .connect_lazy(&database_url)
             .map_err(|e| format!("broker pool: {e}"))?;
+        // PluginApi (ADR-0086 §4) keeps its handles and journal on the same
+        // small pool: a plugin's delegated calls exhaust only it.
+        let broker_db = Arc::new(PostgresDb::with_pool(broker_pool));
         let (broker, broker_journal) = scarab_server::broker::router_with_journal(
             state
                 .clone()
-                .with_broker_plugin_store(Arc::new(PostgresDb::with_pool(broker_pool))),
+                .with_broker_plugin_store(broker_db.clone())
+                .with_delegated_calls(broker_db),
         );
         let listener = tokio::net::TcpListener::bind(&config.plugins.broker_addr).await?;
         println!("broker listening on {}", config.plugins.broker_addr);

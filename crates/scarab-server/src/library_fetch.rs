@@ -348,6 +348,19 @@ pub enum FetchError {
 #[async_trait]
 pub trait AnonymousFetcher: Send + Sync {
     async fn get(&self, url: &str) -> Result<Vec<u8>, FetchError>;
+
+    /// [`get`](Self::get) with a smaller cap than a library's: a body past
+    /// `cap` bytes is refused. [`HttpsFetcher`] stops reading at the cap;
+    /// this default, for test stand-ins, checks after the read.
+    async fn get_capped(&self, url: &str, cap: usize) -> Result<Vec<u8>, FetchError> {
+        let body = self.get(url).await?;
+        if body.len() > cap {
+            return Err(FetchError::Refused(format!(
+                "the file is larger than {cap} bytes"
+            )));
+        }
+        Ok(body)
+    }
 }
 
 /// Is `ip` an address an anonymous fetch may connect to?
@@ -492,7 +505,7 @@ fn chain(e: &dyn std::error::Error) -> String {
 pub fn append_capped(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> Result<(), FetchError> {
     if body.len() + chunk.len() > cap {
         return Err(FetchError::Refused(format!(
-            "the file is larger than {cap} bytes, the limit for a library"
+            "the file is larger than {cap} bytes, the limit for this fetch"
         )));
     }
     body.extend_from_slice(chunk);
@@ -502,6 +515,10 @@ pub fn append_capped(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> Result<(),
 #[async_trait]
 impl AnonymousFetcher for HttpsFetcher {
     async fn get(&self, url: &str) -> Result<Vec<u8>, FetchError> {
+        self.get_capped(url, MAX_SOURCE_BYTES).await
+    }
+
+    async fn get_capped(&self, url: &str, cap: usize) -> Result<Vec<u8>, FetchError> {
         check_literal_host(url)?;
         let mut resp = self
             .client
@@ -519,12 +536,9 @@ impl AnonymousFetcher for HttpsFetcher {
         if !status.is_success() {
             return Err(FetchError::Failed(format!("{url} answered {status}")));
         }
-        if resp
-            .content_length()
-            .is_some_and(|n| n > MAX_SOURCE_BYTES as u64)
-        {
+        if resp.content_length().is_some_and(|n| n > cap as u64) {
             return Err(FetchError::Refused(format!(
-                "the file is larger than {MAX_SOURCE_BYTES} bytes, the limit for a library"
+                "the file is larger than {cap} bytes, the limit for this fetch"
             )));
         }
         let mut body = Vec::new();
@@ -533,7 +547,7 @@ impl AnonymousFetcher for HttpsFetcher {
             .await
             .map_err(|e| FetchError::Failed(format!("reading {url}: {}", chain(&e))))?
         {
-            append_capped(&mut body, &chunk, MAX_SOURCE_BYTES)?;
+            append_capped(&mut body, &chunk, cap)?;
         }
         Ok(body)
     }

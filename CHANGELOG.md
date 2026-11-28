@@ -50,6 +50,14 @@ release.yml uses that version's section as the GitHub Release text. See
   start on a database that ran it: to roll back, run
   `crates/scarab-db-postgres/rollback/0111_revert.sql` with the server scaled to zero. It revokes
   the tokens that carry an operation list. See the chart README, "Upgrading from 0.8.4".
+- **Migration 0112 adds `delegated_caller_handles` and `delegated_call_journal`.** Two new
+  tables; nothing existing changes. To roll back, uninstall every plugin that registers an
+  endpoint, then run `crates/scarab-db-postgres/rollback/0112_revert.sql` before
+  `0111_revert.sql`; it refuses while one is installed.
+- **Migration 0113 adds `oauth_client_metadata_hosts`, `oauth_authorization_codes` and
+  `oauth_grants`.** Three new tables; nothing existing changes. To roll back, run
+  `crates/scarab-db-postgres/rollback/0113_revert.sql` before `0112_revert.sql`; it revokes every
+  connected app's token.
 - **Migration 0114 adds the table `org_fork_run_approval`** (each org's Fork Run approval
   setting; an org with no row has `agent_started`). No row is rewritten. A server that does not
   know 0114 does not start on a database that ran it: to roll back, set it to `off` in every org,
@@ -68,9 +76,29 @@ release.yml uses that version's section as the GitHub Release text. See
   `server.read`. Security events for reads carry the new names. No operation implies another:
   a token with a list needs `account.read` for `GET /v1/me` and `server.read` for
   `GET /v1/about`.
+- **A plugin that registers an endpoint gets a Service and an ingress policy.** Its Pods accept
+  connections on port 8080 from the Scarab server's Pods and nothing else. The chart grants the
+  plugin runtime `services` in the plugin namespace.
 
 ### Security
 
+- **A plugin that registers an endpoint runs only from a publisher the operator trusts.** A
+  manifest may now register an endpoint and the API operations each of its requests may use. Such
+  a plugin is `trusted_service`: an org admin can install or upgrade it only from a digest of an
+  image repository listed in `plugins.trustedPublishers`, which is empty by default, and is
+  refused again (install, upgrade, enable, and every PluginApi call) once the operator delists
+  it. Its `may` can name only `repo.read`, `run.read`, `step.logs.read`, `step.workspace.read`,
+  `run.artifacts.read`, `repo.dispatch`, `step.rerun`, `step.retry`, `run.cancel` and
+  `gate.reject`. Such a plugin may not also resolve gates.
+- **A plugin acts for a caller only with a handle.** On the broker listener a plugin calls the
+  public API for one caller with its installation token and a delegated caller handle bound to
+  that installation and its org, the caller's `oauth` token (granted for that installation's
+  endpoint) and an operation list. The installation token alone acts as nobody. A delegated call
+  obeys the handle's, the token's and the manifest's operation lists, spends the installation's
+  broker permits and the handle's counters, is journaled before it runs (refusals included),
+  never raises or satisfies a step-up, and never approves a gate. Killing, uninstalling or
+  upgrading the plugin to a new digest deletes its handles. The handles and journal use the
+  broker's own database pool; the API handlers a delegated call runs use the main pool.
 - **A dispatch records the kind of ref it ran.** A manual or API dispatch at a bare name such as
   `release/x` was recorded as the branch `refs/heads/release/x` even when the name was a tag.
   Anyone who could push a tag could create `release/x` on their own commit and pass an
@@ -97,7 +125,6 @@ release.yml uses that version's section as the GitHub Release text. See
   branch moves between the push and Scarab's check (another push right after), that Run gets the
   fork limits too. A re-run of that Run keeps them; once the forge answers again, start the
   pipeline again with a new push to the pull request or a dispatch at `refs/pull/<n>/head`.
-
 - **A dispatch of fork code starts no follow-up and is recorded as fork code.** A manual or API
   dispatch whose commit no branch or tag of the repository names is fork code. Such a Run already
   got the fork limits at creation (no secrets, `env=none`, a read-only clone token, no registry
@@ -109,7 +136,6 @@ release.yml uses that version's section as the GitHub Release text. See
   cache. Changes you may see: a manual or API Run recorded before this release has no `fork` flag
   and is treated as fork code, so it starts no follow-up when it finishes again after a re-run;
   a `when:` or template on a manual or API trigger can read `event.fork`.
-
 - **No step OIDC token when its subject could read another way.** A Step gets no token when the
   org, repository or Environment name holds a `/`, the ref has a path component named `env` or
   `ref` (a branch `ref/x` is `refs/heads/ref/x`), or its Environment is named `none`. Its launch
@@ -131,7 +157,6 @@ release.yml uses that version's section as the GitHub Release text. See
   before this release, which did not record whether they were fork code. The `sub` of a Run bound
   to an Environment does not change; Breaking changes lists what else in its token does. See
   [Step OIDC tokens](/scarab-ci/usage/oidc-tokens/).
-
 - **The OIDC issuer's signing key can be changed without breaking cloud trust.** The chart's
   `scarab.oidcPublicKeys` (server: `SCARAB_OIDC_PUBLIC_KEYS`) lists further RSA public keys that
   `/.well-known/jwks.json` publishes beside the signing key: the next key before servers sign with
@@ -139,14 +164,23 @@ release.yml uses that version's section as the GitHub Release text. See
   private key in `SCARAB_OIDC_SIGNING_KEY_FILE`. The chart README, "Changing the signing key",
   gives the three upgrades in order. See
   [Environment variables](/scarab-ci/usage/environment-variables/).
-
 - **Step OIDC tokens live as long as the step may run.** A token lived 15 minutes; it now lives
   for the step's `timeout:`, at most `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` (chart:
   `scarab.oidcTokenMaxTtlSecs`, default one hour, at most 12 hours), so a cloud SDK that exchanges
   the token again later in the step still can. A new docs page shows how to publish the issuer as static files
   and how a step assumes an AWS role with two `env:` lines. See
   [Assuming an AWS role from a step](/scarab-ci/usage/aws-roles/).
-
+- **The MCP plugin.** `scarab-plugin-mcp` is an MCP server that runs as a plugin behind a plugin
+  endpoint, so claude.ai can read your repositories, Runs, Step logs, results and artifact names,
+  start a pipeline, rerun or retry a Step, or cancel a Run as you, within the operations you tick.
+  It has no approve tool and no tool for secrets, settings or Policies, and it returns text from
+  logs and results inside a block marked as untrusted. The image is published as
+  `ghcr.io/thulasi-ram/scarab-plugin-mcp`. See
+  [Using Scarab from Claude](/scarab-ci/usage/mcp-plugin/).
+- **Connected apps.** An app such as claude.ai can act for you at one plugin endpoint with an OAuth
+  token you approve with your passkey; you list and disconnect your apps under Account settings.
+  Off by default (`oauthServer.enabled`). See
+  [Connected apps](/scarab-ci/usage/connected-apps/).
 - **Limit an API token to a list of operations.** A token minted with `operations` may use only
   those; every other request is refused with `403 operation_not_granted`. Each token records its
   kind (`issued`), and every rerun, retry, cancel, pin, approval and rejection made with a token
@@ -157,9 +191,9 @@ release.yml uses that version's section as the GitHub Release text. See
   [API tokens](/scarab-ci/usage/api-tokens/#operations).
 - **Fork Run approval.** An org setting that holds Runs of fork code at a `manual` gate,
   `fork-run-approval`, before any of their steps or shared services start: `off`,
-  `agent_started` (the default: Runs an app started through an `oauth` token) or `all`. Nothing
-  issues an `oauth` token yet, so until OAuth sign-in for apps ships, `agent_started` holds no
-  Run; choose `all` to hold every Run of fork code. Anyone with write on the repository approves
+  `agent_started` (the default: Runs an app started through an `oauth` token, such as a
+  connected app) or `all`. Choose
+  `all` to hold every Run of fork code. Anyone with write on the repository approves
   the gate from the Run page; an API token's owner confirms each approval, and an app cannot
   approve. The gate fails the Run after 72 hours. It never counts as an Environment approval gate,
   and approving it unlocks no Environment secrets, registry credentials or OIDC roles: the Run is
@@ -182,7 +216,6 @@ release.yml uses that version's section as the GitHub Release text. See
   at the gate as at any `manual` gate, starts none of its shared services until the gate is
   released, and never counts the gate as an Environment approval gate. Nothing in 0.8.4 adds the
   gate.
-
 - **Step OIDC tokens carry `iat` and `nbf`.** Both are set 60 seconds before the token is minted,
   so a cloud whose clock runs up to a minute behind the server still accepts the token.
 - **A step launch reads only its Run's trigger record.** Deciding a Step's OIDC token, its fork

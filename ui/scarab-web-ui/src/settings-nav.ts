@@ -39,6 +39,7 @@ export const ACCOUNT_SECTIONS: readonly SettingsSection[] = [
   { id: "profile", label: "Profile", sub: "your sign-in accounts" },
   { id: "security", label: "Security", sub: "your passkeys and security events" },
   { id: "tokens", label: "API tokens", sub: "your tokens for the CLI and scripts" },
+  { id: "connected-apps", label: "Connected apps", sub: "apps that act for you at a plugin endpoint" },
   { id: "appearance", label: "Appearance", sub: "palette and light or dark mode" },
 ];
 

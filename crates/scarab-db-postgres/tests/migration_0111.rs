@@ -140,6 +140,20 @@ async fn the_0111_revert_revokes_limited_tokens_and_runs_twice() {
             .unwrap();
     }
 
+    // The migrator ran the newer migrations too: revert them first, newest
+    // first.
+    sqlx::raw_sql(include_str!("../rollback/0114_revert.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../rollback/0113_revert.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../rollback/0112_revert.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::raw_sql(REVERT).execute(&pool).await.unwrap();
     sqlx::raw_sql(REVERT)
         .execute(&pool)

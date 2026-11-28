@@ -75,6 +75,7 @@ fn policy(enabled: bool) -> PluginPolicy {
         enabled,
         namespace: NAMESPACE.into(),
         dev_allow_tag: false,
+        trusted_publishers: Vec::new(),
     }
 }
 
@@ -1933,5 +1934,262 @@ async fn an_upgrade_is_refused_while_plugins_are_off() {
     let row = pg.installation("acme", "argocd").await.unwrap().unwrap();
     assert_eq!(row.manifest_sha256, manifest_sha256(ARGOCD_MANIFEST));
     assert!(pg.installation_versions(&row.id).await.unwrap().is_empty());
+    tdb.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// `trusted_service`: endpoint plugins and the operator's allowlist
+// (ADR-0086 §4, §8)
+// ---------------------------------------------------------------------------
+
+/// [`apps_with`], the operator listing `publishers` in
+/// `plugins.trustedPublishers`.
+fn apps_trusting(pg: Arc<PostgresDb>, fetcher: Arc<StaticFetcher>, publishers: &[&str]) -> Apps {
+    let mut st = state_with(pg, true, fetcher);
+    st.plugin_policy = Arc::new(PluginPolicy {
+        trusted_publishers: publishers.iter().map(|p| p.to_string()).collect(),
+        ..policy(true)
+    });
+    Apps {
+        public: router(st.clone()),
+        broker: broker::router(st),
+    }
+}
+
+const MCP_PUBLISHER: &str = "ghcr.io/someone-else/mcp";
+
+fn mcp_image() -> String {
+    format!("{MCP_PUBLISHER}@sha256:{}", "d".repeat(64))
+}
+
+/// The Slack plugin's manifest with one endpoint `mcp` whose `read_run`
+/// may use `may`.
+fn slack_with_endpoint(may: &[&str]) -> String {
+    json!({
+        "plugin": "slack-notify",
+        "capabilities": ["use_connection"],
+        "connections": [{
+            "name": "slack",
+            "auth_schemes": ["bearer"],
+            "read_rules": [{ "method": "GET", "path": "/api/conversations.info", "query": ["channel"] }]
+        }],
+        "config_keys": ["SLACK_CHANNEL"],
+        "extensions": [{
+            "point": "endpoint",
+            "path": "mcp",
+            "operations": {
+                "read_run": {
+                    "match": { "method": "POST", "json": { "/params/name": "read_run" } },
+                    "may": may
+                }
+            }
+        }]
+    })
+    .to_string()
+}
+
+/// `POST /v1/orgs/acme/plugins` of `source`'s manifest as `name`.
+async fn install_source(
+    app: &axum::Router,
+    name: &str,
+    source: &str,
+    manifest: &str,
+    image: &str,
+) -> (StatusCode, Value) {
+    call(
+        app,
+        "POST",
+        "/v1/orgs/acme/plugins",
+        None,
+        Some(json!({
+            "name": name,
+            "image": image,
+            "source": source,
+            "manifest_sha256": manifest_sha256(manifest),
+        })),
+    )
+    .await
+}
+
+/// A plugin that registers an endpoint runs as `trusted_service`: it
+/// installs only from an image repository the operator lists whole (none by
+/// default, a namespace or another repository is not enough), and its
+/// endpoint's `may` names only operations a plugin may use for its caller,
+/// refused at fetch and at install. An endpoint never comes with
+/// `resolve_gates`.
+#[tokio::test]
+async fn an_endpoint_plugin_installs_only_from_a_listed_publisher_and_only_delegable_operations() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let fetcher = Arc::new(StaticFetcher::new());
+    let source = format!(
+        "github.com/someone-else/scarab-mcp//manifest.json@{}",
+        "1".repeat(40)
+    );
+    let manifest = slack_with_endpoint(&["run.read", "run.cancel"]);
+    fetcher.serve(&source, &manifest);
+
+    for publishers in [
+        vec![],
+        vec!["ghcr.io/someone-else/other"],
+        vec!["ghcr.io/someone-else"],
+    ] {
+        let apps = apps_trusting(pg.clone(), fetcher.clone(), &publishers);
+        let (status, fetched) = fetch(&apps.public, "acme", &source).await;
+        assert_eq!(status, StatusCode::OK, "{fetched}");
+        assert_eq!(fetched["manifest"]["trust_tier"], json!("trusted_service"));
+        let (status, body) =
+            install_source(&apps.public, "mcp", &source, &manifest, &mcp_image()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{publishers:?}: {body}");
+        assert!(body.to_string().contains(MCP_PUBLISHER), "{body}");
+        assert_eq!(installed(&apps.public, "acme").await, Vec::<String>::new());
+    }
+
+    let apps = apps_trusting(pg.clone(), fetcher.clone(), &[MCP_PUBLISHER]);
+    let (status, body) =
+        install_source(&apps.public, "mcp", &source, &manifest, &mcp_image()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["manifest"]["trust_tier"], json!("trusted_service"));
+
+    for (n, op) in [
+        "gate.approve",
+        "step.debug_pod",
+        "token.mint_own",
+        "policy.create",
+        "plugin.kill",
+        "run.create",
+        "account.read",
+        "settings.read",
+        "no.such",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!(
+            "github.com/someone-else/scarab-mcp//manifest.json@{}",
+            format!("{:x}", n + 2).repeat(40)
+        );
+        let manifest = slack_with_endpoint(&["run.read", op]);
+        fetcher.serve(&source, &manifest);
+        let (status, body) = fetch(&apps.public, "acme", &source).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{op}: {body}");
+        assert!(body.to_string().contains(op), "{op}: {body}");
+        let (status, body) =
+            install_source(&apps.public, "bad", &source, &manifest, &mcp_image()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{op}: {body}");
+    }
+
+    let gates_and_endpoint = argocd_manifest_with(|m| {
+        let endpoint: Value = serde_json::from_str(&slack_with_endpoint(&["run.read"])).unwrap();
+        m["extensions"] = endpoint["extensions"].clone();
+    });
+    let source = format!(
+        "github.com/someone-else/scarab-mcp//gates.json@{}",
+        "f".repeat(40)
+    );
+    fetcher.serve(&source, &gates_and_endpoint);
+    let (status, body) = fetch(&apps.public, "acme", &source).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("resolve_gates"), "{body}");
+
+    assert_eq!(
+        installed(&apps.public, "acme").await,
+        vec!["mcp".to_string()]
+    );
+    tdb.cleanup().await;
+}
+
+/// An upgrade that adds an endpoint widens the plugin: it is refused, at
+/// fetch and at upgrade, unless the operator lists the image's repository,
+/// and once listed it names the endpoint operation it adds and needs a
+/// step-up. Enabling a killed `trusted_service` plugin is refused while its
+/// publisher is not listed.
+#[tokio::test]
+async fn an_upgrade_or_enable_of_an_endpoint_plugin_needs_its_publisher_listed() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let fetcher = Arc::new(argocd_fetcher());
+    fetcher.serve(SLACK_SOURCE, SLACK_MANIFEST);
+    let with_endpoint = format!(
+        "github.com/someone-else/scarab-slack//manifest.yaml@{}",
+        "e".repeat(40)
+    );
+    fetcher.serve(&with_endpoint, &slack_with_endpoint(&["run.read"]));
+    let unlisted = apps_trusting(pg.clone(), fetcher.clone(), &[]);
+    let listed = apps_trusting(pg.clone(), fetcher.clone(), &["ghcr.io/someone-else/slack"]);
+    fetch_and_install(
+        &unlisted.public,
+        "acme",
+        "slack",
+        SLACK_SOURCE,
+        &slack_image(),
+        json!({ "SLACK_CHANNEL": "deploys" }),
+    )
+    .await;
+
+    let (status, body) = upgrade_fetch(
+        &unlisted.public,
+        "slack",
+        json!({ "commit": "e".repeat(40) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, fetched) =
+        upgrade_fetch(&listed.public, "slack", json!({ "commit": "e".repeat(40) })).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(
+        fetched["diff"]["endpoint_operations"]["added"],
+        json!(["mcp/read_run"])
+    );
+    assert_eq!(fetched["needs_step_up"], json!(true));
+    assert!(
+        fetched["step_up_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("adds endpoint operation `mcp/read_run`")),
+        "{fetched}"
+    );
+    let body = json!({
+        "image": slack_image(),
+        "source": fetched["source"],
+        "manifest_sha256": fetched["manifest_sha256"],
+        "expected_current_sha256": fetched["current_manifest_sha256"],
+    });
+    let (status, refused) = upgrade(&unlisted.public, "slack", body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    let (status, upgraded) = upgrade(&listed.public, "slack", body).await;
+    assert_eq!(status, StatusCode::OK, "{upgraded}");
+    assert_eq!(upgraded["manifest"]["trust_tier"], json!("trusted_service"));
+
+    let (status, killed) = call(
+        &listed.public,
+        "POST",
+        "/v1/orgs/acme/plugins/slack/kill",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{killed}");
+    let (status, body) = call(
+        &unlisted.public,
+        "POST",
+        "/v1/orgs/acme/plugins/slack/enable",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = call(
+        &listed.public,
+        "POST",
+        "/v1/orgs/acme/plugins/slack/enable",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     tdb.cleanup().await;
 }

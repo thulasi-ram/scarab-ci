@@ -18,6 +18,7 @@ use sqlx::Row;
 
 use scarab_plugin::{
     BrokerJournalEntry, BrokerJournalFilter, BrokerJournalPhase, BrokerJournalRecord,
+    DelegatedCallJournalEntry, DelegatedCallSpend, DelegatedCallStore, DelegatedCallerHandle,
     InstallationState, PluginConnection, PluginConnectionAuthScheme, PluginInstallation,
     PluginInstallationVersion, PluginManifest, PluginStorage, PluginStore, PluginStoreError,
     PluginUninstall, PluginUpgrade, PluginUpgraded, RuntimeStatus, PAGE_DEFAULT_LIMIT,
@@ -883,5 +884,236 @@ impl PluginStore for PostgresDb {
                 .map_err(plugin_store_err)?
                 .rows_affected(),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DelegatedCallStore (ADR-0086 §3, §4; migration 0112): PluginApi's handles
+// and its journal of delegated calls.
+// ---------------------------------------------------------------------------
+
+const HANDLE_COLUMNS: &str = "id, installation_id, org, token_id, operations, writes_left, \
+     calls_left, created_at, heartbeat_at, expires_at";
+
+fn handle_from_row(r: &sqlx::postgres::PgRow) -> DelegatedCallerHandle {
+    // Both counters have a CHECK (>= 0), so the conversion cannot fail on a
+    // row the migration admitted; a negative one reads as nothing left.
+    let counter = |c: &str| u32::try_from(r.get::<i32, _>(c)).unwrap_or(0);
+    DelegatedCallerHandle {
+        id: r.get("id"),
+        installation_id: r.get("installation_id"),
+        org: r.get("org"),
+        token_id: r.get("token_id"),
+        operations: r.get::<Vec<String>, _>("operations"),
+        writes_left: counter("writes_left"),
+        calls_left: counter("calls_left"),
+        created_at: r.get("created_at"),
+        heartbeat_at: r.get("heartbeat_at"),
+        expires_at: r.get("expires_at"),
+    }
+}
+
+fn counter_i32(n: u32) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+#[async_trait]
+impl DelegatedCallStore for PostgresDb {
+    async fn put_delegated_caller_handle(
+        &self,
+        handle: &DelegatedCallerHandle,
+        hash: &str,
+    ) -> Result<(), PluginStoreError> {
+        // No upsert: an id and a hash are minted fresh, so a conflict is a
+        // CSPRNG collision or a bug, and overwriting a live handle is never
+        // the answer.
+        sqlx::query(
+            "INSERT INTO delegated_caller_handles
+                 (id, handle_hash, installation_id, org, token_id, operations, writes_left,
+                  calls_left, created_at, heartbeat_at, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(&handle.id)
+        .bind(hash)
+        .bind(&handle.installation_id)
+        .bind(&handle.org)
+        .bind(&handle.token_id)
+        .bind(&handle.operations)
+        .bind(counter_i32(handle.writes_left))
+        .bind(counter_i32(handle.calls_left))
+        .bind(handle.created_at)
+        .bind(handle.heartbeat_at)
+        .bind(handle.expires_at)
+        .execute(self.pool())
+        .await
+        .map_err(plugin_store_err)?;
+        Ok(())
+    }
+
+    async fn delegated_caller_handle_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<DelegatedCallerHandle>, PluginStoreError> {
+        let row = sqlx::query(&format!(
+            "SELECT {HANDLE_COLUMNS} FROM delegated_caller_handles WHERE handle_hash = $1"
+        ))
+        .bind(hash)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(plugin_store_err)?;
+        Ok(row.as_ref().map(handle_from_row))
+    }
+
+    async fn spend_delegated_caller_handle(
+        &self,
+        id: &str,
+        write: bool,
+        now_ms: i64,
+    ) -> Result<DelegatedCallSpend, PluginStoreError> {
+        // One statement: two replicas spending the same handle at once can
+        // never both take its last call or its last write.
+        let spent = sqlx::query(
+            "UPDATE delegated_caller_handles
+                SET calls_left = calls_left - 1,
+                    writes_left = writes_left - CASE WHEN $2 THEN 1 ELSE 0 END
+              WHERE id = $1
+                AND expires_at > $3
+                AND calls_left > 0
+                AND (NOT $2 OR writes_left > 0)",
+        )
+        .bind(id)
+        .bind(write)
+        .bind(now_ms)
+        .execute(self.pool())
+        .await
+        .map_err(plugin_store_err)?;
+        if spent.rows_affected() > 0 {
+            return Ok(DelegatedCallSpend::Spent);
+        }
+        // Nothing taken: tell a spent handle from one that is gone.
+        let live: Option<i64> = sqlx::query_scalar(
+            "SELECT expires_at FROM delegated_caller_handles WHERE id = $1 AND expires_at > $2",
+        )
+        .bind(id)
+        .bind(now_ms)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(plugin_store_err)?;
+        Ok(match live {
+            Some(_) => DelegatedCallSpend::Exhausted,
+            None => DelegatedCallSpend::Gone,
+        })
+    }
+
+    async fn heartbeat_delegated_caller_handle(
+        &self,
+        id: &str,
+        now_ms: i64,
+    ) -> Result<bool, PluginStoreError> {
+        let done = sqlx::query(
+            "UPDATE delegated_caller_handles
+                SET heartbeat_at = GREATEST(heartbeat_at, $2)
+              WHERE id = $1 AND expires_at > $2",
+        )
+        .bind(id)
+        .bind(now_ms)
+        .execute(self.pool())
+        .await
+        .map_err(plugin_store_err)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    async fn delete_delegated_caller_handle(&self, id: &str) -> Result<(), PluginStoreError> {
+        sqlx::query("DELETE FROM delegated_caller_handles WHERE id = $1")
+            .bind(id)
+            .execute(self.pool())
+            .await
+            .map_err(plugin_store_err)?;
+        Ok(())
+    }
+
+    async fn delete_installation_delegated_caller_handles(
+        &self,
+        installation_id: &str,
+    ) -> Result<u64, PluginStoreError> {
+        let done = sqlx::query("DELETE FROM delegated_caller_handles WHERE installation_id = $1")
+            .bind(installation_id)
+            .execute(self.pool())
+            .await
+            .map_err(plugin_store_err)?;
+        Ok(done.rows_affected())
+    }
+
+    async fn delete_expired_delegated_caller_handles(
+        &self,
+        now_ms: i64,
+    ) -> Result<u64, PluginStoreError> {
+        let done = sqlx::query("DELETE FROM delegated_caller_handles WHERE expires_at <= $1")
+            .bind(now_ms)
+            .execute(self.pool())
+            .await
+            .map_err(plugin_store_err)?;
+        Ok(done.rows_affected())
+    }
+
+    async fn journal_delegated_call(
+        &self,
+        entry: &DelegatedCallJournalEntry,
+    ) -> Result<i64, PluginStoreError> {
+        sqlx::query_scalar(
+            "INSERT INTO delegated_call_journal
+                 (installation_id, org, handle_id, caller_subject, token_id, token_kind,
+                  oauth_client, operation, method, path, request_id, plugin_request_id,
+                  started_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             RETURNING id",
+        )
+        .bind(&entry.installation_id)
+        .bind(&entry.org)
+        .bind(&entry.handle_id)
+        .bind(&entry.caller_subject)
+        .bind(&entry.token_id)
+        .bind(&entry.token_kind)
+        .bind(&entry.oauth_client)
+        .bind(&entry.operation)
+        .bind(&entry.method)
+        .bind(&entry.path)
+        .bind(&entry.request_id)
+        .bind(&entry.plugin_request_id)
+        .bind(entry.started_at)
+        .fetch_one(self.pool())
+        .await
+        .map_err(plugin_store_err)
+    }
+
+    async fn finish_delegated_call(
+        &self,
+        journal_id: i64,
+        status: u16,
+        now_ms: i64,
+    ) -> Result<(), PluginStoreError> {
+        sqlx::query(
+            "UPDATE delegated_call_journal SET status = $2, finished_at = $3
+              WHERE id = $1 AND status IS NULL",
+        )
+        .bind(journal_id)
+        .bind(i32::from(status))
+        .bind(now_ms)
+        .execute(self.pool())
+        .await
+        .map_err(plugin_store_err)?;
+        Ok(())
+    }
+
+    async fn prune_delegated_call_journal(
+        &self,
+        started_before: i64,
+    ) -> Result<u64, PluginStoreError> {
+        let done = sqlx::query("DELETE FROM delegated_call_journal WHERE started_at < $1")
+            .bind(started_before)
+            .execute(self.pool())
+            .await
+            .map_err(plugin_store_err)?;
+        Ok(done.rows_affected())
     }
 }

@@ -12588,7 +12588,8 @@
           "read_rules",
           "config_keys",
           "gates",
-          "image"
+          "image",
+          "endpoint_operations"
         ],
         "properties": {
           "auth_schemes": {
@@ -12604,6 +12605,10 @@
           "connections": {
             "$ref": "#/components/schemas/ManifestDiffGroupDto",
             "description": "Connection slot names."
+          },
+          "endpoint_operations": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto",
+            "description": "Endpoint operations by `<path>/<operation>`, each compared as its\nwhole definition; one that changed is both removed and added."
           },
           "gates": {
             "$ref": "#/components/schemas/ManifestDiffGroupDto",
@@ -14023,7 +14028,8 @@
           "capabilities",
           "connections",
           "config_keys",
-          "gates"
+          "gates",
+          "endpoint_operations"
         ],
         "properties": {
           "capabilities": {
@@ -14044,6 +14050,13 @@
               "$ref": "#/components/schemas/ConnectionSlotDto"
             }
           },
+          "endpoint_operations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Each request its endpoints take, one line each: `<path>/<operation>:\n<method> <JSON checks>; may <operations>; writes <n>`. Empty when it\nregisters no endpoint."
+          },
           "gates": {
             "type": "array",
             "items": {
@@ -14060,6 +14073,13 @@
           },
           "plugin": {
             "type": "string"
+          },
+          "trust_tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`trusted_service` when the plugin registers an endpoint: it acts for\nmany callers, and runs only from a publisher the operator lists.\nAbsent otherwise."
           }
         }
       },

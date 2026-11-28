@@ -8,8 +8,10 @@
 //! means
 //! the new manifest asks for something the installed one did not: a
 //! capability, a connection slot, an auth scheme on a slot, a read rule, or a
-//! gate (a gate whose definition changed counts as added), or it stops
-//! naming the image repository it named, or names another. Removing anything
+//! gate (a gate whose definition changed counts as added), an endpoint
+//! operation (one whose match, `may` or writes changed counts as added:
+//! ADR-0086 §1), or it stops naming the image repository it named, or names
+//! another. Removing anything
 //! and adding a config key are not wider: a config value is set by the
 //! admin, never by the plugin. The server decides this from the two
 //! manifests it holds, never from what a client says.
@@ -61,6 +63,10 @@ pub struct ManifestDiff {
     pub gates: SetDiff<String>,
     /// The image repository the manifest names, when it names one.
     pub image: SetDiff<String>,
+    /// Endpoint operations by `<path>/<operation>`, each compared as its
+    /// whole definition in canonical JSON (`may` sorted): one whose match,
+    /// `may` or writes changed is in both `removed` and `added`.
+    pub endpoint_operations: SetDiff<String>,
 }
 
 impl ManifestDiff {
@@ -85,6 +91,19 @@ impl ManifestDiff {
                 .collect()
         };
         let image = |m: &PluginManifest| -> Vec<String> { m.image.iter().cloned().collect() };
+        // An endpoint operation is its `<path>/<operation>` key and its whole
+        // definition, in canonical JSON so that listing `may` in another
+        // order is not a change.
+        let endpoint_operations = |m: &PluginManifest| -> Vec<(String, serde_json::Value)> {
+            m.endpoint_operations()
+                .into_iter()
+                .map(|(name, op)| (name, canonical_endpoint_operation(op)))
+                .collect()
+        };
+        let operations = SetDiff::of(&endpoint_operations(old), &endpoint_operations(new));
+        let keys = |xs: Vec<(String, serde_json::Value)>| {
+            xs.into_iter().map(|(n, _)| n).collect::<Vec<_>>()
+        };
         // A gate is its name and its whole definition: the same name with
         // another interface is not the gate an admin approved.
         let gates = SetDiff::of(
@@ -106,6 +125,11 @@ impl ManifestDiff {
                 unchanged: names(gates.unchanged),
             },
             image: SetDiff::of(&image(old), &image(new)),
+            endpoint_operations: SetDiff {
+                added: keys(operations.added),
+                removed: keys(operations.removed),
+                unchanged: keys(operations.unchanged),
+            },
         }
     }
 
@@ -132,6 +156,15 @@ impl ManifestDiff {
                 out.push(format!("adds gate `{g}`"));
             }
         }
+        // An endpoint operation is one approval: a new one, or any change to
+        // one, is asked about again (ADR-0086 §1).
+        for name in &self.endpoint_operations.added {
+            if self.endpoint_operations.removed.contains(name) {
+                out.push(format!("changes endpoint operation `{name}`"));
+            } else {
+                out.push(format!("adds endpoint operation `{name}`"));
+            }
+        }
         // Naming no image, or another, loosens which code the manifest runs
         // with; naming one where there was none narrows it.
         for i in &self.image.removed {
@@ -147,6 +180,14 @@ impl ManifestDiff {
     pub fn widens(&self) -> bool {
         !self.widenings().is_empty()
     }
+}
+
+/// An endpoint operation as one comparable value: its JSON with `may`
+/// sorted.
+fn canonical_endpoint_operation(op: &crate::PluginEndpointOperation) -> serde_json::Value {
+    let mut op = op.clone();
+    op.may.sort();
+    serde_json::to_value(&op).unwrap_or(serde_json::Value::Null)
 }
 
 /// A read rule with the query keys it allows: `GET /api/v1/applications
@@ -199,7 +240,7 @@ mod tests {
                 }))
                 .unwrap(),
             )]),
-            extensions: None,
+            extensions: Vec::new(),
         }
     }
 
@@ -303,5 +344,101 @@ mod tests {
         let d = ManifestDiff::between(&old, &manifest());
         assert_eq!(d.image.added, vec!["ghcr.io/acme/argocd".to_string()]);
         assert!(!d.widens());
+    }
+
+    /// A manifest with one endpoint `mcp` whose `trigger_run` may use `may`.
+    fn with_endpoint(may: &[&str], writes: u32) -> PluginManifest {
+        let mut m = manifest();
+        m.capabilities = vec![PluginCapability::UseConnection];
+        m.gates.clear();
+        m.extensions = vec![serde_json::from_value(serde_json::json!({
+            "point": "endpoint",
+            "path": "mcp",
+            "operations": {
+                "trigger_run": {
+                    "match": { "method": "POST", "json": { "/method": "tools/call" } },
+                    "may": may,
+                    "writes": writes
+                }
+            }
+        }))
+        .unwrap()];
+        m
+    }
+
+    /// J2: an endpoint operation is keyed by `<path>/<operation>` and
+    /// compared as its whole definition: `may` in another order is no
+    /// change, while one more `may` or one more write is a change, named by
+    /// its key.
+    #[test]
+    fn an_endpoint_operation_is_compared_whole_and_named_by_its_key() {
+        let old = with_endpoint(&["run.read", "repo.dispatch"], 1);
+        let reordered = with_endpoint(&["repo.dispatch", "run.read"], 1);
+        let d = ManifestDiff::between(&old, &reordered);
+        assert_eq!(
+            d.endpoint_operations.unchanged,
+            vec!["mcp/trigger_run".to_string()]
+        );
+        assert!(!d.widens(), "{:?}", d.widenings());
+
+        for new in [
+            with_endpoint(&["run.read", "repo.dispatch", "step.rerun"], 1),
+            with_endpoint(&["run.read", "repo.dispatch"], 2),
+        ] {
+            let d = ManifestDiff::between(&old, &new);
+            assert_eq!(
+                d.endpoint_operations.added,
+                vec!["mcp/trigger_run".to_string()]
+            );
+            assert_eq!(
+                d.endpoint_operations.removed,
+                vec!["mcp/trigger_run".to_string()]
+            );
+            assert_eq!(
+                d.widenings(),
+                vec!["changes endpoint operation `mcp/trigger_run`".to_string()]
+            );
+        }
+
+        let d = ManifestDiff::between(&manifest(), &old);
+        assert!(d
+            .widenings()
+            .contains(&"adds endpoint operation `mcp/trigger_run`".to_string()));
+    }
+
+    /// [`with_endpoint`] with `trigger_run`'s JSON checks replaced by `json`.
+    fn with_checks(json: serde_json::Value) -> PluginManifest {
+        let mut m = with_endpoint(&["run.read"], 0);
+        let op = m.extensions[0]
+            .operations
+            .get_mut("trigger_run")
+            .expect("with_endpoint registers trigger_run");
+        op.request_rule.json = serde_json::from_value(json).unwrap();
+        m
+    }
+
+    /// Two match rules whose one-line descriptions could read alike (a value
+    /// holding ` /c=d`) are still two rules: the change is asked about.
+    /// Dropping an endpoint operation, or the whole endpoint, is narrower.
+    #[test]
+    fn a_match_rule_change_is_a_change_and_a_removal_is_narrower() {
+        let two_checks = with_checks(serde_json::json!({ "/a": "b", "/c": "d" }));
+        let one_check = with_checks(serde_json::json!({ "/a": "b /c=d" }));
+        for (old, new) in [(&two_checks, &one_check), (&one_check, &two_checks)] {
+            let d = ManifestDiff::between(old, new);
+            assert_eq!(
+                d.widenings(),
+                vec!["changes endpoint operation `mcp/trigger_run`".to_string()]
+            );
+        }
+
+        let mut no_endpoint = with_endpoint(&["run.read"], 0);
+        no_endpoint.extensions.clear();
+        let d = ManifestDiff::between(&with_endpoint(&["run.read"], 0), &no_endpoint);
+        assert_eq!(
+            d.endpoint_operations.removed,
+            vec!["mcp/trigger_run".to_string()]
+        );
+        assert!(!d.widens(), "{:?}", d.widenings());
     }
 }

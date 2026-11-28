@@ -49,6 +49,7 @@ import Plugins from "../components/Plugins";
 import Libraries from "../components/Libraries";
 import SecretKeyList from "../components/SecretKeyList";
 import { MyApiTokens, OrgApiTokens } from "../components/ApiTokens";
+import { ConnectedApps } from "../components/ConnectedApps";
 import OrgSecurity from "../components/OrgSecurity";
 import OrgPolicies from "../components/OrgPolicies";
 import PolicyLists from "../components/PolicyLists";
@@ -333,6 +334,8 @@ function accountBody(id: string): JSX.Element {
       return <SecuritySettings />;
     case "tokens":
       return <MyApiTokens />;
+    case "connected-apps":
+      return <ConnectedApps />;
     case "appearance":
       return <AppearanceSettings />;
     default:

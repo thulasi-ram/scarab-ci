@@ -656,6 +656,9 @@ pub struct DelegationTrail {
     /// The OAuth client an `oauth` token was granted to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_client: Option<String>,
+    /// The Plugin installation (its id) the dispatch came through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_installation: Option<String>,
 }
 
 /// A forge event, normalized across providers into Scarab's own vocabulary.

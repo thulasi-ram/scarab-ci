@@ -194,9 +194,21 @@ data:
   {{- with .Values.plugins.probeImage }}
   SCARAB_PLUGIN_PROBE_IMAGE: {{ . | quote }}
   {{- end }}
+  {{- with .Values.plugins.trustedPublishers }}
+  SCARAB_PLUGIN_TRUSTED_PUBLISHERS: {{ join "," . | quote }}
+  {{- end }}
   {{- if or .Values.plugins.tolerations .Values.plugins.nodeSelector }}
   SCARAB_PLUGIN_PLACEMENT: {{ dict "tolerations" (.Values.plugins.tolerations | default list) "nodeSelector" (.Values.plugins.nodeSelector | default dict) | toJson | quote }}
   {{- end }}
+  {{- end }}
+  {{- if .Values.oauthServer.enabled }}
+  {{- /* Under secrets.existingSecret the key is that Secret's
+         SCARAB_OAUTH_REFRESH_KEY, which the render cannot see: the server
+         refuses to boot without it. */}}
+  {{- if not (or .Values.secrets.existingSecret .Values.secrets.oauthRefreshKey) }}
+  {{- fail "oauthServer.enabled needs secrets.oauthRefreshKey (at least 32 random bytes, the same on every replica), or SCARAB_OAUTH_REFRESH_KEY in secrets.existingSecret" }}
+  {{- end }}
+  SCARAB_OAUTH_SERVER: "on"
   {{- end }}
   {{- range $k, $v := .Values.scarab.extraEnv }}
   {{ $k }}: {{ $v | quote }}

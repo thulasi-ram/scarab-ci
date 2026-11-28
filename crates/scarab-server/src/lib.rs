@@ -99,12 +99,15 @@ pub mod log_tail;
 pub mod logs;
 pub mod metrics;
 pub mod oauth;
+pub mod oauth_server;
 pub mod oidc;
 /// ADR-0071: the minimal org-level Environment — its admin/read API.
 pub mod org_environments;
 pub mod people;
 /// ADR-0072: PluginInstallations — fetch a manifest to review, install,
 /// uninstall and the kill switch.
+pub mod plugin_api;
+pub mod plugin_endpoint;
 pub mod plugin_gates;
 /// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
 /// baseline, isolation probe, one workload per installation.
@@ -246,6 +249,10 @@ pub struct AppState {
     /// and an admin's kill switch use. `None` = the broker uses `plugins`
     /// (a hand-built state).
     pub broker_plugins: Option<Arc<dyn scarab_plugin::PluginStore>>,
+    /// PluginApi's DelegatedCallerHandles and its journal (ADR-0086 §3,
+    /// §4), on the broker's own pool when the server wires one. `None`:
+    /// every PluginApi call is a 401.
+    pub delegated_calls: Option<Arc<dyn scarab_plugin::DelegatedCallStore>>,
     /// How many entries the CredentialBroker's journal queue holds between
     /// the read proxy and its writer (ADR-0072 §5). Full, the proxy refuses
     /// to forward (503) rather than forward what it cannot journal.
@@ -254,6 +261,17 @@ pub struct AppState {
     /// bound destination that is or resolves to loopback is refused. Only a
     /// test whose fake upstream listens on 127.0.0.1 turns it on.
     pub broker_upstream_loopback_allowed: bool,
+    /// The endpoint's request limits on this replica (ADR-0086 §4).
+    pub plugin_endpoint_limits: Arc<plugin_endpoint::PluginEndpointLimits>,
+    /// Tests only: the base URL every installation's endpoint Service is
+    /// reached at, instead of its Service in the plugin namespace. Never set
+    /// from configuration.
+    pub plugin_endpoint_upstream_override: Option<String>,
+    /// The OAuth authorization server's records (ADR-0086 §7). `None`, or
+    /// `oauth_refresh_key` `None`: the server is off and its routes 404.
+    pub oauth: Option<Arc<dyn scarab_identity::OAuthStore>>,
+    /// The key refresh secrets are derived with (`SCARAB_OAUTH_REFRESH_KEY`).
+    pub oauth_refresh_key: Option<Arc<Vec<u8>>>,
     /// Proves who calls the broker (ADR-0072 §11): TokenReview in production
     /// (slice d2), static dev tokens under `SCARAB_DEV_INSECURE`. `None` makes
     /// every authenticated broker call a 401 — nothing proven, nothing taken.
@@ -459,8 +477,13 @@ impl AppState {
             org_environments: None,
             plugins: None,
             broker_plugins: None,
+            delegated_calls: None,
             broker_journal_queue: broker_proxy::JOURNAL_QUEUE,
             broker_upstream_loopback_allowed: false,
+            plugin_endpoint_limits: Arc::default(),
+            plugin_endpoint_upstream_override: None,
+            oauth: None,
+            oauth_refresh_key: None,
             plugin_tokens: None,
             plugin_api_tokens: None,
             plugin_policy: Arc::new(plugins::PluginPolicy::off()),
@@ -693,6 +716,35 @@ impl AppState {
     /// small pool — instead of [`Self::with_plugins`]'s.
     pub fn with_broker_plugin_store(mut self, store: Arc<dyn scarab_plugin::PluginStore>) -> Self {
         self.broker_plugins = Some(store);
+        self
+    }
+
+    /// Turn the OAuth authorization server on (ADR-0086 §7): its records in
+    /// `store`, refresh secrets derived with `refresh_key`.
+    pub fn with_oauth_server(
+        mut self,
+        store: Arc<dyn scarab_identity::OAuthStore>,
+        refresh_key: Vec<u8>,
+    ) -> Self {
+        self.oauth = Some(store);
+        self.oauth_refresh_key = Some(Arc::new(refresh_key));
+        self
+    }
+
+    /// Reach every installation's endpoint at `base` instead of its Service:
+    /// for a test whose fake Plugin listens on the host. Never set by
+    /// configuration.
+    pub fn with_plugin_endpoint_upstream(mut self, base: impl Into<String>) -> Self {
+        self.plugin_endpoint_upstream_override = Some(base.into());
+        self
+    }
+
+    /// Serve PluginApi's handles and journal from `store` (ADR-0086 §4).
+    pub fn with_delegated_calls(
+        mut self,
+        store: Arc<dyn scarab_plugin::DelegatedCallStore>,
+    ) -> Self {
+        self.delegated_calls = Some(store);
         self
     }
 
@@ -7945,18 +7997,18 @@ fn environment_approval_ir(
 /// (`runs.origin_via`); `None` when no PrincipalToken started the Run (a
 /// session, a forge event).
 ///
-/// Requirement for delegated callers: a Run an agent starts through a
-/// Plugin's delegated call (a DelegatedCallerHandle, PluginApi) must count
-/// here. Its trail names the Plugin installation; once `DelegationTrail`
-/// carries that field (`plugin_installation`, on the PluginApi branch), add
-/// `|| t.plugin_installation.is_some()` to the check below.
+/// A Run an agent starts through a Plugin's delegated call (a
+/// DelegatedCallerHandle, PluginApi) counts too: its trail names the Plugin
+/// installation (`plugin_installation`), whatever the token's kind.
 ///
 /// Fails closed: an `oauth` token counts, and so does a token kind this
-/// binary does not know. Only an `issued` token does not.
+/// binary does not know. Only an `issued` token that names no Plugin
+/// installation does not.
 fn started_by_an_agent(trail: Option<&scarab_forge::DelegationTrail>) -> bool {
     trail.is_some_and(|t| {
         scarab_identity::PrincipalTokenKind::parse(&t.token_kind)
             != Some(scarab_identity::PrincipalTokenKind::Issued)
+            || t.plugin_installation.is_some()
     })
 }
 
@@ -7965,8 +8017,7 @@ fn started_by_an_agent(trail: Option<&scarab_forge::DelegationTrail>) -> bool {
 /// check follow-ups and launches use) and `org`'s setting gates it: `all`
 /// gates every Run of fork code, `agent_started` (the default, for an org
 /// with no stored setting) one an app started ([`started_by_an_agent`]),
-/// and `off` none. Nothing mints an `oauth` token yet, so until one can,
-/// `agent_started` gates no Run. The gate is one `manual` gate in front of
+/// and `off` none. The gate is one `manual` gate in front of
 /// every root Step, so nothing in the Run starts, its shared services
 /// included, until someone with write on the repository releases it
 /// ([`add_fork_run_approval_gate`](scarab_policy::fork_run_approval_gate::add_fork_run_approval_gate)).
@@ -8389,6 +8440,7 @@ fn forge_delegation_trail(via: &scarab_engine::DelegationTrail) -> scarab_forge:
         token_id: via.token_id.clone(),
         token_kind: via.token_kind.clone(),
         oauth_client: via.oauth_client.clone(),
+        plugin_installation: via.plugin_installation.clone(),
     }
 }
 
@@ -8398,6 +8450,7 @@ fn engine_delegation_trail(via: &scarab_forge::DelegationTrail) -> scarab_engine
         token_id: via.token_id.clone(),
         token_kind: via.token_kind.clone(),
         oauth_client: via.oauth_client.clone(),
+        plugin_installation: via.plugin_installation.clone(),
     }
 }
 
@@ -13233,6 +13286,10 @@ struct Caller {
     /// The session behind the request, when it was one (cookie or Bearer) —
     /// what a StepUpConfirmation is bound to (ADR-0073 §4, §7).
     session: Option<SessionFacts>,
+    /// The Plugin installation (its id) acting for this caller through
+    /// PluginApi with a DelegatedCallerHandle (ADR-0086 §4). A delegated
+    /// call never raises or satisfies a step-up.
+    plugin_installation: Option<String>,
 }
 
 /// What ADR-0073 needs to know about the session a request rode on.
@@ -13258,6 +13315,7 @@ impl Caller {
             grant: None,
             via: None,
             session: None,
+            plugin_installation: None,
         }
     }
 
@@ -13271,7 +13329,15 @@ impl Caller {
     /// The `caller` column of an OrgSecurityEventLog row.
     fn event_label(&self) -> String {
         match (&self.grant, self.via) {
-            (Some(token), _) => format!("api_token:{}", token.id),
+            (Some(token), _) => match &self.plugin_installation {
+                Some(installation) => {
+                    format!(
+                        "api_token:{} via plugin_installation:{installation}",
+                        token.id
+                    )
+                }
+                None => format!("api_token:{}", token.id),
+            },
             (None, Some(AuthVia::Cookie)) => "session:cookie".to_string(),
             (None, Some(AuthVia::Bearer)) => "session:bearer".to_string(),
             (None, None) => "dev:insecure".to_string(),
@@ -13312,6 +13378,7 @@ impl Caller {
                 token_id: token.id.clone(),
                 token_kind: token.kind.as_str().to_string(),
                 oauth_client: token.oauth_client.clone(),
+                plugin_installation: self.plugin_installation.clone(),
             })
     }
 
@@ -13435,6 +13502,16 @@ async fn authenticate(
     // and narrowed to the human's live authority; headers are ignored, and
     // CSRF has nothing to defend (no browser sent this request). The
     // task-local is set only by the confirm endpoint around its replay.
+    // A Plugin's call through PluginApi (ADR-0086 §4): the request carries
+    // the installation's token and a DelegatedCallerHandle, which the
+    // PluginApi middleware already checked. The caller is the handle's
+    // PrincipalToken, narrowed to it; headers are ignored, as on a replay.
+    // The task-local is set only by that middleware.
+    if let Some(call) = plugin_api::delegated_call() {
+        let caller = plugin_api::delegated_caller(st, &call).await?;
+        caller.admit_route_operation()?;
+        return Ok(caller);
+    }
     if let Some(authority) = step_up::requests::replay_authority() {
         let caller = step_up::requests::replay_caller(st, &authority).await?;
         caller.admit_route_operation()?;
@@ -13484,6 +13561,7 @@ async fn authenticate(
         grant: None,
         via: Some(via),
         session: Some(facts),
+        plugin_installation: None,
     })
 }
 
@@ -13586,6 +13664,7 @@ async fn authenticate_api_token(
         grant: Some(token),
         via: Some(via),
         session: None,
+        plugin_installation: None,
     })
 }
 
@@ -13789,6 +13868,15 @@ async fn approve_gate(
     // owner) is refused with no request raised, so text an outsider wrote
     // into a log cannot send the owner a stream of confirmations. A session
     // decides as before.
+    // Nor does a Plugin acting for its caller (ADR-0086 §4): PluginApi does
+    // not serve this route, and this refuses a call that reaches it anyway.
+    if caller.plugin_installation.is_some() {
+        return Err(ApiError::Ceremony {
+            status: StatusCode::FORBIDDEN,
+            code: "token_never_approves",
+            message: "a plugin acting for its caller never approves a gate".into(),
+        });
+    }
     let token_approval = match caller.grant.as_ref().map(|t| t.kind) {
         None => false,
         Some(scarab_identity::PrincipalTokenKind::Issued) => true,
@@ -17541,7 +17629,9 @@ const TAG_GROUPS: &[(&str, &str)] = &[
 /// listing rather than a repo one. Returns `None` for a path no rule claims —
 /// a test turns that into a build failure rather than an untagged operation.
 fn tag_for_path(path: &str) -> Option<&'static str> {
-    let group = if path.starts_with("/webhooks/") {
+    let group = if path.starts_with("/oauth/") || path.contains("/oauth/") {
+        "Auth & Identity"
+    } else if path.starts_with("/webhooks/") {
         "Webhooks"
     } else if path.starts_with("/v1/connections") || path.starts_with("/v1/forges/") {
         "Forge Connections"
@@ -17651,6 +17741,7 @@ impl utoipa::Modify for TagGroups {
 fn is_public_path(path: &str) -> bool {
     path.starts_with("/webhooks/")
         || path.starts_with("/.well-known/")
+        || path.starts_with("/oauth/")
         || path.starts_with("/v1/auth/")
         || matches!(
             path,
@@ -17817,6 +17908,17 @@ impl utoipa::Modify for StepUpResponses {
         mint_api_token,
         list_api_tokens,
         revoke_api_token,
+        plugin_endpoint::plugin_endpoint,
+        oauth_server::authorization_server_metadata,
+        oauth_server::protected_resource_metadata,
+        oauth_server::describe_authorization_request,
+        oauth_server::consent,
+        oauth_server::token,
+        oauth_server::list_connected_apps,
+        oauth_server::revoke_connected_app,
+        oauth_server::list_client_metadata_hosts,
+        oauth_server::put_client_metadata_host,
+        oauth_server::delete_client_metadata_host,
         mint_own_api_token,
         list_own_api_tokens,
         revoke_own_api_token,

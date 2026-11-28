@@ -6,9 +6,11 @@
 //!
 //! It serves identity (`whoami`) and the read proxy over PluginConnections
 //! ([`crate::broker_proxy`], slice d3). Report ingest went with the
-//! Deployment record (ADR-0074). It also serves the two gate API routes a
+//! Deployment record (ADR-0074). It also serves the three gate API routes a
 //! plugin that resolves gates calls ([`crate::plugin_gates`], ADR-0076 §7),
-//! at their public API paths.
+//! at their public API paths, and PluginApi ([`crate::plugin_api`], ADR-0086
+//! §4): the public API's routes a plugin calls for one caller, each with a
+//! DelegatedCallerHandle.
 //!
 //! Every route but `healthz` goes through [`authenticate_plugin`]: the
 //! token is verified ([`PluginTokenVerifier`]), its ServiceAccount mapped to
@@ -86,7 +88,7 @@ pub fn router_with_journal(state: AppState) -> (Router, Option<broker_proxy::Bro
     // refused with a 405 that is journaled like any other refusal, not
     // dropped by the router. The proxy is an outer layer, so authentication
     // finds it to take the permit.
-    let proxy = state
+    let shared_proxy = state
         .broker_plugins
         .clone()
         .or_else(|| state.plugins.clone())
@@ -97,6 +99,11 @@ pub fn router_with_journal(state: AppState) -> (Router, Option<broker_proxy::Bro
                 state.broker_upstream_loopback_allowed,
             );
             drain = journal;
+            proxy
+        });
+    let proxy = shared_proxy
+        .clone()
+        .map(|proxy| {
             Router::new()
                 .route(&broker_proxy::route_path(), any(broker_proxy::proxy))
                 .route_layer(axum::middleware::from_fn_with_state(
@@ -123,6 +130,26 @@ pub fn router_with_journal(state: AppState) -> (Router, Option<broker_proxy::Bro
             "/v1/runs/{id}/gates/{step}/note",
             axum::routing::post(crate::plugin_gates::note_on_broker),
         );
+    // PluginApi (ADR-0086 §4): the public API's own routes and handlers for
+    // a Plugin acting for one caller, each call with its installation token
+    // AND a DelegatedCallerHandle ([`crate::plugin_api`]). Only the routes a
+    // handle could name, never the gate routes above. The step-up guard runs
+    // inside, as on the public API, so each route's operation is set for
+    // `authenticate`. The read proxy's per-installation permits ride in as an
+    // extension: a delegated call spends the same budget a proxied read does.
+    let mut plugin_api = crate::routes::plugin_api_routes()
+        .router
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::step_up::guard::guard,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::plugin_api::authenticate_delegated_call,
+        ));
+    if let Some(proxy) = shared_proxy {
+        plugin_api = plugin_api.layer(Extension(proxy));
+    }
     let router = Router::new()
         // Unauthenticated: the reachability probe (the isolation probe,
         // slice d2) must not need a token.
@@ -130,6 +157,7 @@ pub fn router_with_journal(state: AppState) -> (Router, Option<broker_proxy::Bro
         .merge(reads)
         .merge(proxy)
         .merge(gate_api)
+        .merge(plugin_api)
         .layer(DefaultBodyLimit::max(BROKER_BODY_LIMIT_BYTES))
         .layer(axum::middleware::from_fn(super::request_id_middleware))
         // Outermost, so the response it rewrites already carries its

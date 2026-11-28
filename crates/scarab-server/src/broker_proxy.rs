@@ -444,6 +444,15 @@ impl BrokerProxy {
         Ok(ProxyPermit(Arc::new((own, total))))
     }
 
+    /// One of `installation_id`'s permits and one of the broker's, for a
+    /// PluginApi call (ADR-0086 §4): the same budget the read proxy spends,
+    /// so a plugin's delegated calls and its proxied reads share one limit.
+    /// `None` when the installation or the broker is at its limit; nothing is
+    /// journaled here (the delegated-call journal records the refusal).
+    pub(crate) fn try_plugin_api_permit(&self, installation_id: &str) -> Option<ProxyPermit> {
+        self.try_permit(installation_id).ok()
+    }
+
     fn cached_credential(&self, credential_ref: &str) -> Option<Arc<Vec<u8>>> {
         self.credentials
             .lock()

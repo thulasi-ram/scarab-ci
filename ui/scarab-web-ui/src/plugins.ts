@@ -181,6 +181,10 @@ export type ManifestReview = {
   connections: { name: string; auth: string; rules: string[] }[];
   configKeys: string[];
   gates: { name: string; description: string; inputs: string[]; outputs: string[] }[];
+  /** Each request the plugin's endpoints take, one line each. */
+  endpointOperations: string[];
+  /** `trusted_service` when it registers an endpoint, else `null`. */
+  trustTier: string | null;
   installed: InstalledView[];
 };
 
@@ -202,6 +206,8 @@ export function manifestReview(fetched: {
       inputs: readonly { name: string; type: string; required: boolean }[];
       outputs: readonly { name: string; type: string; required: boolean }[];
     }[];
+    endpoint_operations?: readonly string[];
+    trust_tier?: string | null;
   };
   manifest_sha256: string;
   installed: readonly { name: string; image: string; manifest_sha256: string }[];
@@ -222,6 +228,8 @@ export function manifestReview(fetched: {
       inputs: g.inputs.map(gateFieldLabel),
       outputs: g.outputs.map(gateFieldLabel),
     })),
+    endpointOperations: [...(m.endpoint_operations ?? [])],
+    trustTier: m.trust_tier ?? null,
     installed: fetched.installed.map((i) => ({
       name: i.name,
       image: i.image,
@@ -373,6 +381,7 @@ const DIFF_GROUPS: [string, string][] = [
   ["auth_schemes", "Auth schemes"],
   ["read_rules", "Read rules"],
   ["gates", "Gates"],
+  ["endpoint_operations", "Endpoint operations"],
   ["config_keys", "Config keys"],
   ["image", "Named image"],
 ];

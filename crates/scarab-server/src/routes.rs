@@ -40,13 +40,22 @@ pub struct RouteEntry {
 pub(crate) struct Routes {
     pub(crate) router: Router<AppState>,
     pub(crate) table: Vec<RouteEntry>,
+    /// Which routes of the list this router serves: every one for the main
+    /// API; for PluginApi, only those a delegated call may use.
+    keep: fn(&'static str, &'static Op) -> bool,
 }
 
 impl Routes {
     fn new() -> Self {
+        Self::keeping(|_, _| true)
+    }
+
+    /// A router that serves only the routes `keep` accepts.
+    fn keeping(keep: fn(&'static str, &'static Op) -> bool) -> Self {
         Self {
             router: Router::new(),
             table: Vec::new(),
+            keep,
         }
     }
 
@@ -57,6 +66,9 @@ impl Routes {
         op: &'static Op,
         mr: MethodRouter<AppState>,
     ) -> Self {
+        if !(self.keep)(path, op) {
+            return self;
+        }
         // axum merges method routers registered on the same path, and panics
         // on a duplicate (path, method) — so the table cannot hold one either.
         self.router = self.router.route(path, mr);
@@ -84,6 +96,21 @@ impl Routes {
         self.add(Method::POST, path, op, axum::routing::post(h))
     }
 
+    /// A POST whose body is refused past `limit` bytes before the handler
+    /// reads it.
+    fn post_limited<H, T>(self, path: &'static str, op: &'static Op, h: H, limit: usize) -> Self
+    where
+        H: Handler<T, AppState>,
+        T: 'static,
+    {
+        self.add(
+            Method::POST,
+            path,
+            op,
+            axum::routing::post(h).layer(axum::extract::DefaultBodyLimit::max(limit)),
+        )
+    }
+
     fn put<H, T>(self, path: &'static str, op: &'static Op, h: H) -> Self
     where
         H: Handler<T, AppState>,
@@ -107,17 +134,76 @@ pub fn route_table() -> &'static [RouteEntry] {
     TABLE.get_or_init(|| governed_routes().table)
 }
 
-/// The single route list.
+/// The single route list, every route of it.
 pub(crate) fn governed_routes() -> Routes {
+    route_list(Routes::new())
+}
+
+/// The routes PluginApi serves on the broker listener (ADR-0086 §4): the
+/// public API's own routes and handlers, only those whose ApiOperation a
+/// DelegatedCallerHandle could name ([`crate::plugin_api::served`]).
+pub(crate) fn plugin_api_routes() -> Routes {
+    route_list(Routes::keeping(crate::plugin_api::served))
+}
+
+/// The single route list, registered on `routes`.
+fn route_list(routes: Routes) -> Routes {
     use crate::step_up::ceremony;
     use crate::*;
-    Routes::new()
+    routes
         .get("/healthz", &ops::SERVER_READ, healthz)
         .get("/livez", &ops::SERVER_READ, livez)
         .get("/readyz", &ops::SERVER_READ, readyz)
         .get("/metrics", &ops::SERVER_READ, metrics)
         .get("/openapi.json", &ops::SERVER_READ, openapi)
         .get("/.well-known/jwks.json", &ops::SERVER_READ, jwks)
+        // ADR-0086 §7: the OAuth authorization server for plugin endpoints.
+        .get(
+            "/.well-known/oauth-authorization-server",
+            &ops::SERVER_READ,
+            crate::oauth_server::authorization_server_metadata,
+        )
+        .get(
+            "/.well-known/oauth-protected-resource/v1/orgs/{org}/plugin-installations/{id}/endpoints/{*endpoint_path}",
+            &ops::SERVER_READ,
+            crate::oauth_server::protected_resource_metadata,
+        )
+        .post(
+            "/v1/oauth/authorization-requests",
+            &ops::OAUTH_AUTHORIZATION_REQUEST,
+            crate::oauth_server::describe_authorization_request,
+        )
+        .post(
+            "/v1/oauth/consent",
+            &ops::OAUTH_CONSENT,
+            crate::oauth_server::consent,
+        )
+        .post("/oauth/token", &ops::OAUTH_TOKEN, crate::oauth_server::token)
+        .get(
+            "/v1/me/connected-apps",
+            &ops::ACCOUNT_READ,
+            crate::oauth_server::list_connected_apps,
+        )
+        .delete(
+            "/v1/me/connected-apps/{id}",
+            &ops::OAUTH_GRANT_REVOKE_OWN,
+            crate::oauth_server::revoke_connected_app,
+        )
+        .get(
+            "/v1/orgs/{org}/oauth/client-metadata-hosts",
+            &ops::SETTINGS_READ,
+            crate::oauth_server::list_client_metadata_hosts,
+        )
+        .put(
+            "/v1/orgs/{org}/oauth/client-metadata-hosts/{host}",
+            &ops::OAUTH_CLIENT_METADATA_HOST_ADD,
+            crate::oauth_server::put_client_metadata_host,
+        )
+        .delete(
+            "/v1/orgs/{org}/oauth/client-metadata-hosts/{host}",
+            &ops::OAUTH_CLIENT_METADATA_HOST_REMOVE,
+            crate::oauth_server::delete_client_metadata_host,
+        )
         .get(
             "/.well-known/openid-configuration",
             &ops::SERVER_READ,
@@ -713,6 +799,14 @@ pub(crate) fn governed_routes() -> Routes {
             "/v1/orgs/{org}/plugins/{name}",
             &ops::SETTINGS_READ,
             plugins::get_plugin,
+        )
+        // ADR-0086 §1: a plugin's endpoint, authenticated by the caller's
+        // `oauth` token for it (`plugin_endpoint`).
+        .post_limited(
+            "/v1/orgs/{org}/plugin-installations/{id}/endpoints/{*endpoint_path}",
+            &ops::PLUGIN_ENDPOINT,
+            crate::plugin_endpoint::plugin_endpoint,
+            crate::plugin_endpoint::MAX_ENDPOINT_REQUEST_BYTES,
         )
         .get(
             "/v1/orgs/{org}/plugin-installations/{id}",

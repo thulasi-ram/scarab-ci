@@ -27,6 +27,12 @@ pub use leak_checks::{
 
 /// Step-up confirmation ports (ADR-0073): passkeys, challenges,
 /// confirmations, requests and the OrgSecurityEventLog.
+mod oauth;
+pub use oauth::{
+    OAuthAuthorizationCode, OAuthClientMetadataHost, OAuthGrant, OAuthStore,
+    OAUTH_ACCESS_TOKEN_LIFETIME_MS, OAUTH_AUTHORIZATION_CODE_LIFETIME_MS,
+    OAUTH_GRANT_IDLE_LIFETIME_MS, OAUTH_GRANT_MAX_LIFETIME_MS, OAUTH_REFRESH_RETRY_WINDOW_MS,
+};
 mod step_up;
 pub use step_up::{
     security_event_kind, ChallengePurpose, ChallengeStore, ConfirmationKind, LoginKind,
@@ -361,6 +367,14 @@ pub trait SessionStore: Send + Sync {
 /// GitHub push protection, gitleaks — can be taught exactly one pattern for
 /// "this is a Scarab credential, and it is loose".
 pub const API_TOKEN_PREFIX: &str = "scarab_pat_";
+
+/// The prefix of an `oauth` PrincipalToken's access secret (ADR-0086 §6):
+/// accepted only at the one Plugin endpoint it was granted for, never on the
+/// core routes.
+pub const OAUTH_ACCESS_TOKEN_PREFIX: &str = "scarab_oat_";
+
+/// The prefix of an OAuth grant's refresh secret (ADR-0086 §6).
+pub const OAUTH_REFRESH_TOKEN_PREFIX: &str = "scarab_ort_";
 
 /// How long a token may be issued for, in days. An expiry is **mandatory**
 /// (see [`PrincipalToken`]); this only bounds how far out it may be pushed.
