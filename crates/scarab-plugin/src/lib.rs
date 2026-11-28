@@ -360,8 +360,13 @@ impl PluginManifest {
                 ));
             }
         }
-        if self.capabilities.is_empty() {
-            return invalid("a plugin must ask for at least one capability".into());
+        // An endpoint registration is itself what the plugin asks for
+        // (ADR-0086 §1): a plugin that only serves an endpoint needs no
+        // capability beside it.
+        if self.capabilities.is_empty() && self.extensions.is_empty() {
+            return invalid(
+                "a plugin must ask for at least one capability or register an extension".into(),
+            );
         }
         let mut seen = std::collections::BTreeSet::new();
         for capability in &self.capabilities {
