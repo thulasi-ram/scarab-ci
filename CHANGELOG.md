@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-11-28
+
 ### Security
 
 - **A dispatch records the kind of ref it ran.** A manual or API dispatch at a bare name such as
@@ -2869,7 +2871,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.0...v0.8.1
