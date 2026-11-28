@@ -1005,7 +1005,7 @@ async fn which_runs_get_a_token() {
     )
     .await;
 
-    let sub = |r#ref: &str| format!("scarab:org/acme/repo/web/ref/{r#ref}");
+    let sub = |git_ref: &str| format!("scarab:org/acme/repo/web/ref/{git_ref}");
     // (run, tenant, trigger, want: (subject, event, sha))
     let rows: Vec<(
         &str,
