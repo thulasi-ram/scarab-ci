@@ -117,6 +117,7 @@ export default defineConfig({
             { label: 'Libraries', slug: 'usage/libraries' },
             { label: 'Secrets', slug: 'usage/secrets' },
             { label: 'API tokens', slug: 'usage/api-tokens' },
+            { label: 'Connected apps', slug: 'usage/connected-apps' },
             { label: 'Runs', slug: 'usage/runs' },
             { label: 'Run logs', slug: 'usage/run-logs' },
             { label: 'Environments', slug: 'usage/environments' },

@@ -194,8 +194,11 @@ data:
   {{- end }}
   {{- end }}
   {{- if .Values.oauthServer.enabled }}
-  {{- if not .Values.secrets.oauthRefreshKey }}
-  {{- fail "oauthServer.enabled needs secrets.oauthRefreshKey (at least 32 random bytes, the same on every replica)" }}
+  {{- /* Under secrets.existingSecret the key is that Secret's
+         SCARAB_OAUTH_REFRESH_KEY, which the render cannot see: the server
+         refuses to boot without it. */}}
+  {{- if not (or .Values.secrets.existingSecret .Values.secrets.oauthRefreshKey) }}
+  {{- fail "oauthServer.enabled needs secrets.oauthRefreshKey (at least 32 random bytes, the same on every replica), or SCARAB_OAUTH_REFRESH_KEY in secrets.existingSecret" }}
   {{- end }}
   SCARAB_OAUTH_SERVER: "on"
   {{- end }}

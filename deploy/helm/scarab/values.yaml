@@ -432,7 +432,9 @@ secrets:
   gateTokenSecret: ""
   # The key OAuth refresh secrets are derived with (SCARAB_OAUTH_REFRESH_KEY):
   # at least 32 random bytes, the same on every replica. Required when
-  # oauthServer.enabled is true; the render fails without it.
+  # oauthServer.enabled is true: the render fails without it, unless
+  # existingSecret is set (then that Secret must hold SCARAB_OAUTH_REFRESH_KEY,
+  # or the server refuses to boot).
   oauthRefreshKey: ""
   resultsTokenSecret: ""
   # HMAC secret for the workspace token (ADR-0061): the credential a step Pod

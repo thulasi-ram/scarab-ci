@@ -598,10 +598,18 @@ Migration 0113 adds three tables for the OAuth authorization server that
 plugin endpoints use (`oauth_client_metadata_hosts`,
 `oauth_authorization_codes`, `oauth_grants`). It is off until you set
 `oauthServer.enabled` and `secrets.oauthRefreshKey`. A plugin whose manifest
-registers an endpoint gets a Service, `scarab-plugin-endpoint-<id>`, and the
-baseline gains the `plugin-endpoint-ingress` NetworkPolicy, which admits the
-server's Pods to port 8080 of those plugins' Pods and nothing else. The
-endpoint's request limits are counted per server replica.
+registers an endpoint gets a Service, `scarab-plugin-endpoint-<id>`; the
+server creates, changes or deletes Services only for such plugins, and the
+chart grants it `services` in the plugin namespace for that. The plugin
+namespace's baseline gains one NetworkPolicy, `plugin-endpoint-ingress`, on
+every release whether or not an endpoint plugin is installed: it is part of
+the baseline the runtime applies and checks for drift as a whole, and it
+selects only Pods labelled `scarab.io/plugin-endpoint=true`, admitting the
+server's Pods to their port 8080 and nothing else. A plugin without an
+endpoint has no such label, so it still takes no ingress. A broker peer given as
+`cidr:` (`SCARAB_PLUGIN_BROKER_PEER`, for a server outside the cluster)
+admits every address in that range to the endpoint port, not only the
+server. The endpoint's request limits are counted per server replica.
 
 To roll back: scale the server to zero, back up the database, run
 [`rollback/0113_revert.sql`](../../../crates/scarab-db-postgres/rollback/0113_revert.sql)
@@ -972,7 +980,7 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `plugins.namespace` / `.createNamespace` | `scarab-plugins` / `true` | the shared plugin namespace; must enforce Pod Security `restricted`. A namespace of its own: the render fails on the release namespace, `scarab.namespace`, `default` or `kube-*` |
 | `plugins.brokerPort` | `8090` | the broker listener and its ClusterIP Service port |
 | `plugins.probeImage` | `""` = `busybox:1.36.1@sha256:73aa…` | the isolation probe's and the per-Pod self-check's image; digest-pin an override |
-| `oauthServer.enabled` / `secrets.oauthRefreshKey` | `false` / `""` | the OAuth authorization server for plugin endpoints; the key (at least 32 random bytes, the same on every replica) derives refresh secrets, and the render fails without it |
+| `oauthServer.enabled` / `secrets.oauthRefreshKey` | `false` / `""` | the OAuth authorization server for plugin endpoints; the key (at least 32 random bytes, the same on every replica) derives refresh secrets. The render fails without it unless `secrets.existingSecret` is set, which must then hold `SCARAB_OAUTH_REFRESH_KEY` |
 | `plugins.trustedPublishers` | `[]` | image repositories (`registry/namespace/name`, compared whole) a plugin that registers an endpoint (`trusted_service`) may run from, pinned by digest; empty trusts none |
 | `ingress.enabled` | `false` | expose the HTTP API. The web UI, the CLI and the results sidecar name a Step by its key and need nothing from the proxy; an API caller that sends a Step id holding `/` needs a proxy that passes `%2F` on unchanged (with Envoy Gateway, `escapedSlashesAction: KeepUnchanged` in a `ClientTrafficPolicy`) |
 | `scarab.resultsApiUrl` | `""` = `http://<fullname>.<ns>.svc` | where step Pods post results; leave it empty, or point it at the in-cluster Service, not at a gateway that redirects or rewrites paths |

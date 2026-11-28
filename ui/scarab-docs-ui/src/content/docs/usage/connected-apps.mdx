@@ -20,7 +20,9 @@ An operator sets, in the chart:
 
 An org admin then lists the hosts Scarab may read app descriptions from, such as `claude.ai`
 (`PUT /v1/orgs/{org}/oauth/client-metadata-hosts/{host}`; it asks for a passkey). Every path on a
-listed host is trusted, so do not list a host that serves files its users upload.
+listed host is trusted, so do not list a host that serves files its users upload. Removing a host
+(`DELETE` on the same path) disconnects every app in the org whose description came from it.
+There is no settings page for this list yet; use the API.
 
 ## Connecting an app
 
@@ -31,8 +33,13 @@ everything else starts unticked. Connecting asks for your passkey every time. No
 gate.
 
 The app gets a token that lasts an hour and a refresh secret that changes each time it is used. A
-refresh secret used twice revokes the connection, except a retry within 30 seconds. A connection
-ends 30 days after its last use and 90 days after you approved it.
+refresh secret used twice revokes the connection, except one retry within 30 seconds; a second
+retry in that time is refused and the connection stays. A connection ends 30 days after its last
+use, or at most 90 days after you approved it.
+
+While the plugin is killed, held by the plugin runtime, or its publisher is no longer trusted,
+its endpoint and Scarab's token endpoint answer 503 and the connection stays. Uninstalling the
+plugin ends it.
 
 ## Disconnecting
 
@@ -42,7 +49,7 @@ Scarab. Uninstalling the plugin disconnects every app connected to it.
 
 ## Limits
 
-The endpoint takes POST requests of at most 1 MiB, each matching exactly one operation the plugin
-declares. It counts 60 requests a minute and 4 at once per person per plugin, and 600 a minute and
+The endpoint answers 404 while the OAuth server is off. It takes POST requests of at most 1 MiB,
+each matching exactly one operation the plugin declares. It counts 60 requests a minute and 4 at once per person per plugin, and 600 a minute and
 16 at once per plugin. These counts are kept by each server replica, so with two replicas a person
 can make up to twice as many.

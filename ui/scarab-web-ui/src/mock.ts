@@ -2734,6 +2734,8 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   const pol = policyRoute(p, search, method, body, json);
   if (pol) return pol;
   if (p === "/v1/me/security") return json(meSecurity);
+  // No connected apps in the fixture: the page shows its empty state.
+  if (p === "/v1/me/connected-apps") return json([]);
   if (p === "/v1/me/security/events") {
     return json({ events: securityEvents.filter((e) => e.subject === "a.kim") });
   }

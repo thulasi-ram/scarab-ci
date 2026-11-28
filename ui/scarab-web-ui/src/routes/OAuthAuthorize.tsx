@@ -129,7 +129,8 @@ export default function OAuthAuthorize() {
               </dl>
               <p class="subtle">
                 <small>
-                  Logs can hold text outsiders wrote. The app can never approve a gate. You can
+                  Logs can hold text outsiders wrote, and may hold the end of a secret that a step
+                  printed. The app can never approve a gate. You can
                   disconnect it under Account settings › Connected apps. Connecting asks for your
                   passkey.
                 </small>
