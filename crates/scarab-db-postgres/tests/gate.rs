@@ -189,7 +189,7 @@ async fn record_gate_approval_accumulates_without_resuming() {
     assert_eq!(status(&db, "run-accum").await, RunStatus::Suspended);
 
     // Alice approves: recorded as an event, but the gate does NOT resume.
-    record_gate_approval(&db, &clock, &run, &g, "alice")
+    record_gate_approval(&db, &clock, &run, &g, "alice", None)
         .await
         .unwrap();
     assert_eq!(
@@ -204,7 +204,7 @@ async fn record_gate_approval_accumulates_without_resuming() {
     assert_eq!(approval_count(&db, &run).await, 1);
 
     // Alice approves again: idempotent, still exactly one approval event.
-    record_gate_approval(&db, &clock, &run, &g, "alice")
+    record_gate_approval(&db, &clock, &run, &g, "alice", None)
         .await
         .unwrap();
     assert_eq!(
@@ -214,7 +214,7 @@ async fn record_gate_approval_accumulates_without_resuming() {
     );
 
     // Bob approves: a second distinct approval; run still suspended.
-    record_gate_approval(&db, &clock, &run, &g, "bob")
+    record_gate_approval(&db, &clock, &run, &g, "bob", None)
         .await
         .unwrap();
     assert_eq!(approval_count(&db, &run).await, 2);

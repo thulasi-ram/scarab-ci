@@ -32,6 +32,9 @@ pub use environment_governance::InMemoryEnvironmentGovernance;
 /// versioning, name and concurrency rules.
 mod policies;
 pub use policies::InMemoryPolicies;
+// The in-memory `ForkRunApprovalStore` (ADR-0086 §9).
+mod fork_run_approval;
+pub use fork_run_approval::InMemoryForkRunApproval;
 // The in-memory `LibraryStore` (ADR-0076).
 mod leak_checks;
 pub use leak_checks::InMemoryLeakCheckLimits;
@@ -488,6 +491,8 @@ struct InMemoryState {
     run_pipeline_source: HashMap<RunId, scarab_engine::RunPipelineSource>,
     /// Per-run Headline / trigger title (mirrors the `trigger_title` column).
     run_trigger_title: HashMap<RunId, String>,
+    /// Per-run start DelegationTrail (mirrors the `origin_via` column).
+    run_origin_via: HashMap<RunId, scarab_engine::DelegationTrail>,
     /// Refused Run creations (ADR-0076; mirrors `refused_runs`).
     refused_runs: Vec<scarab_engine::RefusedRun>,
     /// ForgeConnection registry rows (ADR-0046).
@@ -2068,6 +2073,26 @@ impl Db for InMemoryDb {
             .cloned())
     }
 
+    async fn set_run_origin_via(
+        &self,
+        run: &RunId,
+        via: &scarab_engine::DelegationTrail,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_origin_via
+            .insert(run.clone(), via.clone());
+        Ok(())
+    }
+
+    async fn run_origin_via(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::DelegationTrail>, DbError> {
+        Ok(self.state.lock().unwrap().run_origin_via.get(run).cloned())
+    }
+
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
         let st = self.state.lock().unwrap();
         let n = st
@@ -3486,6 +3511,7 @@ impl Db for InMemoryDb {
                 reason: "released".to_string(),
                 expired: false,
                 by: None,
+                via: None,
                 fence: None,
                 legacy_started_at: at,
                 at,
@@ -6190,9 +6216,15 @@ impl scarab_identity::ApiTokenStore for InMemoryApiTokens {
 
     async fn by_hash(
         &self,
-        hash: &str,
+        plain_hash: &str,
+        restricted_hash: &str,
     ) -> Result<Option<scarab_identity::ApiToken>, IdentityError> {
-        Ok(self.tokens.lock().unwrap().get(hash).cloned())
+        // The Postgres adapter's rule: a row matches only under the hash its
+        // restrictions call for.
+        let tokens = self.tokens.lock().unwrap();
+        let plain = tokens.get(plain_hash).filter(|t| !t.is_restricted());
+        let restricted = tokens.get(restricted_hash).filter(|t| t.is_restricted());
+        Ok(plain.or(restricted).cloned())
     }
 
     async fn by_id(&self, id: &str) -> Result<Option<scarab_identity::ApiToken>, IdentityError> {

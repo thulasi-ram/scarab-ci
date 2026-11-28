@@ -10,6 +10,9 @@
 //   admin picked.
 // - Leak checks (`LeakChecks.tsx`): how many leak checks each person gets per
 //   hour and per day; an Owner changes them.
+// - Fork Run approval (`ForkRunApproval.tsx`): which Runs of fork code wait
+//   at an approval gate (off, Runs an app started, every one); an admin
+//   changes it.
 // - The event log (`EventLog.tsx`) with its filters and paging; its
 //   "Refusals, last 24h" preset shows who was asked to confirm, for what.
 import { For, Show, createResource, createSignal } from "solid-js";
@@ -22,6 +25,7 @@ import Modal from "./Modal";
 import ConfirmDestructive from "./ConfirmDestructive";
 import EventLog from "./EventLog";
 import LeakChecks from "./LeakChecks";
+import ForkRunApproval from "./ForkRunApproval";
 import { canEditLeakChecks } from "../leak-checks";
 import Pill from "./Pill";
 
@@ -150,6 +154,8 @@ export default function OrgSecurity(props: { org: string }) {
       </Show>
 
       <LeakChecks org={props.org} owner={canEditLeakChecks(summary())} />
+
+      <ForkRunApproval org={props.org} />
 
       <EventLog org={props.org} />
     </>

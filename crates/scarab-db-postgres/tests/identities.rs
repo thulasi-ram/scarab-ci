@@ -273,6 +273,10 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
             last_used_at: None,
             use_count: 0,
             revoked_at: None,
+            kind: scarab_identity::PrincipalTokenKind::Issued,
+            operations: None,
+            audience: None,
+            oauth_client: None,
         },
         "hash-1",
     )
@@ -312,7 +316,11 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
         }
     );
     assert_eq!(
-        db.by_hash("hash-1").await.unwrap().unwrap().owner_subject,
+        db.by_hash("hash-1", "")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_subject,
         ada,
         "the token follows the person"
     );

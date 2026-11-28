@@ -159,6 +159,10 @@ async fn harness(forge: FakeForge) -> Harness {
                 last_used_at: None,
                 use_count: 0,
                 revoked_at: None,
+                kind: scarab_identity::PrincipalTokenKind::Issued,
+                operations: None,
+                audience: None,
+                oauth_client: None,
             },
             &api_token_hash(GLOBEX_TOKEN),
         )

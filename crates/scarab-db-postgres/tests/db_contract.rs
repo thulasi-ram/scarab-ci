@@ -2431,10 +2431,19 @@ async fn the_0099_revert_leaves_a_schema_the_migrator_can_upgrade_again() {
     .await
     .unwrap();
 
-    // Back to 0.8.2 first (the gate note), then to 0.7.5 (the leak-check
-    // limits), then to 0.7.2 (the saved Pipeline file, the supersede mark and
-    // the pull request head), then to 0.7.1 (ADR-0083's migrations), then to
-    // 0.6.
+    // Back past the Fork Run approval setting first, then to 0.8.3 (the
+    // token kinds), then to 0.8.2 (the gate note),
+    // then to 0.7.5 (the leak-check limits), then to 0.7.2 (the saved
+    // Pipeline file, the supersede mark and the pull request head), then to
+    // 0.7.1 (ADR-0083's migrations), then to 0.6.
+    sqlx::raw_sql(include_str!("../rollback/0114_revert.sql"))
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../rollback/0111_revert.sql"))
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
     sqlx::raw_sql(include_str!("../rollback/0110_revert.sql"))
         .execute(&tdb.pool)
         .await

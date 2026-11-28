@@ -407,7 +407,7 @@ async fn a_stale_cancel_intent_spares_the_reruns_attempt(w: World) {
     // a1's Pod stays terminating across several teardown checks.
     w.exec.linger_after_cancel(50);
     assert!(
-        cancel_run_request(&*w.db, &w.clock, &rid("rp"), Some("amy".into()))
+        cancel_run_request(&*w.db, &w.clock, &rid("rp"), Some("amy".into()), None)
             .await
             .unwrap()
     );
@@ -586,7 +586,7 @@ async fn a_stale_generation_read_cannot_orphan_the_reruns_attempt(w: World) {
             Box::new(move || {
                 Box::pin(async move {
                     let clock = FakeClock::new(T0);
-                    assert!(cancel_run_request(&*db, &clock, &rid("rp"), None)
+                    assert!(cancel_run_request(&*db, &clock, &rid("rp"), None, None)
                         .await
                         .unwrap());
                     // The leader (lease owner "sched") — only it admits.
@@ -640,7 +640,7 @@ async fn three_cancel_rerun_cycles_each_tear_down(w: World) {
         let a = format!("a{n}");
         w.running_on("rp", "build", &a).await;
         assert!(
-            cancel_run_request(&*w.db, &w.clock, &rid("rp"), Some("amy".into()))
+            cancel_run_request(&*w.db, &w.clock, &rid("rp"), Some("amy".into()), None)
                 .await
                 .unwrap()
         );
@@ -845,7 +845,7 @@ async fn a_rerun_by_an_old_binary_still_gets_its_cancel(w: World) {
     w.seed_plain("rp").await;
     assert_eq!(w.db.run_reopen_generation(&rid("rp")).await.unwrap(), 0);
     w.running_on("rp", "build", "a1").await;
-    cancel_run_request(&*w.db, &w.clock, &rid("rp"), None)
+    cancel_run_request(&*w.db, &w.clock, &rid("rp"), None, None)
         .await
         .unwrap();
     w.ticks(2).await;
@@ -859,7 +859,7 @@ async fn a_rerun_by_an_old_binary_still_gets_its_cancel(w: World) {
         .await
         .unwrap();
     w.running_on("rp", "build", "a2").await;
-    cancel_run_request(&*w.db, &w.clock, &rid("rp"), None)
+    cancel_run_request(&*w.db, &w.clock, &rid("rp"), None, None)
         .await
         .unwrap();
     w.ticks(2).await;
@@ -934,6 +934,10 @@ async fn pat(h: &Harness, tid: &str, scope: Scope, role: Role) -> String {
                 last_used_at: None,
                 use_count: 0,
                 revoked_at: None,
+                kind: scarab_identity::PrincipalTokenKind::Issued,
+                operations: None,
+                audience: None,
+                oauth_client: None,
             },
             &api_token_hash(&plaintext),
         )

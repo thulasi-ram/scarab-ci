@@ -16,7 +16,7 @@ the same columns as [the org's list](#the-orgs-list) except the owner. Through t
 | Call | What it does |
 |------|--------------|
 | `GET /v1/me/tokens` | your tokens, in every org, newest first. Called with a token, it lists only your tokens inside that token's scope |
-| `POST /v1/me/tokens` | mint one; the body names `org`, `name`, `role`, `expires_in_days` and, optionally, `project` |
+| `POST /v1/me/tokens` | mint one; the body names `org`, `name`, `role`, `expires_in_days` and, optionally, `project` and `operations` |
 | `DELETE /v1/me/tokens/{id}` | revoke one of yours. A token cannot call it (403): sign in, or ask an org admin |
 
 You may mint a token in any org or project where you hold a role, a viewer role included.
@@ -28,6 +28,10 @@ When you mint a token you choose:
   in that scope. On every request the token gets the lower of its ceiling and the role you hold
   at that moment, so when your access is removed, your tokens lose it too.
 - **Lifetime**: 1 to 365 days. There is no token that never expires.
+- **Operations** (optional): the operations the token may use, such as `run.read` and
+  `step.logs.read`. Every other request it makes is refused with `403 operation_not_granted`. A
+  token with no list may use every operation its role allows, as every token minted before 0.9
+  does. See [Operations](#operations).
 
 Minting needs a passkey confirmation each time, and a token cannot mint tokens. The plaintext is
 shown once, in the mint response. Scarab stores only its SHA-256, so a lost token is replaced,
@@ -35,6 +39,43 @@ not recovered.
 
 `POST /v1/orgs/{org}/tokens` still works for clients written before `/v1/me/tokens`. It mints
 the same personal token, with the org taken from the path.
+
+## Operations
+
+Every API route names one operation. Reads are named by the data they return:
+
+| Operation | What it reads |
+|-----------|---------------|
+| `run.read` | Runs and Steps: status, events, the step graph, results, refused deliveries |
+| `step.logs.read` | Step logs and service logs |
+| `step.workspace.read` | a Step's workspace files |
+| `run.artifacts.read` | a Run's artifacts |
+| `repo.read` | repositories, refs, Pipelines and their inputs, schedules |
+| `account.read` | your account, your tokens, and the confirmation requests a token raised |
+| `access.read` | role bindings, members, the org's tokens |
+| `security.read` | security events and leak check limits |
+| `secret.names.read` | secret names and where each is set (never a value) |
+| `settings.read` | Environments, Policies, libraries, plugins, forge connections, the Fork Run approval setting |
+| `server.read` | health, version and sign-in settings |
+
+Writes keep the names the step-up events already use, such as `repo.dispatch`, `step.rerun`,
+`step.retry`, `run.cancel`, `gate.reject` and `gate.approve`. A token limited to a list cannot
+use a route that names no operation.
+
+No operation implies another. A list needs `account.read` for `GET /v1/me` (the CLI calls it to
+say who you are) and to poll a confirmation request, and `server.read` for `GET /v1/about`.
+
+## Approving a gate with a token
+
+A token never approves a gate by itself. Its approval of any `manual` gate, a plain one
+included, is refused with `403 step_up_required` and a link to a confirmation request; the
+approval is recorded once you confirm it with your passkey. A token can reject a gate without a
+confirmation. This does not hold on a server run with `SCARAB_DEV_INSECURE`, where step-up is
+off and a token's approval is recorded at once.
+
+Every dispatch, rerun, retry, cancel, approval and rejection a token makes is recorded with the
+token's id and kind beside your name. Anyone who can read the Run can see that id in its events.
+The id names the token; it is never the secret, and it cannot be used to authenticate.
 
 ## The org's list
 

@@ -536,6 +536,8 @@ pub struct GateResolution {
     /// Who decided (a rejecting principal, `external:{step}`); `None` for a
     /// release, a timer or an expiry.
     pub by: Option<String>,
+    /// How the decision arrived when a token made it ([`DelegationTrail`]).
+    pub via: Option<DelegationTrail>,
     /// The wait this verdict is for. `Some(a)` (the scheduler): resolve only
     /// while `a` is still the open wait — a superseded or cancelled wait takes
     /// no verdict. `None` (an API release or reject): close whichever wait is
@@ -650,6 +652,7 @@ pub fn gate_resolution_events(
         reason: Some(res.reason.clone()),
         deployment: None,
         by: res.by.clone(),
+        via: res.via.clone(),
     });
     out
 }
@@ -1427,6 +1430,25 @@ pub struct RunPipelineSource {
     pub sha: Option<String>,
 }
 
+/// How a write reached Scarab when a PrincipalToken made it rather than its
+/// Principal's own session (ADR-0086 §6). Recorded beside `by` on the events
+/// that name who acted, so the Run page can say "Rerun by alice through API
+/// token ci-bot". Absent for a browser or CLI session.
+///
+/// Read-compatible both ways: an event without it reads as `None`, and a
+/// binary that predates a field of it ignores that field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationTrail {
+    /// The PrincipalToken's row id. Never the secret.
+    pub token_id: String,
+    /// The PrincipalToken's kind: `issued` or `oauth`. Text, so a binary that
+    /// predates a kind still reads the event.
+    pub token_kind: String,
+    /// The OAuth client an `oauth` token was granted to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client: Option<String>,
+}
+
 /// The discriminated payload carried by an [`EventKind`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventPayload {
@@ -1462,6 +1484,10 @@ pub enum EventPayload {
     GateApproved {
         step: StepId,
         by: String,
+        /// How the write arrived when a token made it ([`DelegationTrail`]);
+        /// absent for a session and on events recorded before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<DelegationTrail>,
     },
     GateReleased {
         step: StepId,
@@ -1519,6 +1545,10 @@ pub enum EventPayload {
     /// [`RunRerunRequested`](EventPayload::RunRerunRequested).
     RunCancelRequested {
         by: Option<String>,
+        /// How the write arrived when a token made it ([`DelegationTrail`]);
+        /// absent for a session and on events recorded before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<DelegationTrail>,
     },
     /// An unapproved gate outlived its opt-in `gate_expires_after` deadline and
     /// failed the run (ADR-0047). Still emitted beside the
@@ -1560,6 +1590,10 @@ pub enum EventPayload {
         deployment: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<String>,
+        /// How the write arrived when a token made it ([`DelegationTrail`]);
+        /// absent for a session and on events recorded before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<DelegationTrail>,
     },
     /// A human requested a step rerun (ADR-0056) — the **Take boundary**.
     /// Emitted before any re-arming, so a Take view is a pure replay up to
@@ -1586,6 +1620,10 @@ pub enum EventPayload {
         /// zero-migration (ADR-0022 expand-contract).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         widened: Vec<StepId>,
+        /// How the write arrived when a token made it ([`DelegationTrail`]);
+        /// absent for a session and on events recorded before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<DelegationTrail>,
     },
     /// A human retried a **Failed** step (ADR-0056 amendment 2026-07-22) — an
     /// attribution/audit fact, **NOT a Take boundary**. A Retry re-executes the
@@ -1602,6 +1640,10 @@ pub enum EventPayload {
         /// (ADR-0061 s5). Empty on an ordinary retry.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         widened: Vec<StepId>,
+        /// How the write arrived when a token made it ([`DelegationTrail`]);
+        /// absent for a session and on events recorded before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<DelegationTrail>,
     },
     /// A control plane that did not launch this attempt resumed supervising
     /// it (ADR-0047 re-adoption, surfaced by ADR-0056). Same attempt, same
@@ -1621,6 +1663,10 @@ pub enum EventPayload {
         step: StepId,
         attempt: AttemptId,
         by: Option<String>,
+        /// How the write arrived when a token made it ([`DelegationTrail`]);
+        /// absent for a session and on events recorded before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<DelegationTrail>,
     },
     /// The run's opt-in active-time `budget:` was exhausted (ADR-0047);
     /// in-flight steps were cancelled and the run fails.
@@ -1642,12 +1688,20 @@ pub enum EventPayload {
     /// `by` is the acting principal (`None` only when auth is off).
     RunSnapshotsPinned {
         by: Option<String>,
+        /// How the write arrived when a token made it ([`DelegationTrail`]);
+        /// absent for a session and on events recorded before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<DelegationTrail>,
     },
     /// A human released the pin, returning this Run's Workspace Snapshots to the
     /// ordinary TTL. Recorded for the same reason as the pin: an exception that
     /// costs storage should be attributable in both directions.
     RunSnapshotsUnpinned {
         by: Option<String>,
+        /// How the write arrived when a token made it ([`DelegationTrail`]);
+        /// absent for a session and on events recorded before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<DelegationTrail>,
     },
     /// The fan-in merge of this step's input workspaces overwrote paths
     /// (ticket 2e1a458): two (or more) consumed inputs carried the same path
@@ -2468,6 +2522,7 @@ mod tests {
                 invalidated,
                 by,
                 widened,
+                ..
             } => {
                 assert_eq!(target, StepId("b".into()));
                 assert_eq!(invalidated, vec![StepId("b".into())]);

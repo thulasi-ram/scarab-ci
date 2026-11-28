@@ -19,6 +19,7 @@ import {
   confirmSentence,
   confirmWarning,
   gateNote,
+  planForKind,
   planGroups,
   useExpandedList,
   type ConfirmKind,
@@ -63,6 +64,10 @@ export default function RerunConfirm(props: {
     });
   });
 
+  // The plan as this button runs it: a retry leaves out what only a rerun
+  // re-arms.
+  const shown = () => (props.plan ? planForKind(props.plan, props.kind) : null);
+
   // Keep the popover on-screen: clamp against the right edge.
   const left = () => Math.max(8, Math.min(props.anchor.left, window.innerWidth - 380));
 
@@ -77,7 +82,7 @@ export default function RerunConfirm(props: {
       >
         <p class="rc-headline">{confirmHeadline(props.kind, props.target)}</p>
         <Show
-          when={props.plan}
+          when={shown()}
           fallback={
             <p class="rc-unavailable">
               {props.loading ? "Resolving the scope…" : "Scope preview unavailable."}
@@ -134,7 +139,7 @@ export default function RerunConfirm(props: {
             disabled={props.busy}
             onClick={() => props.onConfirm()}
           >
-            {props.busy ? "…" : confirmLabel(props.plan, props.kind)}
+            {props.busy ? "…" : confirmLabel(shown(), props.kind)}
           </button>
         </div>
       </div>

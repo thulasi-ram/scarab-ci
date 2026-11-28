@@ -6341,6 +6341,125 @@
         ]
       }
     },
+    "/v1/orgs/{org}/security/fork-run-approval": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "An org's Fork Run approval setting",
+        "operationId": "get_fork_run_approval",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForkRunApprovalDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a reserved org (plain text)"
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "403": {
+            "description": "not a member of the org"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Change an org's Fork Run approval setting (admin; always-ask step-up to loosen it)",
+        "operationId": "put_fork_run_approval",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForkRunApprovalUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForkRunApprovalDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a body that is not `{\"setting\": \"off\" | \"agent_started\" | \"all\"}`, or a reserved org (plain text)"
+          },
+          "403": {
+            "description": "`browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an admin of the org; or `step_up_required` (mode `action`) for a change that gates fewer Runs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "the setting cannot be stored on this server"
+          },
+          "409": {
+            "description": "another admin changed the setting since this request read it (plain text): reload and choose again"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/security/leak-checks": {
       "get": {
         "tags": [
@@ -7897,7 +8016,7 @@
           "Runs"
         ],
         "summary": "Approve a `manual` gate. The authenticated principal's\napproval is recorded on the event log (append-only, idempotent).",
-        "description": "An **Environment approval gate** (a Step after it uses the\nRun's Environment's authority) releases only once the accumulated\napprovals satisfy the Environment's effective rules for the run's Project\n(`admits`) and its wait timer has run out on the gate's wait\nclock. Approvals that complete the rules early are kept: the gate is\nreleased by the scheduler when the timer runs out. On release the\ndeployment is written to the legacy history. Every other `manual` gate is\na plain gate: it releases on the first approval, with no step-up. If the\nEnvironment no longer exists or no longer admits the Project, no gate of\nthe Run releases (409). Authz'd as a write.",
+        "description": "An **Environment approval gate** (a Step after it uses the\nRun's Environment's authority) releases only once the accumulated\napprovals satisfy the Environment's effective rules for the run's Project\n(`admits`) and its wait timer has run out on the gate's wait\nclock. Approvals that complete the rules early are kept: the gate is\nreleased by the scheduler when the timer runs out. On release the\ndeployment is written to the legacy history. Every other `manual` gate is\na plain gate: it releases on the first approval, with no step-up. An API\ntoken never approves a gate by itself: its approval of any gate, a plain\none included, raises a StepUpConfirmationRequest its owner confirms. If the\nEnvironment no longer exists or no longer admits the Project, no gate of\nthe Run releases (409). Authz'd as a write.",
         "operationId": "approve_gate",
         "parameters": [
           {
@@ -9891,7 +10010,8 @@
           "created_by",
           "created_at",
           "expires_at",
-          "use_count"
+          "use_count",
+          "kind"
         ],
         "properties": {
           "created_at": {
@@ -9911,6 +10031,10 @@
           "id": {
             "type": "string"
           },
+          "kind": {
+            "type": "string",
+            "description": "`issued`: a token a person minted (an API token)."
+          },
           "last_used_at": {
             "type": [
               "integer",
@@ -9921,6 +10045,16 @@
           },
           "name": {
             "type": "string"
+          },
+          "operations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The ApiOperations it may use. `None`: every operation its role and\nscope allow."
           },
           "org": {
             "type": "string"
@@ -11689,6 +11823,47 @@
           }
         }
       },
+      "ForkRunApprovalDto": {
+        "type": "object",
+        "description": "An org's Fork Run approval setting: `GET` and `PUT`\n`/v1/orgs/{org}/security/fork-run-approval`.",
+        "required": [
+          "setting",
+          "can_change"
+        ],
+        "properties": {
+          "can_change": {
+            "type": "boolean",
+            "description": "The caller may change the setting: an admin of the org, in a\nsigned-in browser."
+          },
+          "setting": {
+            "$ref": "#/components/schemas/ForkRunApprovalSettingDto",
+            "description": "Which Runs of fork code wait at a `manual` gate before any of their\nSteps starts, until someone with write on the repository releases it."
+          }
+        }
+      },
+      "ForkRunApprovalSettingDto": {
+        "type": "string",
+        "description": "Which Runs of fork code wait at the Fork Run approval gate.",
+        "enum": [
+          "off",
+          "agent_started",
+          "all"
+        ]
+      },
+      "ForkRunApprovalUpdate": {
+        "type": "object",
+        "description": "`PUT /v1/orgs/{org}/security/fork-run-approval` body.",
+        "required": [
+          "setting"
+        ],
+        "properties": {
+          "setting": {
+            "$ref": "#/components/schemas/ForkRunApprovalSettingDto",
+            "description": "The new setting. One that gates fewer Runs than the current one asks\nfor a passkey confirmation."
+          }
+        },
+        "additionalProperties": false
+      },
       "GateApprovalDto": {
         "type": "object",
         "description": "The answer to a gate approval.",
@@ -12679,6 +12854,16 @@
             "type": "string",
             "description": "Human label — what makes the token revocable in practice."
           },
+          "operations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The ApiOperations the token may use; absent for every operation its\nrole and scope allow. See [`MintTokenRequest::operations`]."
+          },
           "org": {
             "type": "string",
             "description": "The org the token is scoped to (or the org of its project)."
@@ -12714,6 +12899,16 @@
           "name": {
             "type": "string",
             "description": "Human label — what makes the token revocable in practice. \"demo\nkeepalive\", \"amy's laptop\"."
+          },
+          "operations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The ApiOperations the token may use (`run.read`, `step.logs.read`,\n`repo.dispatch`, …). Absent: every operation its role and scope\nallow. Present: every other request is refused. At least one, each\nan operation an API token can perform."
           },
           "project": {
             "type": [
@@ -13461,7 +13656,8 @@
           "target",
           "cascade",
           "regenerate",
-          "regenerate_cascade"
+          "regenerate_cascade",
+          "fork_run_approval"
         ]
       },
       "PlannedStepDto": {
@@ -16154,7 +16350,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`, `binding.operator_grant`,\n`secret.match_checked`, `secret.match_limits_changed`."
+            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`, `binding.operator_grant`,\n`secret.match_checked`, `secret.match_limits_changed`,\n`fork_run_approval.changed`."
           },
           "op": {
             "type": [

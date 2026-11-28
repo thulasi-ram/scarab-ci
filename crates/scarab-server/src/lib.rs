@@ -125,6 +125,8 @@ pub mod schedules;
 #[doc(hidden)]
 pub mod test_support;
 pub use routes::{route_table, RouteEntry};
+/// An org's Fork Run approval setting (ADR-0086 §9).
+pub mod fork_run_approval;
 pub mod secret_executor;
 pub mod secret_match;
 pub mod step_path;
@@ -369,6 +371,11 @@ pub struct AppState {
     /// `None` (a hand-built state): every org has the defaults and the
     /// limits cannot be changed (PUT 404).
     pub leak_check_limits: Option<Arc<dyn scarab_identity::LeakCheckLimitsStore>>,
+    /// Each org's Fork Run approval setting (ADR-0086 §9,
+    /// `/v1/orgs/{org}/security/fork-run-approval`), which Run creation
+    /// reads. `None` (a hand-built state): every org has the default,
+    /// `agent_started`, and the setting cannot be changed (PUT 404).
+    pub fork_run_approval: Option<Arc<dyn scarab_identity::ForkRunApprovalStore>>,
     /// The label, annotation and toleration keys a step author's
     /// `k8s_overlay` may set, from the operator's placement config
     /// (`author_overlay`). Run admission checks an overlay against them, as
@@ -479,6 +486,7 @@ impl AppState {
             step_up: step_up::StepUpPolicy::Off,
             security_events: None,
             leak_check_limits: None,
+            fork_run_approval: None,
             author_overlay: scarab_executor_k8s::AuthorOverlayConfig::default(),
             placement: None,
             delivery_slots: DeliverySlots::new(WEBHOOK_DELIVERY_SLOTS, WEBHOOK_DELIVERY_SLOT_WAIT),
@@ -539,6 +547,16 @@ impl AppState {
         store: Arc<dyn scarab_identity::LeakCheckLimitsStore>,
     ) -> Self {
         self.leak_check_limits = Some(store);
+        self
+    }
+
+    /// Keep each org's Fork Run approval setting in `store`
+    /// ([`AppState::fork_run_approval`]).
+    pub fn with_fork_run_approval(
+        mut self,
+        store: Arc<dyn scarab_identity::ForkRunApprovalStore>,
+    ) -> Self {
+        self.fork_run_approval = Some(store);
         self
     }
 
@@ -637,6 +655,7 @@ impl AppState {
             connections: self.connections.as_deref(),
             author_overlay: Some(&self.author_overlay),
             placement: self.placement.as_deref(),
+            fork_run_approval: self.fork_run_approval.as_deref(),
         }
     }
 
@@ -2180,7 +2199,9 @@ async fn create_run(
     headers: HeaderMap,
     Json(req): Json<CreateRunRequest>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), ApiError> {
-    authorize(&st, &headers, Action::Write).await?;
+    // The caller, for the DelegationTrail its Run's start records (ADR-0086
+    // §6). Global roles only: an inline Run names no org or Project.
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, None).await?;
     // No `run.create` Policy is consulted (ADR-0075): an inline Run names no org or Project.
     refuse_nul_reason(req.reason.as_deref())?;
 
@@ -2338,6 +2359,10 @@ async fn create_run(
         {
             st.db.set_run_trigger_title(&run, &title).await?;
         }
+        // How the start arrived when a token made it (ADR-0086 §6).
+        if let Some(via) = caller.delegation_trail() {
+            st.db.set_run_origin_via(&run, &via).await?;
+        }
         st.db
             .append_event(&EventKind {
                 version: EVENT_VERSION,
@@ -2435,7 +2460,8 @@ async fn dispatch(
         org: org.clone(),
         name: repo.clone(),
     };
-    let principal = authorize_scoped(&st, &headers, Action::Write, Some(&scope)).await?;
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, Some(&scope)).await?;
+    let principal = caller.principal.clone();
     refuse_nul_reason(req.reason.as_deref())?;
     refuse_unreachable_repo(&st, &org, &repo).await?;
 
@@ -2445,7 +2471,7 @@ async fn dispatch(
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
 
-    let run = dispatch_run(
+    let run = dispatch_run_via(
         forge.as_ref(),
         st.db.as_ref(),
         st.clock.as_ref(),
@@ -2462,6 +2488,8 @@ async fn dispatch(
         req.params,
         req.kind,
         req.reason,
+        // How the dispatch arrived (ADR-0086 §6): the token, when one made it.
+        caller.delegation_trail(),
     )
     .await
     .map_err(ApiError::from)?;
@@ -3765,9 +3793,11 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
             Err(ApiError::Conflict(e.to_string()))
         }
         Err(e @ RerunError::NotFailed { .. }) => Err(ApiError::Conflict(e.to_string())),
-        Err(e @ (RerunError::CreationUnfinished | RerunError::Replaced(_))) => {
-            Err(ApiError::Conflict(e.to_string()))
-        }
+        Err(
+            e @ (RerunError::CreationUnfinished
+            | RerunError::Replaced(_)
+            | RerunError::WhenExcluded(_)),
+        ) => Err(ApiError::Conflict(e.to_string())),
         // Gate-approval-only variants (never produced by rerun/retry); mapped to
         // 409 for exhaustiveness.
         Err(
@@ -3807,8 +3837,9 @@ async fn rerun_step(
     let scope = run_scope(&st, &run).await;
     // Bind the principal (ADR-0056): a rerun is a Take boundary and the
     // event it emits carries WHO pressed it — the same attribution pattern as
-    // gate approval.
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    // gate approval — and how the request arrived (ADR-0086 §6).
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let via = caller.delegation_trail();
     let oracle = snapshot_oracle(&st);
     // The EXECUTED plan comes back as the body (git-bug 4afaa3e): the preview →
     // confirm window is a real TOCTOU (a snapshot can expire between the two),
@@ -3821,7 +3852,8 @@ async fn rerun_step(
             oracle.as_deref(),
             &run,
             &StepId(step),
-            Some(principal.subject),
+            Some(caller.principal.subject),
+            via,
         )
         .await,
     )?;
@@ -3869,7 +3901,8 @@ async fn retry_step(
 ) -> Result<(StatusCode, Json<RerunPlanResponse>), ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let via = caller.delegation_trail();
     let oracle = snapshot_oracle(&st);
     let plan = rerun_outcome(
         scarab_engine::retry_step_widened(
@@ -3878,7 +3911,8 @@ async fn retry_step(
             oracle.as_deref(),
             &run,
             &StepId(step),
-            Some(principal.subject),
+            Some(caller.principal.subject),
+            via,
         )
         .await,
     )?;
@@ -3930,6 +3964,10 @@ pub enum PlanReasonDto {
     Regenerate,
     /// A descendant of a regenerate root the target's cascade did not contain.
     RegenerateCascade,
+    /// A Rerun in a Run of fork code (ADR-0086 §9): the released Fork Run
+    /// approval gate, which waits for a release again, or a Step between it
+    /// and the target. A Retry leaves these out.
+    ForkRunApproval,
 }
 
 /// One member of a rerun plan, with its WHY (git-bug 4afaa3e).
@@ -3978,6 +4016,7 @@ fn plan_response(plan: scarab_engine::RerunPlan) -> RerunPlanResponse {
                     scarab_engine::PlanReason::RegenerateCascade => {
                         PlanReasonDto::RegenerateCascade
                     }
+                    scarab_engine::PlanReason::ForkRunApproval => PlanReasonDto::ForkRunApproval,
                 },
                 because_of: s.because_of.map(|b| b.0),
                 is_gate: s.is_gate,
@@ -4055,9 +4094,16 @@ async fn pin_run_snapshots(
 ) -> Result<Json<SnapshotRetentionDto>, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    if !scarab_engine::pin_run_snapshots(&*st.db, &*st.clock, &run, Some(principal.subject.clone()))
-        .await?
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let via = caller.delegation_trail();
+    if !scarab_engine::pin_run_snapshots(
+        &*st.db,
+        &*st.clock,
+        &run,
+        Some(caller.principal.subject),
+        via,
+    )
+    .await?
     {
         return Err(ApiError::NotFound);
     }
@@ -4082,12 +4128,14 @@ async fn unpin_run_snapshots(
 ) -> Result<Json<SnapshotRetentionDto>, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let via = caller.delegation_trail();
     if !scarab_engine::unpin_run_snapshots(
         &*st.db,
         &*st.clock,
         &run,
-        Some(principal.subject.clone()),
+        Some(caller.principal.subject),
+        via,
     )
     .await?
     {
@@ -4132,12 +4180,19 @@ async fn cancel_run(
 ) -> Result<StatusCode, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let via = caller.delegation_trail();
     let Some(status) = st.db.run_status(&run).await? else {
         return Err(ApiError::NotFound);
     };
-    match scarab_engine::cancel_run_request(&*st.db, &*st.clock, &run, Some(principal.subject))
-        .await
+    match scarab_engine::cancel_run_request(
+        &*st.db,
+        &*st.clock,
+        &run,
+        Some(caller.principal.subject),
+        via,
+    )
+    .await
     {
         Ok(true) => Ok(StatusCode::ACCEPTED),
         Ok(false) => {
@@ -5382,6 +5437,9 @@ pub struct AdmissionPorts<'a> {
     /// each Step's `placement_profiles` against its registry. `None`: not
     /// checked (another executor).
     pub placement: Option<&'a scarab_executor_k8s::PlacementConfig>,
+    /// Each org's Fork Run approval setting (ADR-0086 §9). `None`: every
+    /// org has the default, `agent_started`.
+    pub fork_run_approval: Option<&'a dyn scarab_identity::ForkRunApprovalStore>,
 }
 
 /// The stores that resolve a webhook actor to a Principal (ADR-0069): the
@@ -5488,6 +5546,7 @@ impl<'a> AdmissionPorts<'a> {
             connections: None,
             author_overlay: None,
             placement: None,
+            fork_run_approval: None,
         }
     }
 
@@ -7638,6 +7697,10 @@ async fn admit_unrecorded(
             return Ok(Admission::Refused(refusal));
         }
     };
+    // ADR-0086 §9: then the Fork Run approval gate, in front of every root
+    // Step, so it is in front of a gate the Environment added as a root too.
+    // The Policies and the stored Run see it.
+    let ir = fork_run_approval_ir(db, ports.fork_run_approval, event, &repo.owner, ir).await?;
     let ir = &ir;
 
     // The library and credential PolicyInvariants, before any Policy is
@@ -7874,6 +7937,80 @@ fn environment_approval_ir(
             Ok((decided.ir, result))
         }
     }
+}
+
+/// Was the Run `trail` describes started by an app acting for someone, such
+/// as an agent (ADR-0086 §9, Fork Run approval's `agent_started`)? `trail`
+/// is the DelegationTrail Run creation records as the Run's origin
+/// (`runs.origin_via`); `None` when no PrincipalToken started the Run (a
+/// session, a forge event).
+///
+/// Requirement for delegated callers: a Run an agent starts through a
+/// Plugin's delegated call (a DelegatedCallerHandle, PluginApi) must count
+/// here. Its trail names the Plugin installation; once `DelegationTrail`
+/// carries that field (`plugin_installation`, on the PluginApi branch), add
+/// `|| t.plugin_installation.is_some()` to the check below.
+///
+/// Fails closed: an `oauth` token counts, and so does a token kind this
+/// binary does not know. Only an `issued` token does not.
+fn started_by_an_agent(trail: Option<&scarab_forge::DelegationTrail>) -> bool {
+    trail.is_some_and(|t| {
+        scarab_identity::PrincipalTokenKind::parse(&t.token_kind)
+            != Some(scarab_identity::PrincipalTokenKind::Issued)
+    })
+}
+
+/// `ir` with the Fork Run approval gate (ADR-0086 §9) when `event` builds
+/// fork code ([`trigger_is_fork_code`] on the trigger the Run records, the
+/// check follow-ups and launches use) and `org`'s setting gates it: `all`
+/// gates every Run of fork code, `agent_started` (the default, for an org
+/// with no stored setting) one an app started ([`started_by_an_agent`]),
+/// and `off` none. Nothing mints an `oauth` token yet, so until one can,
+/// `agent_started` gates no Run. The gate is one `manual` gate in front of
+/// every root Step, so nothing in the Run starts, its shared services
+/// included, until someone with write on the repository releases it
+/// ([`add_fork_run_approval_gate`](scarab_policy::fork_run_approval_gate::add_fork_run_approval_gate)).
+/// It is a setting, not a Policy: no Policy adds a gate (ADR-0075). The gate
+/// unlocks nothing: a released Run is still fork code, so Environment
+/// secrets, registry credentials and the OIDC subject stay locked out. A
+/// store that cannot answer refuses the Run: the gate is never skipped by
+/// default. `store` `None` (a hand-built state): the default applies.
+async fn fork_run_approval_ir(
+    db: &dyn Db,
+    store: Option<&dyn scarab_identity::ForkRunApprovalStore>,
+    event: &scarab_forge::Event,
+    org: &str,
+    mut ir: scarab_pipeline::PipelineIr,
+) -> Result<scarab_pipeline::PipelineIr, TriggerError> {
+    if !trigger_is_fork_code(db, &event.context()["event"]).await? {
+        return Ok(ir);
+    }
+    let setting = match store {
+        Some(store) => store
+            .fork_run_approval(org)
+            .await
+            .map_err(|e| {
+                TriggerError::Db(DbError::Other(format!(
+                    "fork run approval store: {e}; the Run was not created because the org's \
+                     Fork Run approval setting could not be read"
+                )))
+            })?
+            .unwrap_or_default(),
+        None => scarab_identity::ForkRunApproval::default(),
+    };
+    if setting.gates(started_by_an_agent(event.delegation_trail())) {
+        let gate = scarab_policy::fork_run_approval_gate::add_fork_run_approval_gate(
+            &mut ir,
+            scarab_identity::FORK_RUN_APPROVAL_SETTING_NAME,
+        );
+        tracing::info!(
+            org,
+            gate = %gate,
+            setting = setting.as_str(),
+            "Fork Run approval added its gate to a Run of fork code"
+        );
+    }
+    Ok(ir)
 }
 
 /// The admission checks a Run passes before its `run.create` Policies are
@@ -8211,6 +8348,7 @@ impl DispatchKind {
     /// is the **symbolic** dispatch ref (canonicalized, used for `allowed_refs`
     /// matching, ADR-0037), `sha` the **resolved commit** the config is read at and
     /// the Run pins to.
+    #[allow(clippy::too_many_arguments)] // the event's fields, one each
     fn into_event(
         self,
         actor: String,
@@ -8219,6 +8357,7 @@ impl DispatchKind {
         sha: String,
         reason: Option<String>,
         fork: bool,
+        via: Option<scarab_forge::DelegationTrail>,
     ) -> scarab_forge::Event {
         match self {
             DispatchKind::Manual => scarab_forge::Event::Manual {
@@ -8228,6 +8367,7 @@ impl DispatchKind {
                 sha,
                 fork,
                 reason,
+                via,
             },
             DispatchKind::Api => scarab_forge::Event::Api {
                 actor,
@@ -8236,8 +8376,28 @@ impl DispatchKind {
                 sha,
                 fork,
                 reason,
+                via,
             },
         }
+    }
+}
+
+/// The engine's DelegationTrail as the forge event carries it (the two crates
+/// each hold a copy; ADR-0086 §6).
+fn forge_delegation_trail(via: &scarab_engine::DelegationTrail) -> scarab_forge::DelegationTrail {
+    scarab_forge::DelegationTrail {
+        token_id: via.token_id.clone(),
+        token_kind: via.token_kind.clone(),
+        oauth_client: via.oauth_client.clone(),
+    }
+}
+
+/// The forge event's DelegationTrail as the engine records it.
+fn engine_delegation_trail(via: &scarab_forge::DelegationTrail) -> scarab_engine::DelegationTrail {
+    scarab_engine::DelegationTrail {
+        token_id: via.token_id.clone(),
+        token_kind: via.token_kind.clone(),
+        oauth_client: via.oauth_client.clone(),
     }
 }
 
@@ -8680,6 +8840,29 @@ pub async fn dispatch_run(
     kind: DispatchKind,
     reason: Option<String>,
 ) -> Result<RunId, DispatchError> {
+    dispatch_run_via(
+        forge, db, clock, ports, actor, repo, r#ref, pipeline, params, kind, reason, None,
+    )
+    .await
+}
+
+/// [`dispatch_run`], recording `via`, how the dispatch arrived when a
+/// PrincipalToken made it (ADR-0086 §6), on the dispatch event and the Run.
+#[allow(clippy::too_many_arguments)] // the dispatch coordinates are irreducible
+pub async fn dispatch_run_via(
+    forge: &dyn scarab_forge::ForgePort,
+    db: &dyn Db,
+    clock: &dyn Clock,
+    ports: AdmissionPorts<'_>,
+    actor: String,
+    repo: scarab_forge::RepoRef,
+    r#ref: String,
+    pipeline: String,
+    params: std::collections::BTreeMap<String, serde_json::Value>,
+    kind: DispatchKind,
+    reason: Option<String>,
+    via: Option<scarab_engine::DelegationTrail>,
+) -> Result<RunId, DispatchError> {
     // Resolve the dispatch ref to the symbolic ref the Run records and a
     // concrete commit, both from the same ref — the form and the run see
     // byte-identical config (no branch-moved skew), and the Run is
@@ -8730,7 +8913,15 @@ pub async fn dispatch_run(
     // Headline. The endpoint stays dumb — accept + stamp, no requiredness check
     // (that is an Environment ProtectionRule at admission, thread D). Excluded
     // from `context()`, so it never reaches trigger-matching / interpolation.
-    let event = kind.into_event(actor, repo, sym, sha, reason, fork);
+    let event = kind.into_event(
+        actor,
+        repo,
+        sym,
+        sha,
+        reason,
+        fork,
+        via.as_ref().map(forge_delegation_trail),
+    );
     let ir = record_compile_failure(db, clock, &event, &path, compiled).await?;
     // The `when:` context: a dispatch has no changed paths, so
     // `event.changed_paths_known` reads `false` here as on a push whose list
@@ -9269,6 +9460,12 @@ async fn write_run_from_ir(
         origin_pr_head(event).as_deref(),
     )
     .await?;
+    // How the start arrived when a token made it (ADR-0086 §6): the
+    // dispatch's DelegationTrail, beside the Actor.
+    if let Some(via) = event.delegation_trail() {
+        db.set_run_origin_via(run, &engine_delegation_trail(via))
+            .await?;
+    }
     // The pipeline name (the runs-list/detail "which pipeline is this") — the
     // explicit `name:` from the IR when set, else the bare `.scarab/<name>`
     // selection. Stamped beside origin.
@@ -12353,6 +12550,12 @@ pub struct MintTokenRequest {
     pub role: String,
     /// Lifetime in days, `1..=365`. No default and no "never".
     pub expires_in_days: u32,
+    /// The ApiOperations the token may use (`run.read`, `step.logs.read`,
+    /// `repo.dispatch`, …). Absent: every operation its role and scope
+    /// allow. Present: every other request is refused. At least one, each
+    /// an operation an API token can perform.
+    #[serde(default)]
+    pub operations: Option<Vec<String>>,
 }
 
 /// `POST /v1/me/tokens` body: [`MintTokenRequest`] plus the org, which the
@@ -12371,6 +12574,10 @@ pub struct MintOwnTokenRequest {
     pub role: String,
     /// Lifetime in days, `1..=365`.
     pub expires_in_days: u32,
+    /// The ApiOperations the token may use; absent for every operation its
+    /// role and scope allow. See [`MintTokenRequest::operations`].
+    #[serde(default)]
+    pub operations: Option<Vec<String>>,
 }
 
 /// The mint response — the **only** place the plaintext ever appears.
@@ -12415,6 +12622,11 @@ pub struct ApiTokenDto {
     pub use_count: u64,
     /// Unix-ms revocation, or `None` while it is live.
     pub revoked_at: Option<i64>,
+    /// `issued`: a token a person minted (an API token).
+    pub kind: String,
+    /// The ApiOperations it may use. `None`: every operation its role and
+    /// scope allow.
+    pub operations: Option<Vec<String>>,
 }
 
 impl From<scarab_identity::ApiToken> for ApiTokenDto {
@@ -12441,6 +12653,8 @@ impl From<scarab_identity::ApiToken> for ApiTokenDto {
             last_used_at: t.last_used_at,
             use_count: t.use_count,
             revoked_at: t.revoked_at,
+            kind: t.kind.as_str().to_string(),
+            operations: t.operations,
         }
     }
 }
@@ -12517,6 +12731,7 @@ async fn mint_own_api_token(
         project,
         role,
         expires_in_days,
+        operations,
     } = req;
     if org.trim().is_empty() {
         return Err(ApiError::BadRequest("token `org` must not be empty".into()));
@@ -12530,6 +12745,7 @@ async fn mint_own_api_token(
             project,
             role,
             expires_in_days,
+            operations,
         },
     )
     .await
@@ -12576,6 +12792,7 @@ async fn mint_personal_token(
         )));
     }
     let role = parse_role(&req.role)?;
+    let operations = token_operation_list(req.operations)?;
 
     // Least privilege, enforced at mint: the grant may not exceed what the
     // minter holds in this scope. The easy implementation — clone the minter's
@@ -12636,10 +12853,14 @@ async fn mint_personal_token(
         last_used_at: None,
         use_count: 0,
         revoked_at: None,
+        kind: scarab_identity::PrincipalTokenKind::Issued,
+        operations,
+        audience: None,
+        oauth_client: None,
     };
     note_org(st, token.scope.org()).await?;
     store
-        .put(&token, &scarab_identity::api_token_hash(&plaintext))
+        .put(&token, &token.stored_hash(&plaintext))
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -12657,6 +12878,41 @@ async fn mint_personal_token(
         ),
     )
         .into_response())
+}
+
+/// The operation list a mint asked for, checked (ADR-0086 §6): `None` stays
+/// `None` (no list). A list must name at least one operation, each an
+/// ApiOperation of the route table that an API token can perform; it is
+/// stored sorted, each id once.
+fn token_operation_list(requested: Option<Vec<String>>) -> Result<Option<Vec<String>>, ApiError> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    if requested.is_empty() {
+        return Err(ApiError::BadRequest(
+            "`operations` must name at least one operation; leave it out for a token that may \
+             use every operation its role allows"
+                .into(),
+        ));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(requested.len());
+    for id in requested {
+        let Some(op) = step_up::ops::by_id(&id) else {
+            return Err(ApiError::BadRequest(format!(
+                "`operations` names `{id}`, which is not an operation"
+            )));
+        };
+        if op.machine != step_up::ops::StepUpMachineUse::Requestable {
+            return Err(ApiError::BadRequest(format!(
+                "`operations` names `{id}`, which an API token can never perform"
+            )));
+        }
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out.sort();
+    Ok(Some(out))
 }
 
 /// 32 bytes of CSPRNG, base64url without padding — a high-entropy bearer
@@ -13047,6 +13303,48 @@ impl Caller {
         }
     }
 
+    /// How this caller's writes arrived (ADR-0086 §6): the PrincipalToken
+    /// that authenticated it, or `None` for a session.
+    fn delegation_trail(&self) -> Option<scarab_engine::DelegationTrail> {
+        self.grant
+            .as_ref()
+            .map(|token| scarab_engine::DelegationTrail {
+                token_id: token.id.clone(),
+                token_kind: token.kind.as_str().to_string(),
+                oauth_client: token.oauth_client.clone(),
+            })
+    }
+
+    /// Refuse a token that carries an ApiOperation list (ADR-0086 §5, §6)
+    /// on a request whose route's operation is not in it, or whose route
+    /// names no operation at all: fail-closed, so a route the guard did not
+    /// see can never widen a limited token. Any other caller passes.
+    fn admit_route_operation(&self) -> Result<(), ApiError> {
+        let Some(token) = &self.grant else {
+            return Ok(());
+        };
+        let operation = step_up::guard::route_operation();
+        if token.admits_operation(operation.map(|op| op.id)) {
+            return Ok(());
+        }
+        let message = match operation {
+            Some(op) => format!(
+                "this API token may not use the operation `{}` ({}); it may use: {}",
+                op.id,
+                op.label,
+                token.operations.as_deref().unwrap_or_default().join(", ")
+            ),
+            None => "this API token is limited to a list of operations, and this request \
+                     matched no route that names one"
+                .to_string(),
+        };
+        Err(ApiError::Ceremony {
+            status: StatusCode::FORBIDDEN,
+            code: "operation_not_granted",
+            message,
+        })
+    }
+
     /// May this caller perform `action` in `scope`?
     async fn may(
         &self,
@@ -13122,7 +13420,8 @@ async fn token_owner_roles(st: &AppState, subject: &str) -> Vec<scarab_identity:
 
 /// Authenticate the request: resolve the credential (Bearer or cookie), enforce
 /// expiry + the CSRF double-submit on cookie mutations, and return the
-/// [`Caller`] — **no role decision** (that's [`authorize`]/[`authorize_scoped`]).
+/// [`Caller`] — **no role decision** (that's [`authorize_scoped`]; `None` scope
+/// for an untenanted resource).
 /// With no session store configured, authn is **disabled** (dev/test) and every
 /// caller is a synthetic Owner (the loud SCARAB_DEV_INSECURE posture).
 async fn authenticate(
@@ -13137,7 +13436,9 @@ async fn authenticate(
     // CSRF has nothing to defend (no browser sent this request). The
     // task-local is set only by the confirm endpoint around its replay.
     if let Some(authority) = step_up::requests::replay_authority() {
-        return step_up::requests::replay_caller(st, &authority).await;
+        let caller = step_up::requests::replay_caller(st, &authority).await?;
+        caller.admit_route_operation()?;
+        return Ok(caller);
     }
     let Some(sessions) = st.sessions.as_ref() else {
         return Ok(Caller::dev_insecure_owner(Principal {
@@ -13152,7 +13453,9 @@ async fn authenticate(
     // amendment): a mistyped token must fail as a token, with no chance of
     // being taken for a session id.
     if sid.starts_with(scarab_identity::API_TOKEN_PREFIX) {
-        return authenticate_api_token(st, &sid, via).await;
+        let caller = authenticate_api_token(st, &sid, via).await?;
+        caller.admit_route_operation()?;
+        return Ok(caller);
     }
     let session = sessions
         .get(&sid)
@@ -13239,12 +13542,15 @@ async fn authenticate_api_token(
         return Err(ApiError::Unauthorized);
     };
     let token = store
-        .by_hash(&scarab_identity::api_token_hash(plaintext))
+        .by_hash(
+            &scarab_identity::api_token_hash(plaintext),
+            &scarab_identity::restricted_api_token_hash(plaintext),
+        )
         .await
         .map_err(|_| ApiError::Unauthorized)?
         .ok_or(ApiError::Unauthorized)?;
     let now = st.clock.now().await.0;
-    if !token.is_live(now) {
+    if !token.is_live(now) || !usable_on_core_routes(&token) {
         return Err(ApiError::Unauthorized);
     }
     // Observability, coarse and best-effort: a failure to record the use must
@@ -13283,14 +13589,13 @@ async fn authenticate_api_token(
     })
 }
 
-/// Authorize `action` with **global** (flat) roles only — for resources that
-/// belong to no tenant (inline dev runs, the catch-all default).
-async fn authorize(
-    st: &AppState,
-    headers: &HeaderMap,
-    action: Action,
-) -> Result<Principal, ApiError> {
-    authorize_scoped(st, headers, action, None).await
+/// May `token` authenticate a request to the core API (ADR-0086 §6)? Only
+/// an issued token with no audience. An `oauth` token is bound to the one
+/// URL it was granted for and is never accepted on the core routes; an
+/// issued token never carries an audience, so one that does is refused
+/// rather than trusted.
+pub(crate) fn usable_on_core_routes(token: &scarab_identity::PrincipalToken) -> bool {
+    token.kind == scarab_identity::PrincipalTokenKind::Issued && token.audience.is_none()
 }
 
 /// Authorize `action` in `scope` (ADR-0049 C2). The decision is scope-aware:
@@ -13304,13 +13609,28 @@ async fn authorize_scoped(
     action: Action,
     scope: Option<&scarab_identity::Scope>,
 ) -> Result<Principal, ApiError> {
+    Ok(authorize_scoped_caller(st, headers, action, scope)
+        .await?
+        .principal)
+}
+
+/// [`authorize_scoped`], answering the whole [`Caller`]: what a write that
+/// records how it arrived needs ([`Caller::delegation_trail`], ADR-0086 §6),
+/// and what a decision that depends on the credential needs (a token never
+/// approves a Gate by itself).
+async fn authorize_scoped_caller(
+    st: &AppState,
+    headers: &HeaderMap,
+    action: Action,
+    scope: Option<&scarab_identity::Scope>,
+) -> Result<Caller, ApiError> {
     let caller = authenticate(st, headers, action).await?;
     if caller.may_globally(action) {
-        return Ok(caller.principal);
+        return Ok(caller);
     }
     if let Some(scope) = scope {
         if caller.may(st, action, scope).await? {
-            return Ok(caller.principal);
+            return Ok(caller);
         }
     }
     Err(ApiError::Forbidden)
@@ -13432,7 +13752,9 @@ pub struct GateApprovalDto {
 /// clock. Approvals that complete the rules early are kept: the gate is
 /// released by the scheduler when the timer runs out. On release the
 /// deployment is written to the legacy history. Every other `manual` gate is
-/// a plain gate: it releases on the first approval, with no step-up. If the
+/// a plain gate: it releases on the first approval, with no step-up. An API
+/// token never approves a gate by itself: its approval of any gate, a plain
+/// one included, raises a StepUpConfirmationRequest its owner confirms. If the
 /// Environment no longer exists or no longer admits the Project, no gate of
 /// the Run releases (409). Authz'd as a write.
 #[utoipa::path(
@@ -13457,8 +13779,29 @@ async fn approve_gate(
 ) -> Result<Response, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let principal = caller.principal.clone();
     let step = StepId(step);
+    // ADR-0086 §6: a PrincipalToken never approves a `manual` Gate by
+    // itself. An issued token (an API token) raises a
+    // StepUpConfirmationRequest for every Gate, a plain one included, so its
+    // owner confirms each approval. An `oauth` token (an app acting for its
+    // owner) is refused with no request raised, so text an outsider wrote
+    // into a log cannot send the owner a stream of confirmations. A session
+    // decides as before.
+    let token_approval = match caller.grant.as_ref().map(|t| t.kind) {
+        None => false,
+        Some(scarab_identity::PrincipalTokenKind::Issued) => true,
+        Some(scarab_identity::PrincipalTokenKind::Oauth) => {
+            return Err(ApiError::Ceremony {
+                status: StatusCode::FORBIDDEN,
+                code: "token_never_approves",
+                message: "a token granted to an app never approves a gate; approve it in a \
+                          browser, or with an API token whose owner confirms the approval"
+                    .into(),
+            })
+        }
+    };
 
     // 0. The governing Environment's effective rules for this Project
     //    (ADR-0071 §3), resolved NOW — before the approval is recorded,
@@ -13484,8 +13827,7 @@ async fn approve_gate(
     )
     .await;
     match (&ctx, &governance) {
-        _ if !approval_gate => guard.exempt("not an Environment approval gate"),
-        (Some(c), Ok(Some(p))) if !p.approvers.is_empty() => {
+        (Some(c), Ok(Some(p))) if approval_gate && !p.approvers.is_empty() => {
             guard
                 .require(
                     &st,
@@ -13496,7 +13838,7 @@ async fn approve_gate(
                 )
                 .await?
         }
-        (Some(c), Err(_)) => {
+        (Some(c), Err(_)) if approval_gate => {
             guard
                 .require(
                     &st,
@@ -13507,6 +13849,19 @@ async fn approve_gate(
                 )
                 .await?
         }
+        _ if token_approval => {
+            guard
+                .require(
+                    &st,
+                    vec![format!(
+                        "approves the gate `{}` with an API token; its owner confirms every \
+                         approval a token makes",
+                        step.0
+                    )],
+                )
+                .await?
+        }
+        _ if !approval_gate => guard.exempt("not an Environment approval gate"),
         _ => guard.exempt("no approvers required"),
     }
 
@@ -13645,6 +14000,7 @@ async fn approve_gate(
         &run,
         &step,
         &principal.subject,
+        caller.delegation_trail(),
     )
     .await
     {
@@ -13661,7 +14017,8 @@ async fn approve_gate(
             | RerunError::GateNotReached { .. }
             | RerunError::NotARejectableGate(_)
             | RerunError::CreationUnfinished
-            | RerunError::Replaced(_)),
+            | RerunError::Replaced(_)
+            | RerunError::WhenExcluded(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -13793,7 +14150,8 @@ async fn approve_gate(
             | RerunError::GateNotReached { .. }
             | RerunError::NotARejectableGate(_)
             | RerunError::CreationUnfinished
-            | RerunError::Replaced(_)),
+            | RerunError::Replaced(_)
+            | RerunError::WhenExcluded(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -13884,7 +14242,7 @@ async fn reject_gate(
 ) -> Result<Response, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
     let req: RejectGateRequest = serde_json::from_slice(&body)
         .map_err(|e| ApiError::BadRequest(format!("bad reject body: {e}")))?;
     let reason = gate_reject_reason(&req.reason)?;
@@ -13894,8 +14252,9 @@ async fn reject_gate(
             st.clock.as_ref(),
             &run,
             &StepId(step),
-            &principal.subject,
+            &caller.principal.subject,
             reason,
+            caller.delegation_trail(),
         )
         .await,
     )?;
@@ -14066,6 +14425,7 @@ async fn release_gate_external(
                 &step,
                 &format!("external:{}", step.0),
                 reason,
+                None,
             )
             .await,
         )?;
@@ -14092,7 +14452,8 @@ async fn release_gate_external(
             | RerunError::GateNotReached { .. }
             | RerunError::NotARejectableGate(_)
             | RerunError::CreationUnfinished
-            | RerunError::Replaced(_)),
+            | RerunError::Replaced(_)
+            | RerunError::WhenExcluded(_)),
         ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
@@ -17541,6 +17902,8 @@ impl utoipa::Modify for StepUpResponses {
         secret_match::org_secret_match,
         secret_match::get_leak_check_limits,
         secret_match::put_leak_check_limits,
+        fork_run_approval::get_fork_run_approval,
+        fork_run_approval::put_fork_run_approval,
         silence_secret_cell,
         unsilence_secret_cell,
         list_connections,
@@ -17661,6 +18024,9 @@ impl utoipa::Modify for StepUpResponses {
         secret_match::LeakCheckLimitsDto,
         secret_match::LeakCheckLimitsUpdate,
         secret_match::LeakCheckCallerRole,
+        fork_run_approval::ForkRunApprovalDto,
+        fork_run_approval::ForkRunApprovalSettingDto,
+        fork_run_approval::ForkRunApprovalUpdate,
         SilenceCellRequest,
         ConnectionDto,
         CreateConnectionRequest,

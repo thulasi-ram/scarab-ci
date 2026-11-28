@@ -165,6 +165,8 @@ secrets, the `env=none` OIDC subject in an Environment and no OIDC token outside
 it. Scarab asks the forge which branch, tag or pull request points at the commit it resolved, so
 spelling the ref differently (a short SHA, `pull/5/head`) does not change the answer. When the
 forge cannot answer, the Run is refused. `HEAD`, the CLI's default ref, means the default branch.
+An org can also hold every Run of fork code at an approval gate until someone with write on the
+repository approves it: see [Fork Run approval](/scarab-ci/usage/fork-run-approval/).
 
 ### New run with these inputs
 

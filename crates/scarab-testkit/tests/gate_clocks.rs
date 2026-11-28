@@ -115,6 +115,7 @@ async fn resolutions(db: &InMemoryDb, gate: &str) -> Vec<(AttemptId, bool, Optio
                 reason,
                 deployment,
                 by: _,
+                ..
             } if step.0 == gate => {
                 assert_eq!(
                     deployment, None,
@@ -521,7 +522,7 @@ async fn retrying_an_expired_gate_opens_a_fresh_attempt_and_forgets_old_approval
     for _ in 0..3 {
         tick(&db, &clock, &exec).await;
     }
-    record_gate_approval(&db, &clock, &run_id(), &g, "alice")
+    record_gate_approval(&db, &clock, &run_id(), &g, "alice", None)
         .await
         .unwrap();
     assert_eq!(
@@ -558,7 +559,7 @@ async fn retrying_an_expired_gate_opens_a_fresh_attempt_and_forgets_old_approval
 
     // Alice must approve again — and her new approval is recorded, not deduped
     // against the one she gave the expired wait.
-    record_gate_approval(&db, &clock, &run_id(), &g, "alice")
+    record_gate_approval(&db, &clock, &run_id(), &g, "alice", None)
         .await
         .unwrap();
     let alice_approvals = events(&db)
@@ -678,13 +679,13 @@ async fn a_gate_that_is_not_reached_refuses_approve_release_and_reject() {
     let before = events(&db).await.len();
 
     let not_reached = |e: RerunError| matches!(e, RerunError::GateNotReached { step } if step == g);
-    let err = record_gate_approval(&db, &clock, &run_id(), &g, "alice")
+    let err = record_gate_approval(&db, &clock, &run_id(), &g, "alice", None)
         .await
         .unwrap_err();
     assert!(not_reached(err));
     let err = release_gate(&db, &clock, &run_id(), &g).await.unwrap_err();
     assert!(not_reached(err));
-    let err = reject_gate(&db, &clock, &run_id(), &g, "alice", "no")
+    let err = reject_gate(&db, &clock, &run_id(), &g, "alice", "no", None)
         .await
         .unwrap_err();
     assert!(not_reached(err));

@@ -11,6 +11,13 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// An org's Fork Run approval setting (ADR-0086 §9).
+mod fork_run_approval;
+pub use fork_run_approval::{
+    fork_run_approval_org_key, ForkRunApproval, ForkRunApprovalStore,
+    FORK_RUN_APPROVAL_SETTING_NAME,
+};
+
 /// An org's limits on leak checks (`secret.match`).
 mod leak_checks;
 pub use leak_checks::{
@@ -356,7 +363,7 @@ pub trait SessionStore: Send + Sync {
 pub const API_TOKEN_PREFIX: &str = "scarab_pat_";
 
 /// How long a token may be issued for, in days. An expiry is **mandatory**
-/// (see [`ApiToken`]); this only bounds how far out it may be pushed.
+/// (see [`PrincipalToken`]); this only bounds how far out it may be pushed.
 pub const MAX_API_TOKEN_DAYS: u32 = 365;
 
 /// The stored identity of a token plaintext: its SHA-256, lowercase hex.
@@ -381,17 +388,58 @@ pub fn api_token_hash(plaintext: &str) -> String {
     out
 }
 
-/// An issued API token's **record** — everything about a token except the one
-/// thing that would let someone use it. The plaintext exists exactly once, in
-/// the response to the mint call; what survives here is
+/// The prefix of a **restricted** token's stored hash
+/// ([`restricted_api_token_hash`]).
+pub const RESTRICTED_API_TOKEN_HASH_PREFIX: &str = "r1:";
+
+/// The domain a restricted token's hash is computed in, so it can never equal
+/// [`api_token_hash`] of the same plaintext.
+const RESTRICTED_API_TOKEN_HASH_DOMAIN: &[u8] = b"scarab-principal-token-restricted-v1\0";
+
+/// The stored identity of a **restricted** token's plaintext (one with an
+/// operation list, a kind other than `issued`, or an audience):
+/// `r1:` + SHA-256 (lowercase hex) of the domain and the plaintext.
+///
+/// A server built before PrincipalTokens had restrictions looks tokens up by
+/// [`api_token_hash`] alone and knows nothing of the restriction columns, so
+/// during a rolling upgrade it would let a restricted token do everything its
+/// role allows. Stored under this hash, a restricted token is a token that
+/// server cannot find.
+pub fn restricted_api_token_hash(plaintext: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(RESTRICTED_API_TOKEN_HASH_DOMAIN);
+    hasher.update(plaintext.as_bytes());
+    let mut out = String::from(RESTRICTED_API_TOKEN_HASH_PREFIX);
+    for byte in hasher.finalize() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// A PrincipalToken's **record** (ADR-0086 §6): everything about a token
+/// except the one thing that would let someone use it. The plaintext exists
+/// exactly once, in the response to the mint call; what survives here is
 /// [`api_token_hash`] of it, held by the store rather than on this struct.
 ///
 /// A token is not a second authorization model. It is a *narrowing* of an
-/// existing [`Principal`]'s authority along two axes at once — down to one
-/// [`Scope`], and down to a [`Role`] at or below what its owner holds there —
-/// and everything downstream ([`Rbac`], tenancy scoping) is unchanged.
+/// existing [`Principal`]'s authority along three axes at once: down to one
+/// [`Scope`], down to a [`Role`] at or below what its owner holds there, and,
+/// when it carries an operation list, down to those ApiOperations. Everything
+/// downstream ([`Rbac`], tenancy scoping) is unchanged.
+///
+/// **Restricted tokens are stored under another hash.** A token with an
+/// operation list, a kind other than `issued`, or an audience is
+/// [restricted](Self::is_restricted) and stored under
+/// [`restricted_api_token_hash`], every other token under [`api_token_hash`]
+/// ([`Self::stored_hash`]), and a lookup matches a row only under the hash its
+/// restrictions call for ([`ApiTokenStore::by_hash`]). The invariant this
+/// rests on: no code changes a row's restrictions in place, so a row's hash
+/// always matches them; and any later code that mints restricted tokens (an
+/// OAuth refresh rotation, say) stores them under the `r1:` hash too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApiToken {
+pub struct PrincipalToken {
     /// Opaque row id. Safe to log, safe to show, safe to put in a revoke URL —
     /// it is not the credential.
     pub id: String,
@@ -412,7 +460,7 @@ pub struct ApiToken {
     pub scope: Scope,
     /// The **ceiling** the minter set, not the token's effective role. What the
     /// token can actually do is this capped by the owner's live authority — see
-    /// [`ApiToken::effective_role`].
+    /// [`PrincipalToken::effective_role`].
     pub role: Role,
     /// Unix-ms expiry. **Mandatory.** `values.yaml` already records why, about
     /// the workspace results token: it "carries no verb and never expires", and
@@ -440,9 +488,84 @@ pub struct ApiToken {
     /// an opaque secret in a table rather than a self-describing JWT, which
     /// could not be withdrawn before its own expiry.
     pub revoked_at: Option<i64>,
+    /// How it was granted. Every token minted before PrincipalTokens had
+    /// kinds is [`PrincipalTokenKind::Issued`].
+    #[serde(default)]
+    pub kind: PrincipalTokenKind,
+    /// The ApiOperation ids it may use (`run.read`, `repo.dispatch`, …).
+    /// `None`: no list, so every operation its role and scope allow, as every
+    /// token before lists existed. `Some`: a request is refused unless its
+    /// route's operation is in the list, and refused when the route names no
+    /// operation (fail-closed).
+    #[serde(default)]
+    pub operations: Option<Vec<String>>,
+    /// The one URL it may be used at (RFC 8707). Always `None` for an issued
+    /// token; the server refuses to authenticate an issued token that has one.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// The OAuth client an `oauth` token was granted to. `None` for an issued
+    /// token.
+    #[serde(default)]
+    pub oauth_client: Option<String>,
 }
 
-impl ApiToken {
+/// The kinds of [`PrincipalToken`] (ADR-0086 §6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalTokenKind {
+    /// A `scarab_pat_` token a person minted for themselves: an API token.
+    #[default]
+    Issued,
+    /// A token granted to an app through a consent page. It is accepted only
+    /// at its audience, never approves a Gate, and nothing mints one yet.
+    Oauth,
+}
+
+impl PrincipalTokenKind {
+    /// The stored and wire name: `issued` or `oauth`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Issued => "issued",
+            Self::Oauth => "oauth",
+        }
+    }
+
+    /// The kind a stored name reads as; `None` for a name this binary does
+    /// not know, which a reader refuses rather than defaults.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "issued" => Some(Self::Issued),
+            "oauth" => Some(Self::Oauth),
+            _ => None,
+        }
+    }
+}
+
+/// The name [`PrincipalToken`] had before it had kinds. The routes, the
+/// `scarab_pat_` prefix and the `api_tokens` table keep that name too.
+pub type ApiToken = PrincipalToken;
+
+impl PrincipalToken {
+    /// Does it carry a restriction a server built before PrincipalTokens had
+    /// them would ignore: an operation list, a kind other than `issued`, or an
+    /// audience?
+    pub fn is_restricted(&self) -> bool {
+        self.operations.is_some()
+            || self.kind != PrincipalTokenKind::Issued
+            || self.audience.is_some()
+    }
+
+    /// The hash to store this token under for `plaintext`:
+    /// [`restricted_api_token_hash`] when it [is restricted](Self::is_restricted),
+    /// [`api_token_hash`] otherwise.
+    pub fn stored_hash(&self, plaintext: &str) -> String {
+        if self.is_restricted() {
+            restricted_api_token_hash(plaintext)
+        } else {
+            api_token_hash(plaintext)
+        }
+    }
+
     /// Is this token still usable at `now_ms`? Revocation beats expiry beats
     /// everything; neither is a judgement call.
     pub fn is_live(&self, now_ms: i64) -> bool {
@@ -476,6 +599,17 @@ impl ApiToken {
     pub fn effective_role(&self, live: Option<Role>) -> Option<Role> {
         live.map(|live| live.min(self.role))
     }
+
+    /// May this token be used for the ApiOperation `operation` (the matched
+    /// route's, `None` when the request matched none)? A token with no list
+    /// may use any; a token with a list only one it names, and never one
+    /// whose operation is unknown.
+    pub fn admits_operation(&self, operation: Option<&str>) -> bool {
+        match &self.operations {
+            None => true,
+            Some(allowed) => operation.is_some_and(|op| allowed.iter().any(|a| a == op)),
+        }
+    }
 }
 
 /// Durable store of issued API tokens (ADR-0049 amendment). Keyed on the
@@ -485,22 +619,33 @@ impl ApiToken {
 pub trait ApiTokenStore: Send + Sync {
     /// Record a freshly minted token. `hash` is [`api_token_hash`] of the
     /// plaintext the caller is about to return once and forget.
-    async fn put(&self, token: &ApiToken, hash: &str) -> Result<(), IdentityError>;
+    async fn put(&self, token: &PrincipalToken, hash: &str) -> Result<(), IdentityError>;
     /// The token a presented plaintext hashes to, live or not — expiry and
-    /// revocation are the caller's decision ([`ApiToken::is_live`]) so that
+    /// revocation are the caller's decision ([`PrincipalToken::is_live`]) so that
     /// "this token is revoked" stays distinguishable from "no such token" in
     /// the code, even though both answer 401 on the wire.
-    async fn by_hash(&self, hash: &str) -> Result<Option<ApiToken>, IdentityError>;
+    ///
+    /// `plain_hash` is [`api_token_hash`] of the plaintext and
+    /// `restricted_hash` its [`restricted_api_token_hash`]. A row matches only
+    /// under the hash its restrictions call for: an unrestricted row under
+    /// `plain_hash`, a [restricted](PrincipalToken::is_restricted) one under
+    /// `restricted_hash`. A restricted row stored under a plain hash is never
+    /// found.
+    async fn by_hash(
+        &self,
+        plain_hash: &str,
+        restricted_hash: &str,
+    ) -> Result<Option<PrincipalToken>, IdentityError>;
     /// The token record with row id `id`, live or not (ADR-0073: a
     /// StepUpConfirmationRequest's replay re-checks its requesting token by
     /// id, never by plaintext).
-    async fn by_id(&self, id: &str) -> Result<Option<ApiToken>, IdentityError>;
+    async fn by_id(&self, id: &str) -> Result<Option<PrincipalToken>, IdentityError>;
     /// Every token issued within `org` — org- and project-scoped alike —
     /// newest first. Records only; there is no plaintext to return.
-    async fn list(&self, org: &str) -> Result<Vec<ApiToken>, IdentityError>;
+    async fn list(&self, org: &str) -> Result<Vec<PrincipalToken>, IdentityError>;
     /// Every token `owner` holds, in every org, newest first — what a person
     /// sees under their own account.
-    async fn list_owned(&self, owner: &str) -> Result<Vec<ApiToken>, IdentityError>;
+    async fn list_owned(&self, owner: &str) -> Result<Vec<PrincipalToken>, IdentityError>;
     /// Revoke `id` at `now_ms`. `false` if no such token, or it was already
     /// revoked — revocation is idempotent but not silent.
     async fn revoke(&self, id: &str, now_ms: i64) -> Result<bool, IdentityError>;
@@ -1304,8 +1449,8 @@ mod tests {
         assert_ne!(hash, api_token_hash("scarab_pat_0123456789abcdee"));
     }
 
-    fn token(scope: Scope, role: Role) -> ApiToken {
-        ApiToken {
+    fn token(scope: Scope, role: Role) -> PrincipalToken {
+        PrincipalToken {
             id: "t1".into(),
             name: "ci".into(),
             owner_subject: "amy".into(),
@@ -1317,6 +1462,10 @@ mod tests {
             last_used_at: None,
             use_count: 0,
             revoked_at: None,
+            kind: PrincipalTokenKind::Issued,
+            operations: None,
+            audience: None,
+            oauth_client: None,
         }
     }
 
@@ -1362,6 +1511,36 @@ mod tests {
         assert_eq!(t.effective_role(None), None);
     }
 
+    /// J1: a restricted token's stored hash is the `r1:` hash, never the
+    /// plain one; an unrestricted token's is the plain hash.
+    #[test]
+    fn a_restricted_token_is_stored_under_its_own_hash() {
+        let secret = "scarab_pat_0123456789abcdef";
+        let plain = token(Scope::Org("acme".into()), Role::Member);
+        assert!(!plain.is_restricted());
+        assert_eq!(plain.stored_hash(secret), api_token_hash(secret));
+        for restricted in [
+            PrincipalToken {
+                operations: Some(vec!["run.read".into()]),
+                ..plain.clone()
+            },
+            PrincipalToken {
+                kind: PrincipalTokenKind::Oauth,
+                ..plain.clone()
+            },
+            PrincipalToken {
+                audience: Some("https://ci.example.com/mcp".into()),
+                ..plain.clone()
+            },
+        ] {
+            assert!(restricted.is_restricted());
+            let hash = restricted.stored_hash(secret);
+            assert!(hash.starts_with(RESTRICTED_API_TOKEN_HASH_PREFIX), "{hash}");
+            assert_ne!(hash, api_token_hash(secret));
+            assert_eq!(hash, restricted_api_token_hash(secret));
+        }
+    }
+
     #[test]
     fn expiry_and_revocation_each_kill_a_token_on_their_own() {
         let t = token(Scope::Org("acme".into()), Role::Member);
@@ -1369,7 +1548,7 @@ mod tests {
         assert!(!t.is_live(2_000), "expiry is exclusive at the instant");
         assert!(!t.is_live(2_001));
 
-        let revoked = ApiToken {
+        let revoked = PrincipalToken {
             revoked_at: Some(1_500),
             ..t
         };

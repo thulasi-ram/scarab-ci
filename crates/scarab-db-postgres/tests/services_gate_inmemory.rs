@@ -430,7 +430,7 @@ async fn operator_cancel_tears_down_shared_services() {
 
     // The operator cancels: durable state settles now, teardown is the intent.
     assert!(
-        cancel_run_request(&db, &clock, &run, Some("operator".into()))
+        cancel_run_request(&db, &clock, &run, Some("operator".into()), None)
             .await
             .unwrap()
     );
@@ -480,7 +480,7 @@ async fn failed_service_teardown_is_retried_not_recorded() {
     exec.fail_service_teardowns(1); // the first teardown errors; the next succeeds
     let sched = Scheduler::new(&db, &clock, &exec, "drv").with_outbox_visibility_ms(0);
 
-    cancel_run_request(&db, &clock, &run, Some("operator".into()))
+    cancel_run_request(&db, &clock, &run, Some("operator".into()), None)
         .await
         .unwrap();
 

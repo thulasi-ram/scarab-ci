@@ -1056,7 +1056,7 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
     let db: Arc<dyn Db> = Arc::new(pg);
     let pinned = RunId("pin-kept".into());
     assert!(
-        scarab_engine::pin_run_snapshots(&*db, &*clock, &pinned, Some("alice".into()))
+        scarab_engine::pin_run_snapshots(&*db, &*clock, &pinned, Some("alice".into()), None)
             .await
             .unwrap(),
         "an existing run can be pinned"
@@ -1081,12 +1081,12 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
     );
     // Pinning is idempotent (re-stamping, never an error).
     assert!(
-        scarab_engine::pin_run_snapshots(&*db, &*clock, &pinned, Some("alice".into()))
+        scarab_engine::pin_run_snapshots(&*db, &*clock, &pinned, Some("alice".into()), None)
             .await
             .unwrap()
     );
     assert!(
-        !scarab_engine::pin_run_snapshots(&*db, &*clock, &RunId("nope".into()), None)
+        !scarab_engine::pin_run_snapshots(&*db, &*clock, &RunId("nope".into()), None, None)
             .await
             .unwrap(),
         "pinning a run that does not exist reports false, not a phantom pin"
@@ -1138,7 +1138,7 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
     // Release the pin: the next sweep collects it. This is the half that proves
     // the pin is a live predicate rather than a one-off reprieve.
     assert!(
-        scarab_engine::unpin_run_snapshots(&*db, &*clock, &pinned, Some("alice".into()))
+        scarab_engine::unpin_run_snapshots(&*db, &*clock, &pinned, Some("alice".into()), None)
             .await
             .unwrap()
     );
@@ -1382,6 +1382,7 @@ async fn an_expired_input_widens_a_rerun_back_to_clone_instead_of_failing() {
         &run,
         &test,
         Some("alice".into()),
+        None,
     )
     .await
     .unwrap();

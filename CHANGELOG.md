@@ -45,6 +45,29 @@ release.yml uses that version's section as the GitHub Release text. See
   pipelines there.
 - **The OIDC issuer refuses keys under 2048 bits.** A signing key or a
   `SCARAB_OIDC_PUBLIC_KEYS` entry with a shorter RSA modulus stops the server at boot.
+- **Migration 0111 adds `kind`, `operations`, `audience` and `oauth_client` to `api_tokens`.**
+  No row is rewritten; every existing token keeps working as before. A 0.8.4 server does not
+  start on a database that ran it: to roll back, run
+  `crates/scarab-db-postgres/rollback/0111_revert.sql` with the server scaled to zero. It revokes
+  the tokens that carry an operation list. See the chart README, "Upgrading from 0.8.4".
+- **Migration 0114 adds the table `org_fork_run_approval`** (each org's Fork Run approval
+  setting; an org with no row has `agent_started`). No row is rewritten. A server that does not
+  know 0114 does not start on a database that ran it: to roll back, set it to `off` in every org,
+  then run
+  `crates/scarab-db-postgres/rollback/0114_revert.sql` with the server scaled to zero. Roll back
+  to 0.8.4, not further: 0.8.4 is the first release that can load a Run with the Fork Run approval
+  gate. See the chart README, "Upgrading from 0.8.4".
+- **An API token no longer approves a gate by itself.** Its approval of any `manual` gate, a
+  plain one included, answers `403 step_up_required` with a confirmation request its owner
+  confirms with a passkey. A script that approved plain gates with a token must confirm each
+  approval or approve from a browser. Rejecting is unchanged. Under `SCARAB_DEV_INSECURE`, where
+  step-up is off, a token's approval is still recorded at once.
+- **Reads are named by the data they return.** The shared `read` operation is split into
+  `run.read`, `step.logs.read`, `step.workspace.read`, `run.artifacts.read`, `repo.read`,
+  `account.read`, `access.read`, `security.read`, `secret.names.read`, `settings.read` and
+  `server.read`. Security events for reads carry the new names. No operation implies another:
+  a token with a list needs `account.read` for `GET /v1/me` and `server.read` for
+  `GET /v1/about`.
 
 ### Security
 
@@ -123,6 +146,30 @@ release.yml uses that version's section as the GitHub Release text. See
   the token again later in the step still can. A new docs page shows how to publish the issuer as static files
   and how a step assumes an AWS role with two `env:` lines. See
   [Assuming an AWS role from a step](/scarab-ci/usage/aws-roles/).
+
+- **Limit an API token to a list of operations.** A token minted with `operations` may use only
+  those; every other request is refused with `403 operation_not_granted`. Each token records its
+  kind (`issued`), and every rerun, retry, cancel, pin, approval and rejection made with a token
+  records the token beside the person in the Run's events, and so does a dispatch on the Run
+  itself. The token's id (never its secret) is visible to anyone who can read the Run. A token
+  with a list is stored under a different hash, so a server older than this release cannot find
+  it during a rolling upgrade. See
+  [API tokens](/scarab-ci/usage/api-tokens/#operations).
+- **Fork Run approval.** An org setting that holds Runs of fork code at a `manual` gate,
+  `fork-run-approval`, before any of their steps or shared services start: `off`,
+  `agent_started` (the default: Runs an app started through an `oauth` token) or `all`. Nothing
+  issues an `oauth` token yet, so until OAuth sign-in for apps ships, `agent_started` holds no
+  Run; choose `all` to hold every Run of fork code. Anyone with write on the repository approves
+  the gate from the Run page; an API token's owner confirms each approval, and an app cannot
+  approve. The gate fails the Run after 72 hours. It never counts as an Environment approval gate,
+  and approving it unlocks no Environment secrets, registry credentials or OIDC roles: the Run is
+  still fork code. A Rerun waits at the gate again, and asks the other gates between it and the
+  rerun step again (an Environment's approvers, a plugin gate); a Retry does not. After a
+  rollback to 0.8.4 a Rerun no longer puts the gate back, so set the setting to `off` and let gated
+  Runs finish first. An org admin changes the
+  setting from a browser in Org settings › Security
+  (`/v1/orgs/{org}/security/fork-run-approval`); a change that holds fewer Runs asks for a passkey
+  confirmation. See [Fork Run approval](/scarab-ci/usage/fork-run-approval/).
 
 ### Enhancement
 

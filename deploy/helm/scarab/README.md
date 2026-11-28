@@ -628,6 +628,72 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
 
+### Upgrading from 0.8.4: Fork Run approval
+
+Migration 0114 adds the table `org_fork_run_approval`: each org's Fork Run
+approval setting. It is a new table, so it rewrites no row and locks no other
+table; it waits at most 5 seconds for its lock, and on a busy database the
+server stops with `canceling statement due to lock timeout` and runs it again
+when the Pod restarts. It is numbered 0114, after 0112 and 0113, which two
+other changes of this release line add. They can land in any order: the
+migrator runs every migration a database has not run, whatever its number,
+so a database that ran 0114 first still runs 0112 and 0113 when they arrive,
+and none of the three depends on another. Every org starts on the default, `agent_started`: a Run of
+fork code that an app started through an `oauth` token waits for approval.
+Nothing issues such a token yet, so no Run changes until an admin picks `all`
+(Org settings › Security).
+
+A Run of fork code the setting holds gets one `manual` gate,
+`fork-run-approval`, in front of every root step. A Rerun in such a Run waits
+at the gate again, and asks the other gates between it and the rerun step
+again too; a Retry does not.
+
+0.8.4 is the release to roll back to: it reads a Run that has the gate, holds
+it and its shared services at the gate, and never counts the gate as an
+Environment approval gate. A server before 0.8.4 cannot load such a Run, so
+do not roll back past 0.8.4 while one exists. On 0.8.4 the gate is weaker: an
+issued API token releases it without a confirmation, and a Rerun of a Run
+whose gate was released does not put the gate back (0.8.4 has no re-arm), so
+the rerun steps start at once. So before rolling back, set the setting to
+`off` and let the Runs that have the gate finish.
+
+To roll back: set Fork Run approval to `off` in every org, approve or reject the
+gates still waiting, scale the server to zero, back up the database, run
+[`rollback/0114_revert.sql`](../../../crates/scarab-db-postgres/rollback/0114_revert.sql)
+(`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0114_revert.sql`; a second run
+changes nothing), then the revert scripts of the other migrations above 0111
+this database ran, newest first, then `0111_revert.sql` (see "Upgrading from
+0.8.4: token kinds and operation lists"), then install the 0.8.4 chart. The
+settings are dropped.
+
+### Upgrading from 0.8.4: token kinds and operation lists
+
+Migration 0111 adds four columns to `api_tokens`: `kind` (`NOT NULL DEFAULT
+'issued'`), and the nullable `operations`, `audience` and `oauth_client`, and
+one nullable column to `runs`, `origin_via`, the token that started a Run. No
+row is rewritten, and every existing token reads as an issued token with no
+operation list, so it works as before. A token minted with an operation list
+is stored under a different hash, so a 0.8.4 replica still running during the
+rolling update cannot find it and cannot let it use every operation its role
+allows. The `ALTER` waits at most 5 seconds for
+its lock on `api_tokens` and on `runs`; on a busy database the server stops with `canceling
+statement due to lock timeout` and runs it again when the Pod restarts.
+
+Two behaviour changes reach existing tokens. Every GET now names a read
+operation (`run.read`, `step.logs.read`, …) instead of one shared `read`, so
+the `op` of security events changes for reads. And an API token's approval of
+any `manual` gate, a plain one included, now raises a confirmation request its
+owner confirms; a script that approved plain gates with a token must confirm
+each approval, or approve from a browser.
+
+To roll back: scale the server to zero, back up the database, run
+[`rollback/0111_revert.sql`](../../../crates/scarab-db-postgres/rollback/0111_revert.sql)
+(`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0111_revert.sql`; a second run
+changes nothing), then install the 0.8.4 chart. A 0.8.4 server would let a
+token with an operation list use every operation, so the revert revokes those
+tokens before it drops the columns; their owners mint new ones. To go back to
+0.8.2, run `0110_revert.sql` next.
+
 ### Upgrading from 0.8.3: rollback target for Fork Run approval
 
 No migration. A later release adds Fork Run approval, an org setting that puts

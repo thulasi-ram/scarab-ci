@@ -136,6 +136,42 @@ export const ROLE_CHOICES = [
 
 export type TokenRole = (typeof ROLE_CHOICES)[number]["role"];
 
+/**
+ * The operations a token can be limited to, with what each lets it do. The
+ * ids are the server's operation names: a token with a list may use only
+ * those, and every other request it makes is refused. A token with no list
+ * may use every operation its role allows. Reads come first, then writes.
+ */
+export const TOKEN_OPERATION_CHOICES = [
+  { op: "run.read", what: "read Runs and Steps: status, the graph, results" },
+  { op: "step.logs.read", what: "read Step logs" },
+  { op: "step.workspace.read", what: "read a Step's workspace files" },
+  { op: "run.artifacts.read", what: "read a Run's artifacts" },
+  { op: "repo.read", what: "read repositories, refs and Pipelines" },
+  { op: "account.read", what: "read your account, and the confirmations it asks you for" },
+  { op: "repo.dispatch", what: "start a Pipeline" },
+  { op: "step.rerun", what: "rerun a Step" },
+  { op: "step.retry", what: "retry a failed Step" },
+  { op: "run.cancel", what: "cancel a Run" },
+  { op: "gate.reject", what: "reject a gate" },
+  { op: "gate.approve", what: "approve a gate, which you confirm each time" },
+] as const;
+
+/** What a token's operation list allows, in a few words. */
+export function operationsLabel(t: { operations?: readonly string[] | null }): string {
+  if (t.operations == null) return "every operation its role allows";
+  return t.operations.length === 1 ? "1 operation" : `${t.operations.length} operations`;
+}
+
+/** Why this operation choice cannot be minted, or `null` if it can. A list
+ * must name at least one operation; no list means every operation. */
+export function operationsError(limited: boolean, selected: readonly string[]): string | null {
+  if (limited && selected.length === 0) {
+    return "Pick at least one operation, or let the token use every operation its role allows.";
+  }
+  return null;
+}
+
 /** How a scope reads in a row: the org, or `org/project` when narrowed. */
 export function scopeLabel(t: { org: string; project?: string | null }): string {
   return t.project ? `${t.org}/${t.project}` : t.org;

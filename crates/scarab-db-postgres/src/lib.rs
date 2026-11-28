@@ -34,6 +34,8 @@ use scarab_project::ProjectError;
 /// overlays and grants, and the one-snapshot read admission makes.
 mod delivery;
 mod environment_governance;
+/// `ForkRunApprovalStore`: each org's Fork Run approval setting.
+mod fork_run_approval;
 /// `LeakCheckLimitsStore`: each org's limits on leak checks.
 mod leak_checks;
 /// `LibraryStore` (ADR-0076): installed libraries, their versions, yanks
@@ -1771,6 +1773,40 @@ impl Db for PostgresDb {
             .await
             .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<Option<String>, _>("trigger_title")))
+    }
+
+    async fn set_run_origin_via(
+        &self,
+        run: &RunId,
+        via: &scarab_engine::DelegationTrail,
+    ) -> Result<(), DbError> {
+        let via = serde_json::to_value(via).map_err(|e| DbError::Other(e.to_string()))?;
+        sqlx::query("UPDATE runs SET origin_via = $2 WHERE id = $1")
+            .bind(&run.0)
+            .bind(via)
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_origin_via(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::DelegationTrail>, DbError> {
+        let row = sqlx::query("SELECT origin_via FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        // A value that does not read as a trail is reported, not dropped: it
+        // is the record of who started the Run.
+        match row.and_then(|r| r.get::<Option<serde_json::Value>, _>("origin_via")) {
+            None => Ok(None),
+            Some(v) => serde_json::from_value(v)
+                .map(Some)
+                .map_err(|e| DbError::Other(format!("runs.origin_via: {e}"))),
+        }
     }
 
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
@@ -5843,6 +5879,12 @@ fn api_token_from_row(r: &sqlx::postgres::PgRow) -> Option<scarab_identity::ApiT
         // BIGINT, never negative: it only ever grows by `touch`'s `uses`.
         use_count: u64::try_from(r.get::<i64, _>("use_count")).unwrap_or(0),
         revoked_at: r.get::<Option<i64>, _>("revoked_at"),
+        // An unknown kind fails CLOSED like an unknown role: the row is
+        // dropped, so the token authenticates nothing.
+        kind: scarab_identity::PrincipalTokenKind::parse(&r.get::<String, _>("kind"))?,
+        operations: r.get::<Option<Vec<String>>, _>("operations"),
+        audience: r.get::<Option<String>, _>("audience"),
+        oauth_client: r.get::<Option<String>, _>("oauth_client"),
     })
 }
 
@@ -6561,7 +6603,7 @@ impl scarab_identity::IdentityStore for PostgresDb {
 
 const API_TOKEN_COLS: &str = "id, name, owner_subject, scope_org, scope_project, role, \
                               expires_at, created_by, created_at, last_used_at, use_count, \
-                              revoked_at";
+                              revoked_at, kind, operations, audience, oauth_client";
 
 #[async_trait]
 impl scarab_identity::ApiTokenStore for PostgresDb {
@@ -6578,8 +6620,9 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
         sqlx::query(
             "INSERT INTO api_tokens
                  (id, token_hash, name, owner_subject, scope_org, scope_project,
-                  role, expires_at, created_by, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                  role, expires_at, created_by, created_at,
+                  kind, operations, audience, oauth_client)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(&token.id)
         .bind(hash)
@@ -6591,6 +6634,10 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
         .bind(token.expires_at)
         .bind(&token.created_by)
         .bind(token.created_at)
+        .bind(token.kind.as_str())
+        .bind(&token.operations)
+        .bind(&token.audience)
+        .bind(&token.oauth_client)
         .execute(self.pool())
         .await
         .map_err(identity_err)?;
@@ -6599,12 +6646,22 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
 
     async fn by_hash(
         &self,
-        hash: &str,
+        plain_hash: &str,
+        restricted_hash: &str,
     ) -> Result<Option<scarab_identity::ApiToken>, scarab_identity::IdentityError> {
+        // A row matches only under the hash its restrictions call for
+        // (ADR-0086 §6): a restricted row is stored under the `r1:` hash, so a
+        // server built before restrictions, which looks up the plain hash,
+        // never finds it.
         let row = sqlx::query(&format!(
-            "SELECT {API_TOKEN_COLS} FROM api_tokens WHERE token_hash = $1"
+            "SELECT {API_TOKEN_COLS} FROM api_tokens
+              WHERE (token_hash = $1 AND operations IS NULL AND kind = 'issued'
+                     AND audience IS NULL)
+                 OR (token_hash = $2 AND (operations IS NOT NULL OR kind <> 'issued'
+                     OR audience IS NOT NULL))"
         ))
-        .bind(hash)
+        .bind(plain_hash)
+        .bind(restricted_hash)
         .fetch_optional(self.pool())
         .await
         .map_err(identity_err)?;

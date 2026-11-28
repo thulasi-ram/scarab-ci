@@ -26,22 +26,32 @@ use step_up_harness::*;
 /// COND-A (crown jewel only when it loosens; the handler decides), CER
 /// (the ceremony endpoints), EX (tightening), NG (not governed).
 const EXPECTED: &[(&str, &str, &str, &str)] = &[
-    ("GET", "/healthz", "read", "READ"),
-    ("GET", "/livez", "read", "READ"),
-    ("GET", "/readyz", "read", "READ"),
-    ("GET", "/metrics", "read", "READ"),
-    ("GET", "/openapi.json", "read", "READ"),
-    ("GET", "/.well-known/jwks.json", "read", "READ"),
-    ("GET", "/.well-known/openid-configuration", "read", "READ"),
+    ("GET", "/healthz", "server.read", "READ"),
+    ("GET", "/livez", "server.read", "READ"),
+    ("GET", "/readyz", "server.read", "READ"),
+    ("GET", "/metrics", "server.read", "READ"),
+    ("GET", "/openapi.json", "server.read", "READ"),
+    ("GET", "/.well-known/jwks.json", "server.read", "READ"),
+    (
+        "GET",
+        "/.well-known/openid-configuration",
+        "server.read",
+        "READ",
+    ),
     ("POST", "/v1/auth/login", "auth.login", "NG"),
-    ("GET", "/v1/auth/login", "read", "READ"),
-    ("GET", "/v1/auth/callback", "read", "READ"),
-    ("GET", "/v1/auth/providers", "read", "READ"),
+    ("GET", "/v1/auth/login", "server.read", "READ"),
+    ("GET", "/v1/auth/callback", "server.read", "READ"),
+    ("GET", "/v1/auth/providers", "server.read", "READ"),
     ("POST", "/v1/auth/logout", "auth.logout", "NG"),
-    ("GET", "/v1/me", "read", "READ"),
-    ("GET", "/v1/about", "read", "READ"),
+    ("GET", "/v1/me", "account.read", "READ"),
+    ("GET", "/v1/about", "server.read", "READ"),
     ("POST", "/v1/me/identities/link", "identity.link", "CJ-W"),
-    ("GET", "/v1/me/identities/merges/{id}", "read", "READ"),
+    (
+        "GET",
+        "/v1/me/identities/merges/{id}",
+        "account.read",
+        "READ",
+    ),
     (
         "POST",
         "/v1/me/identities/merges/{id}",
@@ -54,7 +64,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "identity.unlink",
         "CJ-W",
     ),
-    ("GET", "/v1/me/security", "read", "READ"),
+    ("GET", "/v1/me/security", "account.read", "READ"),
     (
         "POST",
         "/v1/me/passkeys/registration/options",
@@ -70,18 +80,45 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("DELETE", "/v1/me/passkeys/{id}", "passkey.remove", "CJ-A"),
     ("POST", "/v1/me/step-up/options", "step_up.options", "CER"),
     ("POST", "/v1/me/step-up", "step_up.confirm", "CER"),
-    ("GET", "/v1/me/security/events", "read", "READ"),
-    ("GET", "/v1/me/tokens", "read", "READ"),
+    ("GET", "/v1/me/security/events", "account.read", "READ"),
+    ("GET", "/v1/me/tokens", "account.read", "READ"),
     ("POST", "/v1/me/tokens", "token.mint_own", "CJ-A"),
     ("DELETE", "/v1/me/tokens/{id}", "token.revoke_own", "EX"),
-    ("GET", "/v1/security/events", "read", "READ"),
-    ("GET", "/v1/orgs/{org}/security/events", "read", "READ"),
-    ("GET", "/v1/orgs/{org}/security/summary", "read", "READ"),
-    ("GET", "/v1/orgs/{org}/security/leak-checks", "read", "READ"),
+    ("GET", "/v1/security/events", "security.read", "READ"),
+    (
+        "GET",
+        "/v1/orgs/{org}/security/events",
+        "security.read",
+        "READ",
+    ),
+    (
+        "GET",
+        "/v1/orgs/{org}/security/summary",
+        "security.read",
+        "READ",
+    ),
+    (
+        "GET",
+        "/v1/orgs/{org}/security/leak-checks",
+        "security.read",
+        "READ",
+    ),
     (
         "PUT",
         "/v1/orgs/{org}/security/leak-checks",
         "secret.match_limits",
+        "COND-A",
+    ),
+    (
+        "GET",
+        "/v1/orgs/{org}/security/fork-run-approval",
+        "settings.read",
+        "READ",
+    ),
+    (
+        "PUT",
+        "/v1/orgs/{org}/security/fork-run-approval",
+        "fork_run_approval.put",
         "COND-A",
     ),
     (
@@ -90,7 +127,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "passkey.reset",
         "CJ-A",
     ),
-    ("GET", "/v1/step-up/requests/{id}", "read", "READ"),
+    ("GET", "/v1/step-up/requests/{id}", "account.read", "READ"),
     (
         "POST",
         "/v1/step-up/requests/{id}/options",
@@ -103,7 +140,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "step_up.request_confirm",
         "CER",
     ),
-    ("GET", "/v1/orgs/{org}/bindings", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/bindings", "access.read", "READ"),
     ("PUT", "/v1/orgs/{org}/bindings", "binding.put", "CJ-W"),
     (
         "DELETE",
@@ -111,9 +148,9 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "binding.delete",
         "CJ-W",
     ),
-    ("GET", "/v1/orgs/{org}/principals", "read", "READ"),
-    ("GET", "/v1/orgs/{org}/members/{id}", "read", "READ"),
-    ("GET", "/v1/orgs/{org}/tokens", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/principals", "access.read", "READ"),
+    ("GET", "/v1/orgs/{org}/members/{id}", "access.read", "READ"),
+    ("GET", "/v1/orgs/{org}/tokens", "access.read", "READ"),
     ("POST", "/v1/orgs/{org}/tokens", "token.mint", "CJ-A"),
     ("DELETE", "/v1/orgs/{org}/tokens/{id}", "token.revoke", "EX"),
     (
@@ -122,15 +159,25 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "binding.import",
         "CJ-W",
     ),
-    ("GET", "/v1/repos", "read", "READ"),
-    ("GET", "/v1/repos/{org}/{repo}/runs", "read", "READ"),
-    ("GET", "/v1/repos/{org}/{repo}/refused-runs", "read", "READ"),
-    ("GET", "/v1/repos/{org}/{repo}/schedules", "read", "READ"),
+    ("GET", "/v1/repos", "repo.read", "READ"),
+    ("GET", "/v1/repos/{org}/{repo}/runs", "run.read", "READ"),
+    (
+        "GET",
+        "/v1/repos/{org}/{repo}/refused-runs",
+        "run.read",
+        "READ",
+    ),
+    (
+        "GET",
+        "/v1/repos/{org}/{repo}/schedules",
+        "repo.read",
+        "READ",
+    ),
     ("POST", "/v1/runs", "run.create", "NG"),
-    ("GET", "/v1/runs", "read", "READ"),
-    ("GET", "/v1/runs/{id}", "read", "READ"),
-    ("GET", "/v1/runs/{id}/events", "read", "READ"),
-    ("GET", "/v1/runs/{id}/logs", "read", "READ"),
+    ("GET", "/v1/runs", "run.read", "READ"),
+    ("GET", "/v1/runs/{id}", "run.read", "READ"),
+    ("GET", "/v1/runs/{id}/events", "run.read", "READ"),
+    ("GET", "/v1/runs/{id}/logs", "step.logs.read", "READ"),
     (
         "POST",
         "/v1/runs/{id}/steps/{step}/rerun",
@@ -152,7 +199,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     (
         "GET",
         "/v1/runs/{id}/steps/{step}/rerun-plan",
-        "read",
+        "run.read",
         "READ",
     ),
     (
@@ -168,21 +215,41 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "CJ-W",
     ),
     ("POST", "/v1/runs/{id}/cancel", "run.cancel", "EX"),
-    ("GET", "/v1/runs/{id}/artifacts", "read", "READ"),
-    ("GET", "/v1/runs/{id}/artifacts/{*name}", "read", "READ"),
-    ("GET", "/v1/runs/{id}/steps/{step}/logs", "read", "READ"),
-    ("GET", "/v1/runs/{id}/steps/{step}/logs/raw", "read", "READ"),
-    ("GET", "/v1/runs/{id}/services", "read", "READ"),
+    (
+        "GET",
+        "/v1/runs/{id}/artifacts",
+        "run.artifacts.read",
+        "READ",
+    ),
+    (
+        "GET",
+        "/v1/runs/{id}/artifacts/{*name}",
+        "run.artifacts.read",
+        "READ",
+    ),
+    (
+        "GET",
+        "/v1/runs/{id}/steps/{step}/logs",
+        "step.logs.read",
+        "READ",
+    ),
+    (
+        "GET",
+        "/v1/runs/{id}/steps/{step}/logs/raw",
+        "step.logs.read",
+        "READ",
+    ),
+    ("GET", "/v1/runs/{id}/services", "run.read", "READ"),
     (
         "GET",
         "/v1/runs/{id}/services/{service}/logs",
-        "read",
+        "step.logs.read",
         "READ",
     ),
     (
         "GET",
         "/v1/runs/{id}/services/{service}/logs/raw",
-        "read",
+        "step.logs.read",
         "READ",
     ),
     (
@@ -200,13 +267,13 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     (
         "GET",
         "/v1/runs/{id}/steps/{step}/workspace",
-        "read",
+        "step.workspace.read",
         "READ",
     ),
     (
         "GET",
         "/v1/runs/{id}/steps/{step}/workspace/file",
-        "read",
+        "step.workspace.read",
         "READ",
     ),
     (
@@ -227,18 +294,33 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "gate.release_external",
         "NG",
     ),
-    ("GET", "/v1/runs/{id}/steps/{step}/results", "read", "READ"),
+    (
+        "GET",
+        "/v1/runs/{id}/steps/{step}/results",
+        "run.read",
+        "READ",
+    ),
     (
         "POST",
         "/v1/runs/{id}/steps/{step}/results",
         "step.results_ingest",
         "NG",
     ),
-    ("GET", "/v1/runs/{id}/steps/{step}/consumed", "read", "READ"),
+    (
+        "GET",
+        "/v1/runs/{id}/steps/{step}/consumed",
+        "run.read",
+        "READ",
+    ),
     ("POST", "/v1/secrets", "secret.put", "CJ-W"),
-    ("GET", "/v1/secrets", "read", "READ"),
+    ("GET", "/v1/secrets", "secret.names.read", "READ"),
     ("DELETE", "/v1/secrets", "secret.delete", "CJ-W"),
-    ("GET", "/v1/repos/{org}/{repo}/environments", "read", "READ"),
+    (
+        "GET",
+        "/v1/repos/{org}/{repo}/environments",
+        "settings.read",
+        "READ",
+    ),
     (
         "PUT",
         "/v1/repos/{org}/{repo}/environments/{name}",
@@ -248,7 +330,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     (
         "GET",
         "/v1/repos/{org}/{repo}/environments/{name}",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
@@ -257,9 +339,24 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "environment.legacy_delete",
         "NG",
     ),
-    ("GET", "/v1/orgs/{org}/environments", "read", "READ"),
-    ("GET", "/v1/orgs/{org}/secrets/orphaned", "read", "READ"),
-    ("GET", "/v1/orgs/{org}/secrets/matrix", "read", "READ"),
+    (
+        "GET",
+        "/v1/orgs/{org}/environments",
+        "settings.read",
+        "READ",
+    ),
+    (
+        "GET",
+        "/v1/orgs/{org}/secrets/orphaned",
+        "secret.names.read",
+        "READ",
+    ),
+    (
+        "GET",
+        "/v1/orgs/{org}/secrets/matrix",
+        "secret.names.read",
+        "READ",
+    ),
     (
         "POST",
         "/v1/orgs/{org}/secrets/match",
@@ -272,7 +369,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "environment.put",
         "NG",
     ),
-    ("GET", "/v1/orgs/{org}/environments/{env}", "read", "READ"),
+    (
+        "GET",
+        "/v1/orgs/{org}/environments/{env}",
+        "settings.read",
+        "READ",
+    ),
     (
         "DELETE",
         "/v1/orgs/{org}/environments/{env}",
@@ -294,7 +396,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     (
         "GET",
         "/v1/orgs/{org}/environments/{env}/eligibility",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
@@ -306,13 +408,13 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     (
         "GET",
         "/v1/orgs/{org}/environments/{env}/protection",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
         "GET",
         "/v1/orgs/{org}/environments/{env}/projects",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
@@ -324,7 +426,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     (
         "GET",
         "/v1/orgs/{org}/environments/{env}/projects/{project}/overlay",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
@@ -342,7 +444,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     (
         "GET",
         "/v1/orgs/{org}/environments/{env}/projects/{project}/privilege-grant",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
@@ -353,9 +455,14 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ),
     // ADR-0075 §10: adding tightens; an edit or delete of an enforced Policy
     // loosens (the handler decides from the stored mode).
-    ("GET", "/v1/orgs/{org}/policies", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/policies", "settings.read", "READ"),
     ("POST", "/v1/orgs/{org}/policies", "policy.create", "EX"),
-    ("GET", "/v1/orgs/{org}/policies/{id}", "read", "READ"),
+    (
+        "GET",
+        "/v1/orgs/{org}/policies/{id}",
+        "settings.read",
+        "READ",
+    ),
     (
         "PUT",
         "/v1/orgs/{org}/policies/{id}",
@@ -371,13 +478,13 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     (
         "GET",
         "/v1/orgs/{org}/policies/{id}/versions",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
         "GET",
         "/v1/orgs/{org}/projects/{project}/policies",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
@@ -389,7 +496,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     (
         "GET",
         "/v1/orgs/{org}/projects/{project}/policies/{id}",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
@@ -407,7 +514,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     (
         "GET",
         "/v1/orgs/{org}/projects/{project}/policies/{id}/versions",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
@@ -423,30 +530,40 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "policy.replay",
         "NG",
     ),
-    ("GET", "/v1/orgs/{org}/policy-decisions", "read", "READ"),
+    (
+        "GET",
+        "/v1/orgs/{org}/policy-decisions",
+        "settings.read",
+        "READ",
+    ),
     (
         "GET",
         "/v1/orgs/{org}/policy-decisions/counts",
-        "read",
+        "settings.read",
         "READ",
     ),
-    ("GET", "/v1/policy-checkpoints", "read", "READ"),
-    ("GET", "/v1/runs/{id}/policy-decisions", "read", "READ"),
-    ("GET", "/v1/orgs/{org}/libraries", "read", "READ"),
+    ("GET", "/v1/policy-checkpoints", "settings.read", "READ"),
+    ("GET", "/v1/runs/{id}/policy-decisions", "run.read", "READ"),
+    ("GET", "/v1/orgs/{org}/libraries", "settings.read", "READ"),
     (
         "GET",
         "/v1/orgs/{org}/library-installations/{id}",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
         "GET",
         "/v1/orgs/{org}/library-yanks/{hash}/impact",
-        "read",
+        "settings.read",
         "READ",
     ),
-    ("GET", "/v1/runs/{id}/steps/{step}/origin", "read", "READ"),
-    ("GET", "/v1/runs/{id}/manifest", "read", "READ"),
+    (
+        "GET",
+        "/v1/runs/{id}/steps/{step}/origin",
+        "run.read",
+        "READ",
+    ),
+    ("GET", "/v1/runs/{id}/manifest", "run.read", "READ"),
     (
         "POST",
         "/v1/orgs/{org}/libraries/fetch",
@@ -485,16 +602,21 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "EX",
     ),
     ("POST", "/v1/orgs/{org}/plugin-fetch", "plugin.fetch", "NG"),
-    ("GET", "/v1/orgs/{org}/plugins", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/plugins", "settings.read", "READ"),
     // ADR-0076 §7: a plugin's open gate waits; the handler takes only its
     // scarab-api token, in its own org.
-    ("GET", "/v1/orgs/{org}/gates", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/gates", "run.read", "READ"),
     ("POST", "/v1/orgs/{org}/plugins", "plugin.install", "CJ-A"),
-    ("GET", "/v1/orgs/{org}/plugins/{name}", "read", "READ"),
+    (
+        "GET",
+        "/v1/orgs/{org}/plugins/{name}",
+        "settings.read",
+        "READ",
+    ),
     (
         "GET",
         "/v1/orgs/{org}/plugin-installations/{id}",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
@@ -542,13 +664,13 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     (
         "GET",
         "/v1/orgs/{org}/plugins/{name}/connections",
-        "read",
+        "settings.read",
         "READ",
     ),
     (
         "GET",
         "/v1/orgs/{org}/plugins/{name}/broker-journal",
-        "read",
+        "security.read",
         "READ",
     ),
     (
@@ -563,7 +685,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "plugin_connection.delete",
         "EX",
     ),
-    ("GET", "/v1/connections", "read", "READ"),
+    ("GET", "/v1/connections", "settings.read", "READ"),
     ("POST", "/v1/connections", "connection.create", "CJ-W"),
     (
         "DELETE",
@@ -583,15 +705,20 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "connection.resync",
         "CJ-W",
     ),
-    ("GET", "/v1/connections/{id}/preflight", "read", "READ"),
-    ("GET", "/v1/forges/github/app", "read", "READ"),
+    (
+        "GET",
+        "/v1/connections/{id}/preflight",
+        "settings.read",
+        "READ",
+    ),
+    ("GET", "/v1/forges/github/app", "settings.read", "READ"),
     (
         "GET",
         "/v1/connections/{id}/available-repos",
-        "read",
+        "settings.read",
         "READ",
     ),
-    ("GET", "/v1/orgs/{org}/repos", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/repos", "repo.read", "READ"),
     (
         "POST",
         "/v1/connections/{id}/repos",
@@ -613,7 +740,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     (
         "GET",
         "/v1/repos/{org}/{repo}/secrets/matrix",
-        "read",
+        "secret.names.read",
         "READ",
     ),
     (
@@ -628,12 +755,17 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "secret_matrix.unsilence",
         "NG",
     ),
-    ("GET", "/v1/repos/{org}/{repo}/refs", "read", "READ"),
-    ("GET", "/v1/repos/{org}/{repo}/pipelines", "read", "READ"),
+    ("GET", "/v1/repos/{org}/{repo}/refs", "repo.read", "READ"),
+    (
+        "GET",
+        "/v1/repos/{org}/{repo}/pipelines",
+        "repo.read",
+        "READ",
+    ),
     (
         "GET",
         "/v1/repos/{org}/{repo}/pipelines/{name}/interface",
-        "read",
+        "repo.read",
         "READ",
     ),
     (
@@ -677,8 +809,9 @@ fn the_route_table_is_exactly_the_reviewed_classification() {
         a.len(),
         "a (method, path) is registered twice"
     );
-    // Every mutating route names a non-READ op; every GET is READ but the
-    // debug shell's WebSocket upgrades (git-bug 606102b).
+    // Every mutating route names a non-read op; every GET names a read op
+    // (ADR-0086 §5) but the debug shell's WebSocket upgrades (git-bug
+    // 606102b).
     const GOVERNED_GETS: [&str; 2] = [
         "/v1/runs/{id}/steps/{step}/attach",
         "/v1/runs/{id}/steps/{step}/debug-pod",

@@ -813,6 +813,7 @@ async fn two_of_three_baseline_approvers_release_the_gate() {
         &run,
         &StepId("approve".into()),
         "carol",
+        None,
     )
     .await
     .unwrap();
@@ -942,6 +943,7 @@ async fn two_racing_approvals_are_both_recorded_and_release_once() {
                 &run,
                 &StepId("approve".into()),
                 "carol",
+                None,
             )
             .await
             .unwrap();
