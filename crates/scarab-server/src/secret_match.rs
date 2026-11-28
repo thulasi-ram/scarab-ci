@@ -399,7 +399,7 @@ fn check_turn(subject: &str, org: &str) -> &'static tokio::sync::Mutex<()> {
 
 /// The 403 for an API token or a session presented as Bearer, if the caller
 /// is one: leak checks and their limits are for a person in a browser.
-fn refuse_unless_browser(caller: &crate::Caller, what: &str) -> Option<Response> {
+pub(crate) fn refuse_unless_browser(caller: &crate::Caller, what: &str) -> Option<Response> {
     if caller.grant.is_none() && caller.via != Some(crate::AuthVia::Bearer) {
         return None;
     }

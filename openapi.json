@@ -28,6 +28,71 @@
         "security": []
       }
     },
+    "/.well-known/oauth-authorization-server": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "OAuth authorization server metadata for plugin endpoints",
+        "operationId": "authorization_server_metadata",
+        "responses": {
+          "200": {
+            "description": "the metadata (RFC 8414)"
+          },
+          "404": {
+            "description": "the OAuth authorization server is off"
+          }
+        },
+        "security": []
+      }
+    },
+    "/.well-known/oauth-protected-resource/v1/orgs/{org}/plugin-installations/{id}/endpoints/{endpoint_path}": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "OAuth protected resource metadata of a plugin endpoint",
+        "operationId": "protected_resource_metadata",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the installation's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_path",
+            "in": "path",
+            "description": "a path the installation registers",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the metadata (RFC 9728)"
+          },
+          "404": {
+            "description": "no such endpoint, or the OAuth authorization server is off"
+          }
+        },
+        "security": []
+      }
+    },
     "/.well-known/openid-configuration": {
       "get": {
         "tags": [
@@ -89,6 +154,30 @@
         "responses": {
           "200": {
             "description": "Prometheus text exposition"
+          }
+        },
+        "security": []
+      }
+    },
+    "/oauth/token": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "OAuth token endpoint for plugin endpoints",
+        "operationId": "token",
+        "responses": {
+          "200": {
+            "description": "an access token, its lifetime and the next refresh secret"
+          },
+          "400": {
+            "description": "an OAuth error (RFC 6749 §5.2)"
+          },
+          "404": {
+            "description": "the OAuth authorization server is off"
+          },
+          "503": {
+            "description": "`temporarily_unavailable`: the plugin endpoint is not running, or the store could not be read; the grant stays"
           }
         },
         "security": []
@@ -951,6 +1040,70 @@
         ]
       }
     },
+    "/v1/me/connected-apps": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Your connected apps (OAuth grants)",
+        "operationId": "list_connected_apps",
+        "responses": {
+          "200": {
+            "description": "your connected apps, newest first"
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "404": {
+            "description": "the OAuth authorization server is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/connected-apps/{id}": {
+      "delete": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Disconnect one of your connected apps",
+        "operationId": "revoke_connected_app",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the connected app's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "disconnected"
+          },
+          "404": {
+            "description": "no such connected app of yours, already disconnected, or the OAuth authorization server is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/me/identities/link": {
       "post": {
         "tags": [
@@ -1647,6 +1800,84 @@
           },
           "404": {
             "description": "no such live token of yours"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/oauth/authorization-requests": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Check an OAuth authorization request and describe it for consent",
+        "operationId": "describe_authorization_request",
+        "responses": {
+          "200": {
+            "description": "what the consent page shows"
+          },
+          "400": {
+            "description": "a request that is not one this server takes"
+          },
+          "403": {
+            "description": "not a person in a browser, or a client host the org does not allow"
+          },
+          "404": {
+            "description": "no role in the org, no such endpoint, or the OAuth authorization server is off"
+          },
+          "503": {
+            "description": "the plugin installation is killed, held or its publisher delisted"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/oauth/consent": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Consent to an OAuth authorization request (passkey every time)",
+        "operationId": "consent",
+        "responses": {
+          "200": {
+            "description": "where to send the browser: the client's redirect URI with the code"
+          },
+          "400": {
+            "description": "an operation the request does not offer, or a request this server does not take"
+          },
+          "403": {
+            "description": "not a person in a browser, or no confirmation — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no role in the org, no such endpoint, or the OAuth authorization server is off"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting"
+          },
+          "503": {
+            "description": "the plugin installation is killed, held or its publisher delisted"
           }
         },
         "security": [
@@ -3680,6 +3911,152 @@
         ]
       }
     },
+    "/v1/orgs/{org}/oauth/client-metadata-hosts": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Hosts OAuth client metadata documents may be read from",
+        "operationId": "list_client_metadata_hosts",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the hosts, by name"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "the OAuth authorization server is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/oauth/client-metadata-hosts/{host}": {
+      "put": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Allow a host to serve OAuth client metadata documents",
+        "operationId": "put_client_metadata_host",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "host",
+            "in": "path",
+            "description": "a lowercase DNS name, e.g. `claude.ai`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "allowed"
+          },
+          "400": {
+            "description": "not a lowercase DNS name"
+          },
+          "403": {
+            "description": "not an org admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "the OAuth authorization server is off"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Stop allowing a host to serve OAuth client metadata documents",
+        "operationId": "delete_client_metadata_host",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "host",
+            "in": "path",
+            "description": "the host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "removed; its clients' grants and tokens are revoked"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "not listed, or the OAuth authorization server is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/plugin-fetch": {
       "post": {
         "tags": [
@@ -3782,6 +4159,81 @@
           },
           "404": {
             "description": "no installation with this id in the org, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugin-installations/{id}/endpoints/{endpoint_path}": {
+      "post": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Call a plugin's endpoint as yourself, with an OAuth token granted for it",
+        "operationId": "plugin_endpoint",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the installation's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_path",
+            "in": "path",
+            "description": "a path the installation's manifest registers",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the plugin's answer, passed on as data"
+          },
+          "400": {
+            "description": "a body that is not JSON, repeats a key, or matches no operation or more than one"
+          },
+          "401": {
+            "description": "no OAuth token for this endpoint, or one that is not usable here; `WWW-Authenticate` names the protected resource metadata"
+          },
+          "404": {
+            "description": "no such installation or endpoint in this org, or the OAuth authorization server is off"
+          },
+          "413": {
+            "description": "the body is too large"
+          },
+          "415": {
+            "description": "not `application/json`, or a `Content-Encoding`"
+          },
+          "429": {
+            "description": "the caller or the installation is at its request limit"
+          },
+          "502": {
+            "description": "the plugin could not be reached, or answered with something the endpoint does not pass on"
+          },
+          "503": {
+            "description": "the installation is killed, held by the plugin runtime, or its publisher is no longer trusted"
           }
         },
         "security": [
@@ -6341,6 +6793,125 @@
         ]
       }
     },
+    "/v1/orgs/{org}/security/fork-run-approval": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "An org's Fork Run approval setting",
+        "operationId": "get_fork_run_approval",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForkRunApprovalDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a reserved org (plain text)"
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "403": {
+            "description": "not a member of the org"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Change an org's Fork Run approval setting (admin; always-ask step-up to loosen it)",
+        "operationId": "put_fork_run_approval",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForkRunApprovalUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForkRunApprovalDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a body that is not `{\"setting\": \"off\" | \"agent_started\" | \"all\"}`, or a reserved org (plain text)"
+          },
+          "403": {
+            "description": "`browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an admin of the org; or `step_up_required` (mode `action`) for a change that gates fewer Runs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "the setting cannot be stored on this server"
+          },
+          "409": {
+            "description": "another admin changed the setting since this request read it (plain text): reload and choose again"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/security/leak-checks": {
       "get": {
         "tags": [
@@ -7897,7 +8468,7 @@
           "Runs"
         ],
         "summary": "Approve a `manual` gate. The authenticated principal's\napproval is recorded on the event log (append-only, idempotent).",
-        "description": "An **Environment approval gate** (a Step after it uses the\nRun's Environment's authority) releases only once the accumulated\napprovals satisfy the Environment's effective rules for the run's Project\n(`admits`) and its wait timer has run out on the gate's wait\nclock. Approvals that complete the rules early are kept: the gate is\nreleased by the scheduler when the timer runs out. On release the\ndeployment is written to the legacy history. Every other `manual` gate is\na plain gate: it releases on the first approval, with no step-up. If the\nEnvironment no longer exists or no longer admits the Project, no gate of\nthe Run releases (409). Authz'd as a write.",
+        "description": "An **Environment approval gate** (a Step after it uses the\nRun's Environment's authority) releases only once the accumulated\napprovals satisfy the Environment's effective rules for the run's Project\n(`admits`) and its wait timer has run out on the gate's wait\nclock. Approvals that complete the rules early are kept: the gate is\nreleased by the scheduler when the timer runs out. On release the\ndeployment is written to the legacy history. Every other `manual` gate is\na plain gate: it releases on the first approval, with no step-up. An API\ntoken never approves a gate by itself: its approval of any gate, a plain\none included, raises a StepUpConfirmationRequest its owner confirms. If the\nEnvironment no longer exists or no longer admits the Project, no gate of\nthe Run releases (409). Authz'd as a write.",
         "operationId": "approve_gate",
         "parameters": [
           {
@@ -9891,7 +10462,8 @@
           "created_by",
           "created_at",
           "expires_at",
-          "use_count"
+          "use_count",
+          "kind"
         ],
         "properties": {
           "created_at": {
@@ -9911,6 +10483,10 @@
           "id": {
             "type": "string"
           },
+          "kind": {
+            "type": "string",
+            "description": "`issued`: a token a person minted (an API token)."
+          },
           "last_used_at": {
             "type": [
               "integer",
@@ -9921,6 +10497,16 @@
           },
           "name": {
             "type": "string"
+          },
+          "operations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The ApiOperations it may use. `None`: every operation its role and\nscope allow."
           },
           "org": {
             "type": "string"
@@ -11689,6 +12275,47 @@
           }
         }
       },
+      "ForkRunApprovalDto": {
+        "type": "object",
+        "description": "An org's Fork Run approval setting: `GET` and `PUT`\n`/v1/orgs/{org}/security/fork-run-approval`.",
+        "required": [
+          "setting",
+          "can_change"
+        ],
+        "properties": {
+          "can_change": {
+            "type": "boolean",
+            "description": "The caller may change the setting: an admin of the org, in a\nsigned-in browser."
+          },
+          "setting": {
+            "$ref": "#/components/schemas/ForkRunApprovalSettingDto",
+            "description": "Which Runs of fork code wait at a `manual` gate before any of their\nSteps starts, until someone with write on the repository releases it."
+          }
+        }
+      },
+      "ForkRunApprovalSettingDto": {
+        "type": "string",
+        "description": "Which Runs of fork code wait at the Fork Run approval gate.",
+        "enum": [
+          "off",
+          "agent_started",
+          "all"
+        ]
+      },
+      "ForkRunApprovalUpdate": {
+        "type": "object",
+        "description": "`PUT /v1/orgs/{org}/security/fork-run-approval` body.",
+        "required": [
+          "setting"
+        ],
+        "properties": {
+          "setting": {
+            "$ref": "#/components/schemas/ForkRunApprovalSettingDto",
+            "description": "The new setting. One that gates fewer Runs than the current one asks\nfor a passkey confirmation."
+          }
+        },
+        "additionalProperties": false
+      },
       "GateApprovalDto": {
         "type": "object",
         "description": "The answer to a gate approval.",
@@ -12413,7 +13040,8 @@
           "read_rules",
           "config_keys",
           "gates",
-          "image"
+          "image",
+          "endpoint_operations"
         ],
         "properties": {
           "auth_schemes": {
@@ -12429,6 +13057,10 @@
           "connections": {
             "$ref": "#/components/schemas/ManifestDiffGroupDto",
             "description": "Connection slot names."
+          },
+          "endpoint_operations": {
+            "$ref": "#/components/schemas/ManifestDiffGroupDto",
+            "description": "Endpoint operations by `<path>/<operation>`, each compared as its\nwhole definition; one that changed is both removed and added."
           },
           "gates": {
             "$ref": "#/components/schemas/ManifestDiffGroupDto",
@@ -12679,6 +13311,16 @@
             "type": "string",
             "description": "Human label — what makes the token revocable in practice."
           },
+          "operations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The ApiOperations the token may use; absent for every operation its\nrole and scope allow. See [`MintTokenRequest::operations`]."
+          },
           "org": {
             "type": "string",
             "description": "The org the token is scoped to (or the org of its project)."
@@ -12714,6 +13356,16 @@
           "name": {
             "type": "string",
             "description": "Human label — what makes the token revocable in practice. \"demo\nkeepalive\", \"amy's laptop\"."
+          },
+          "operations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The ApiOperations the token may use (`run.read`, `step.logs.read`,\n`repo.dispatch`, …). Absent: every operation its role and scope\nallow. Present: every other request is refused. At least one, each\nan operation an API token can perform."
           },
           "project": {
             "type": [
@@ -13461,7 +14113,8 @@
           "target",
           "cascade",
           "regenerate",
-          "regenerate_cascade"
+          "regenerate_cascade",
+          "fork_run_approval"
         ]
       },
       "PlannedStepDto": {
@@ -13827,7 +14480,8 @@
           "capabilities",
           "connections",
           "config_keys",
-          "gates"
+          "gates",
+          "endpoint_operations"
         ],
         "properties": {
           "capabilities": {
@@ -13848,6 +14502,13 @@
               "$ref": "#/components/schemas/ConnectionSlotDto"
             }
           },
+          "endpoint_operations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Each request its endpoints take, one line each: `<path>/<operation>:\n<method> <JSON checks>; may <operations>; writes <n>`. Empty when it\nregisters no endpoint."
+          },
           "gates": {
             "type": "array",
             "items": {
@@ -13864,6 +14525,13 @@
           },
           "plugin": {
             "type": "string"
+          },
+          "trust_tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`trusted_service` when the plugin registers an endpoint: it acts for\nmany callers, and runs only from a publisher the operator lists.\nAbsent otherwise."
           }
         }
       },
@@ -16154,7 +16822,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`, `binding.operator_grant`,\n`secret.match_checked`, `secret.match_limits_changed`."
+            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`, `binding.operator_grant`,\n`secret.match_checked`, `secret.match_limits_changed`,\n`fork_run_approval.changed`."
           },
           "op": {
             "type": [

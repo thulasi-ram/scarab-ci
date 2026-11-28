@@ -852,6 +852,18 @@ pub trait Db: Send + Sync {
     /// The run's Headline, if stamped.
     async fn run_trigger_title(&self, run: &RunId) -> Result<Option<String>, DbError>;
 
+    /// Stamp how the Run's start arrived when a PrincipalToken made it
+    /// (ADR-0086 §6): the dispatch or inline creation's DelegationTrail. Set
+    /// once at creation; a Run started from a session or by the forge has none.
+    async fn set_run_origin_via(
+        &self,
+        run: &RunId,
+        via: &crate::DelegationTrail,
+    ) -> Result<(), DbError>;
+
+    /// The DelegationTrail the Run's start recorded, if any.
+    async fn run_origin_via(&self, run: &RunId) -> Result<Option<crate::DelegationTrail>, DbError>;
+
     /// Record one keyed-cache save (ADR-0065 s1): upsert the `(project, key,
     /// dir) → tree_root` mapping, refreshing `saved_at` and the provenance on
     /// conflict. **Advisory only**: under replica-local warm + eviction a row
@@ -1102,6 +1114,23 @@ pub trait Db: Send + Sync {
 
     /// The run's append-only event log, in append order (the SSE tail source).
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError>;
+
+    /// The first [`EventPayload::Raw`](crate::EventPayload::Raw) event of the
+    /// run whose value holds a `trigger.event` object: the trigger context
+    /// Run creation records, `{ "trigger": { "event": … }, "actor": … }`.
+    /// `None` when the run recorded none. A launch reads it for every Step,
+    /// so a store should read only up to that event, not the whole log; this
+    /// default reads the whole log.
+    async fn run_trigger_record(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError> {
+        Ok(self
+            .events(run)
+            .await?
+            .into_iter()
+            .find_map(|e| match e.kind {
+                crate::EventPayload::Raw(v) if v["trigger"]["event"].is_object() => Some(v),
+                _ => None,
+            }))
+    }
 
     /// Append one row to `stream`'s index, fenced on `writer` (I3): the
     /// lease of `writer.lease`'s kind **for this stream**, whose resource the

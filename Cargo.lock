@@ -2956,6 +2956,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarab-plugin-mcp"
+version = "0.8.4"
+dependencies = [
+ "axum",
+ "reqwest",
+ "scarab-plugin",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "scarab-policy"
 version = "0.8.4"
 dependencies = [

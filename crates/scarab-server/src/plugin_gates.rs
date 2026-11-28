@@ -69,6 +69,25 @@ pub(crate) async fn authenticate(
     st: &AppState,
     headers: &HeaderMap,
 ) -> Result<PluginInstallation, ApiError> {
+    let installation = api_token_installation(st, headers).await?;
+    if !installation.manifest.has(PluginCapability::ResolveGates) {
+        return Err(ApiError::Denied(format!(
+            "plugin installation `{}` was not approved to resolve gates",
+            installation.name
+        )));
+    }
+    Ok(installation)
+}
+
+/// The installation a `scarab-api` token proves, read from the store on
+/// this request and enabled. 401 for a token that proves nothing (or with
+/// no verifier wired); 403 for a killed installation. What it may do is the
+/// caller's check: the gate API asks for `resolve_gates`, PluginApi for an
+/// endpoint registration and a DelegatedCallerHandle.
+pub(crate) async fn api_token_installation(
+    st: &AppState,
+    headers: &HeaderMap,
+) -> Result<PluginInstallation, ApiError> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -98,12 +117,6 @@ pub(crate) async fn authenticate(
     if installation.state == InstallationState::Killed {
         return Err(ApiError::Denied(format!(
             "plugin installation `{}` is killed (ADR-0072 §10)",
-            installation.name
-        )));
-    }
-    if !installation.manifest.has(PluginCapability::ResolveGates) {
-        return Err(ApiError::Denied(format!(
-            "plugin installation `{}` was not approved to resolve gates",
             installation.name
         )));
     }

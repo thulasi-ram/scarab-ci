@@ -13,8 +13,10 @@
 //! - **Exempt** — tightening: never a step-up.
 //! - **NotGoverned** — not on ADR-0073 §3's list, with the reason.
 //!
-//! Every GET is [`READ`], except the debug shell ([`STEP_ATTACH`],
-//! [`STEP_DEBUG_POD`]): a WebSocket upgrade that opens a shell in a step Pod.
+//! Every GET is a [`Class::Read`] operation named by the data it exposes
+//! ([`RUN_READ`], [`STEP_LOGS_READ`], …), except the debug shell
+//! ([`STEP_ATTACH`], [`STEP_DEBUG_POD`]): a WebSocket upgrade that opens a
+//! shell in a step Pod.
 
 use scarab_identity::Role;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -97,6 +99,10 @@ pub enum OrgOf {
     Body(&'static str),
     /// A query parameter.
     Query(&'static str),
+    /// The org of the plugin endpoint whose canonical URL is the string at
+    /// this JSON pointer into the body (an OAuth `resource`); none when it is
+    /// not such a URL.
+    Resource(&'static str),
     /// The tenant of the run named by the `id` path parameter.
     Run,
     /// The Org of the forge connection named by the `id` path parameter
@@ -308,6 +314,53 @@ pub fn by_id(id: &str) -> Option<&'static Op> {
         .iter()
         .map(|e| e.op)
         .find(|op| op.id == id)
+}
+
+/// The only ApiOperations a Plugin's DelegatedCallerHandle may ever use
+/// (ADR-0086 §4): a closed list, so a new route is not delegable until it is
+/// added here on purpose. Reads of Runs, Steps, logs, workspaces, artifacts
+/// and repositories, and the Run writes an agent may make for its caller.
+/// Settings, access, security, account, Policy, Environment, token, plugin
+/// and library operations, an inline `run.create`, and the snapshot pin are
+/// not on it.
+pub const DELEGABLE_OPERATIONS: [&str; 10] = [
+    "repo.read",
+    "run.read",
+    "step.logs.read",
+    "step.workspace.read",
+    "run.artifacts.read",
+    "repo.dispatch",
+    "step.rerun",
+    "step.retry",
+    "run.cancel",
+    "gate.reject",
+];
+
+/// May a Plugin's DelegatedCallerHandle use `op` (ADR-0086 §4)? `Err`
+/// says why not. Only an operation on [`DELEGABLE_OPERATIONS`]; and, as a
+/// second guard should the list ever name one, never an operation that can
+/// need a step-up (a delegated call never raises or satisfies one, so
+/// `gate.approve` is never delegable), a passkey ceremony, or a browser-only
+/// or not-by-token operation. A manifest whose endpoint `may` names any
+/// other is refused at fetch, install and upgrade, and PluginApi serves no
+/// route of one.
+pub fn delegable(op: &Op) -> Result<(), &'static str> {
+    if !DELEGABLE_OPERATIONS.contains(&op.id) {
+        return Err("it is not one of the operations a plugin may use for its caller");
+    }
+    match op.class {
+        Class::CrownJewel(_) | Class::Conditional { .. } => {
+            return Err("it can need a step-up, which a delegated call never raises or satisfies")
+        }
+        Class::Ceremony => return Err("it is a passkey ceremony"),
+        Class::Read | Class::Exempt(_) | Class::NotGoverned(_) => {}
+    }
+    match op.machine {
+        StepUpMachineUse::BrowserOnly => return Err("only a person in a browser may do it"),
+        StepUpMachineUse::NotByToken => return Err("a token may never do it"),
+        StepUpMachineUse::Requestable => {}
+    }
+    Ok(())
 }
 
 /// [`Op::max_request_body`] unless an operation says otherwise.
@@ -692,17 +745,63 @@ const W: Mode = Mode::Window;
 const A: Mode = Mode::AlwaysAsk;
 
 // --- reads ------------------------------------------------------------------
+//
+// ADR-0086 §5: every GET names the ApiOperation of the data it exposes. The
+// ids are a public contract: a token's operation list, and later OAuth
+// consent and a Plugin endpoint's `may`, name them. Renaming one breaks
+// every token that lists it.
 
-/// Every GET route.
-pub static READ: Op = op(
-    "read",
-    "Read",
-    Class::Read,
-    "reads are never governed",
-    ANYONE,
-    OrgOf::None,
-    &[],
-    &[],
+/// A read operation: never governed by step-up.
+const fn read(id: &'static str, label: &'static str) -> Op {
+    op(
+        id,
+        label,
+        Class::Read,
+        "reads are never governed; ADR-0086 §5 names each by the data it exposes",
+        ANYONE,
+        OrgOf::None,
+        &[],
+        &[],
+    )
+}
+
+/// Health, version, metrics, the OpenAPI document and sign-in settings:
+/// the routes that need no Principal.
+pub static SERVER_READ: Op = read(
+    "server.read",
+    "Read the server's health, version and sign-in settings",
+);
+/// The caller's own account: profile, identities, passkeys, own tokens, own
+/// security events and the StepUpConfirmationRequests it raised.
+pub static ACCOUNT_READ: Op = read("account.read", "Read your own account");
+/// Repositories, their refs, Pipelines with their typed inputs, and
+/// schedules.
+pub static REPO_READ: Op = read(
+    "repo.read",
+    "Read repositories, refs, Pipelines and schedules",
+);
+/// Runs and Steps: status, events, the step graph, results, what an Attempt
+/// consumed, refused deliveries, pending gate waits and a Run's Policy
+/// decisions.
+pub static RUN_READ: Op = read("run.read", "Read Runs and Steps");
+/// The logs of Steps and of their service containers.
+pub static STEP_LOGS_READ: Op = read("step.logs.read", "Read Step logs");
+/// A Step's workspace files.
+pub static STEP_WORKSPACE_READ: Op = read("step.workspace.read", "Read a Step's workspace files");
+/// A Run's artifacts: the list and the files.
+pub static RUN_ARTIFACTS_READ: Op = read("run.artifacts.read", "Read a Run's artifacts");
+/// Role bindings, members, Principal search and the org's API tokens.
+pub static ACCESS_READ: Op = read("access.read", "Read role bindings, members and API tokens");
+/// Security events, their summary, leak check limits and a plugin's broker
+/// journal.
+pub static SECURITY_READ: Op = read("security.read", "Read security events");
+/// Secret names and where each is set. Never a value: no route returns one.
+pub static SECRET_NAMES_READ: Op = read("secret.names.read", "Read secret names");
+/// Environments, Policies and their decisions, libraries, plugins, forge
+/// connections and the org's Fork Run approval setting.
+pub static SETTINGS_READ: Op = read(
+    "settings.read",
+    "Read Environments, Policies, libraries, plugins and connections",
 );
 
 // --- not governed -----------------------------------------------------------
@@ -1101,6 +1200,26 @@ pub static LEAK_CHECK_LIMITS_PUT: Op = op(
     &["path:org"],
 )
 .browser_only();
+pub static FORK_RUN_APPROVAL_PUT: Op = op(
+    "fork_run_approval.put",
+    "Change the org's Fork Run approval setting",
+    // A change that gates fewer Runs of fork code (`all` → `agent_started`,
+    // `all` → `off`, `agent_started` → `off`) asks for a passkey
+    // confirmation of its own. One that gates more, or a request that
+    // changes nothing, is exempt.
+    Class::Conditional {
+        mode: A,
+        rule: "the new setting gates fewer Runs of fork code",
+    },
+    "ADR-0086 §9: loosening the setting needs a step-up",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org"],
+)
+// Only a human in a browser: no API token, Bearer session or app acting
+// for someone may change it, so no request is raised for a machine.
+.browser_only();
 pub static ENVIRONMENT_DELETE: Op = op(
     "environment.delete",
     "Delete an Environment",
@@ -1262,6 +1381,88 @@ pub static TOKEN_MINT_OWN: Op = op(
     &["body:/org", "body:/project", "body:/name"],
 )
 .not_by_token();
+// The endpoint extension point (ADR-0086 §1): a caller's own `oauth` token
+// for that endpoint authenticates it, never a session or an issued token.
+pub static PLUGIN_ENDPOINT: Op = op(
+    "plugin.endpoint",
+    "Call a plugin's endpoint",
+    Class::NotGoverned(
+        "the caller's oauth token for this endpoint is the authority, held to the operations \
+         it was granted; nothing it does can raise or satisfy a step-up",
+    ),
+    "ADR-0086 §1-§2",
+    ANYONE,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:id", "path:endpoint_path"],
+);
+// The OAuth authorization server (ADR-0086 §7).
+pub static OAUTH_AUTHORIZATION_REQUEST: Op = op(
+    "oauth.authorization_request",
+    "Check an OAuth authorization request",
+    Class::NotGoverned("reads the client's metadata and describes the request; grants nothing"),
+    "ADR-0086 §7",
+    ANYONE,
+    OrgOf::None,
+    &[],
+    &["body:/client_id", "body:/resource"],
+)
+.browser_only();
+// Every consent asks for a passkey of its own, bound to this client, this
+// endpoint and these operations (the digest covers the whole body).
+pub static OAUTH_CONSENT: Op = op(
+    "oauth.consent",
+    "Connect an app to a plugin endpoint",
+    Class::CrownJewel(A),
+    "ADR-0086 §7: granting a token is a crown jewel, as minting one is",
+    VIEWER,
+    OrgOf::Resource("/resource"),
+    &[],
+    &["body:/client_id", "body:/resource"],
+)
+.browser_only();
+pub static OAUTH_TOKEN: Op = op(
+    "oauth.token",
+    "Exchange an OAuth code or refresh secret",
+    Class::NotGoverned("the code verifier or the refresh secret is the credential; a machine call"),
+    "ADR-0086 §7",
+    ANYONE,
+    OrgOf::None,
+    &["/code", "/code_verifier", "/refresh_token"],
+    &[],
+);
+pub static OAUTH_GRANT_REVOKE_OWN: Op = op(
+    "oauth.grant.revoke_own",
+    "Disconnect one of your connected apps",
+    Class::Exempt("revocation tightens"),
+    "ADR-0086 §7",
+    ANYONE,
+    OrgOf::None,
+    &[],
+    &["path:id"],
+)
+// Its handler checks ownership only, so it refuses a token.
+.not_by_token();
+pub static OAUTH_CLIENT_METADATA_HOST_ADD: Op = op(
+    "oauth.client_metadata_host.add",
+    "Allow a host to serve OAuth client metadata",
+    Class::CrownJewel(W),
+    "ADR-0086 §7: adding a host loosens",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:host"],
+);
+pub static OAUTH_CLIENT_METADATA_HOST_REMOVE: Op = op(
+    "oauth.client_metadata_host.remove",
+    "Stop allowing a host to serve OAuth client metadata",
+    Class::Exempt("removing a host tightens"),
+    "ADR-0086 §7",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:host"],
+);
 pub static PLUGIN_FETCH: Op = op(
     "plugin.fetch",
     "Fetch a plugin manifest to review",
@@ -1343,9 +1544,10 @@ pub static GATE_APPROVE: Op = op(
     "Approve a gate",
     Class::Conditional {
         mode: W,
-        rule: "the run's Environment has approvers",
+        rule: "the run's Environment has approvers, or an API token approves (any gate)",
     },
-    "§3 approvals on Gates of Environments with approvers",
+    "§3 approvals on Gates of Environments with approvers; ADR-0086 §6: a token never \
+     approves a gate by itself",
     MEMBER,
     OrgOf::Run,
     &[],
@@ -1743,8 +1945,11 @@ mod tests {
         assert_eq!(
             browser_only,
             vec![
+                "fork_run_approval.put",
                 "identity.link",
                 "identity.unlink",
+                "oauth.authorization_request",
+                "oauth.consent",
                 "passkey.add",
                 "secret.match",
                 "secret.match_limits",
@@ -1770,6 +1975,7 @@ mod tests {
             not_by_token,
             vec![
                 "connection.assign_org",
+                "oauth.grant.revoke_own",
                 "token.mint",
                 "token.mint_own",
                 "token.revoke_own"
@@ -1863,13 +2069,13 @@ mod tests {
     #[test]
     fn long_values_are_cut_on_a_char_boundary() {
         let body = json!({"x": "é".repeat(300)});
-        let s = describe_generic(&READ, &input(body));
+        let s = describe_generic(&RUN_READ, &input(body));
         assert!(s.changes[0].contains('…'), "{:?}", s.changes);
         assert!(s.changes[0].ends_with("(600 bytes)"), "{:?}", s.changes);
     }
 
     fn changes(body: Value) -> Vec<String> {
-        describe_generic(&READ, &input(body)).changes
+        describe_generic(&RUN_READ, &input(body)).changes
     }
 
     #[test]

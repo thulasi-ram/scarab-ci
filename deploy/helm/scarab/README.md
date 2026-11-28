@@ -231,6 +231,71 @@ separate durable state, registered by the App's `installation` /
 `installation_repositories` webhook deliveries (or, for the local dogfood stack,
 the signed synthetic `installation` event `just stack up dogfood` sends). A fresh database still needs one delivery.
 
+## The OIDC issuer for step tokens (`scarab.oidcIssuer`, ADR-0015)
+
+With `scarab.oidcIssuer` set, the server signs a token for each Attempt of a
+step and mounts it in the step Pod at `/scarab/oidc/token`. Which Steps get
+one, the subject a cloud matches, and how to publish the issuer's documents as
+static files while the server stays private, are on the docs page "Step OIDC
+tokens". A cloud that trusts the issuer verifies the token against
+the keys at `<issuer>/.well-known/jwks.json`. The server signs with the PKCS#8
+RSA private key at `SCARAB_OIDC_SIGNING_KEY_FILE`, and does not start without
+it. Mount the key from your own Secret through `extraVolumes` and
+`extraVolumeMounts`, and set the variable through `scarab.extraEnv`:
+
+```sh
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out oidc-a.pem
+kubectl -n scarab create secret generic scarab-oidc --from-file=oidc.pem=./oidc-a.pem
+```
+
+```yaml
+scarab:
+  oidcIssuer: https://scarab.example.com
+  extraEnv:
+    SCARAB_OIDC_SIGNING_KEY_FILE: /etc/scarab/oidc/oidc.pem
+extraVolumes:
+  - name: oidc-key
+    secret:
+      secretName: scarab-oidc
+extraVolumeMounts:
+  - name: oidc-key
+    mountPath: /etc/scarab/oidc
+    readOnly: true
+```
+
+Each key in the JWKS has the RFC 7638 thumbprint of the public key (SHA-256,
+base64url) as its `kid`, so its `kid` changes only when the key does.
+
+### Changing the signing key
+
+The JWKS lists the signing key's public half and every key in
+`scarab.oidcPublicKeys`, each once. A cloud accepts a token only when the JWKS
+it last fetched holds the key that signed it, and clouds keep a fetched JWKS for
+a while. So publish the next key before any server signs with it, and keep the
+old one published until its last token has expired. Get a key's public half
+with:
+
+```sh
+openssl pkey -in oidc-b.pem -pubout -out oidc-b.pub.pem
+```
+
+1. **Publish the next key.** Add the public half of the next key (`oidc-b`) to
+   `scarab.oidcPublicKeys` and upgrade. Every server still signs with `oidc-a`;
+   every JWKS now lists both keys. Wait until each cloud that trusts the issuer
+   has fetched the JWKS again.
+2. **Sign with the next key.** Point the Secret at `oidc-b.pem`, set
+   `scarab.oidcPublicKeys` to the public halves of both `oidc-a` and `oidc-b`,
+   and upgrade. The change to `scarab.oidcPublicKeys` rolls the server Pods, so
+   each one reads the new signing key at boot. While old and new Pods run side
+   by side, a token from either verifies.
+3. **Drop the old key.** Once the last token `oidc-a` signed has expired (a
+   step token lives at most `scarab.oidcTokenMaxTtlSecs`, one hour by
+   default), remove `oidc-a` from `scarab.oidcPublicKeys` and upgrade.
+
+The server never signs with a key in `scarab.oidcPublicKeys`, and refuses to
+start when an entry is not a `-----BEGIN PUBLIC KEY-----` block holding an RSA
+key of at least 2048 bits. The signing key must be at least 2048 bits too.
+
 ## Declarative connections (`scarab.connections`, ADR-0060 part D)
 
 A forge connection can be **declared in config** instead of created through the
@@ -562,6 +627,111 @@ the old count until the release is upgraded.
 The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
+
+### Upgrading from 0.8.4: Fork Run approval
+
+Migration 0114 adds the table `org_fork_run_approval`: each org's Fork Run
+approval setting. It is a new table, so it rewrites no row and locks no other
+table; it waits at most 5 seconds for its lock, and on a busy database the
+server stops with `canceling statement due to lock timeout` and runs it again
+when the Pod restarts. It is numbered 0114, after 0112 and 0113, which two
+other changes of this release line add. They can land in any order: the
+migrator runs every migration a database has not run, whatever its number,
+so a database that ran 0114 first still runs 0112 and 0113 when they arrive,
+and none of the three depends on another. Every org starts on the default, `agent_started`: a Run of
+fork code that an app started through an `oauth` token, or through a
+plugin endpoint, waits for approval. Only the OAuth authorization server for
+plugin endpoints issues such a token, and it is off until you set
+`oauthServer.enabled`; until then no Run changes unless an admin picks `all`
+(Org settings › Security).
+
+A Run of fork code the setting holds gets one `manual` gate,
+`fork-run-approval`, in front of every root step. A Rerun in such a Run waits
+at the gate again, and asks the other gates between it and the rerun step
+again too; a Retry does not.
+
+0.8.4 is the release to roll back to: it reads a Run that has the gate, holds
+it and its shared services at the gate, and never counts the gate as an
+Environment approval gate. A server before 0.8.4 cannot load such a Run, so
+do not roll back past 0.8.4 while one exists. On 0.8.4 the gate is weaker: an
+issued API token releases it without a confirmation, and a Rerun of a Run
+whose gate was released does not put the gate back (0.8.4 has no re-arm), so
+the rerun steps start at once. So before rolling back, set the setting to
+`off` and let the Runs that have the gate finish.
+
+To roll back: set Fork Run approval to `off` in every org, approve or reject the
+gates still waiting, scale the server to zero, back up the database, run
+[`rollback/0114_revert.sql`](../../../crates/scarab-db-postgres/rollback/0114_revert.sql)
+(`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0114_revert.sql`; a second run
+changes nothing), then the revert scripts of the other migrations above 0111
+this database ran, newest first, then `0111_revert.sql` (see "Upgrading from
+0.8.4: token kinds and operation lists"), then install the 0.8.4 chart. The
+settings are dropped.
+
+### Upgrading from 0.8.4: token kinds and operation lists
+
+Migration 0111 adds four columns to `api_tokens`: `kind` (`NOT NULL DEFAULT
+'issued'`), and the nullable `operations`, `audience` and `oauth_client`, and
+one nullable column to `runs`, `origin_via`, the token that started a Run. No
+row is rewritten, and every existing token reads as an issued token with no
+operation list, so it works as before. A token minted with an operation list
+is stored under a different hash, so a 0.8.4 replica still running during the
+rolling update cannot find it and cannot let it use every operation its role
+allows. The `ALTER` waits at most 5 seconds for
+its lock on `api_tokens` and on `runs`; on a busy database the server stops with `canceling
+statement due to lock timeout` and runs it again when the Pod restarts.
+
+Two behaviour changes reach existing tokens. Every GET now names a read
+operation (`run.read`, `step.logs.read`, …) instead of one shared `read`, so
+the `op` of security events changes for reads. And an API token's approval of
+any `manual` gate, a plain one included, now raises a confirmation request its
+owner confirms; a script that approved plain gates with a token must confirm
+each approval, or approve from a browser.
+
+Migration 0112 adds two tables, `delegated_caller_handles` and
+`delegated_call_journal`, for PluginApi: a plugin that registers an endpoint
+calls the public API on the broker listener for one caller at a time. No
+existing row is touched. A plugin whose manifest registers no endpoint works
+as before. A plugin that registers one (a `trusted_service` plugin) installs
+only from a digest of an image repository listed in
+`plugins.trustedPublishers`, which is empty by default. The handles and the
+journal live on the broker's own small database pool, but the API handlers a
+plugin's delegated calls run read and write through the server's main pool,
+as the public API does: a busy endpoint plugin shares that pool.
+
+Migration 0113 adds three tables for the OAuth authorization server that
+plugin endpoints use (`oauth_client_metadata_hosts`,
+`oauth_authorization_codes`, `oauth_grants`). It is off until you set
+`oauthServer.enabled` and `secrets.oauthRefreshKey`. A plugin whose manifest
+registers an endpoint gets a Service, `scarab-plugin-endpoint-<id>`; the
+server creates, changes or deletes Services only for such plugins, and the
+chart grants it `services` in the plugin namespace for that. The plugin
+namespace's baseline gains one NetworkPolicy, `plugin-endpoint-ingress`, on
+every release whether or not an endpoint plugin is installed: it is part of
+the baseline the runtime applies and checks for drift as a whole, and it
+selects only Pods labelled `scarab.io/plugin-endpoint=true`, admitting the
+server's Pods to their port 8080 and nothing else. A plugin without an
+endpoint has no such label, so it still takes no ingress. A broker peer given as
+`cidr:` (`SCARAB_PLUGIN_BROKER_PEER`, for a server outside the cluster)
+admits every address in that range to the endpoint port, not only the
+server. The endpoint's request limits are counted per server replica.
+
+To roll back: scale the server to zero, back up the database, run, in this order,
+[`rollback/0114_revert.sql`](../../../crates/scarab-db-postgres/rollback/0114_revert.sql)
+(set the Fork Run approval setting to `off` in every org first),
+[`rollback/0113_revert.sql`](../../../crates/scarab-db-postgres/rollback/0113_revert.sql)
+(it revokes every connected app's access token),
+[`rollback/0112_revert.sql`](../../../crates/scarab-db-postgres/rollback/0112_revert.sql)
+and then
+[`rollback/0111_revert.sql`](../../../crates/scarab-db-postgres/rollback/0111_revert.sql)
+(`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0111_revert.sql`; a second run
+changes nothing), then install the 0.8.4 chart. A 0.8.4 server would let a
+token with an operation list use every operation, so the revert revokes those
+tokens before it drops the columns; their owners mint new ones. The 0112
+revert drops the PluginApi tables and their journal. Uninstall endpoint plugins
+before rolling back: the 0112 revert refuses to run while one is installed. The
+rollback target is 0.8.4, not 0.8.3. To go back to 0.8.2, run `0110_revert.sql`
+next.
 
 ### Upgrading from 0.8.3: rollback target for Fork Run approval
 
@@ -917,6 +1087,9 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `scarab.createNamespace` | `true` | render `<release ns>-steps` when `scarab.namespace` is empty; `false` runs step Pods in the release namespace |
 | `scarab.s3.*` | — | object store; set `bucket` to enable S3/MinIO |
 | `scarab.oauth.*` | — | OAuth/OIDC login: `clientId`, `authorizeUrl`, `tokenUrl`, `userinfoUrl`, `scopes`, `owners`, `issuer` (above) |
+| `scarab.oidcIssuer` | `""` = off | the issuer URL of step OIDC tokens; needs `SCARAB_OIDC_SIGNING_KEY_FILE` (above) |
+| `scarab.oidcTokenMaxTtlSecs` | `""` = 3600 | the longest a step OIDC token lives; a token lives for its step's timeout, at most this long |
+| `scarab.oidcPublicKeys` | `[]` | further public keys the issuer's JWKS lists: the previous and next key of a key change (above) |
 | `scarab.devInsecure` | `false` | ⚠ dev/eval only — no auth; mutually exclusive with `scarab.oauth` |
 | `secrets.*` / `secrets.existingSecret` | — | sensitive `SCARAB_*` env |
 | `secrets.oauthClientSecret.name` / `.key` | — / `oauth-client-secret` | OAuth client secret by reference from your own Secret (above) |
@@ -938,6 +1111,8 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `plugins.namespace` / `.createNamespace` | `scarab-plugins` / `true` | the shared plugin namespace; must enforce Pod Security `restricted`. A namespace of its own: the render fails on the release namespace, `scarab.namespace`, `default` or `kube-*` |
 | `plugins.brokerPort` | `8090` | the broker listener and its ClusterIP Service port |
 | `plugins.probeImage` | `""` = `busybox:1.36.1@sha256:73aa…` | the isolation probe's and the per-Pod self-check's image; digest-pin an override |
+| `oauthServer.enabled` / `secrets.oauthRefreshKey` | `false` / `""` | the OAuth authorization server for plugin endpoints; the key (at least 32 random bytes, the same on every replica) derives refresh secrets. The render fails without it unless `secrets.existingSecret` is set, which must then hold `SCARAB_OAUTH_REFRESH_KEY` |
+| `plugins.trustedPublishers` | `[]` | image repositories (`registry/namespace/name`, compared whole) a plugin that registers an endpoint (`trusted_service`) may run from, pinned by digest; empty trusts none |
 | `ingress.enabled` | `false` | expose the HTTP API. The web UI, the CLI and the results sidecar name a Step by its key and need nothing from the proxy; an API caller that sends a Step id holding `/` needs a proxy that passes `%2F` on unchanged (with Envoy Gateway, `escapedSlashesAction: KeepUnchanged` in a `ClientTrafficPolicy`) |
 | `scarab.resultsApiUrl` | `""` = `http://<fullname>.<ns>.svc` | where step Pods post results; leave it empty, or point it at the in-cluster Service, not at a gateway that redirects or rewrites paths |
 | `service.type` / `service.nodePort` | `ClusterIP` / `""` | the API Service; with `NodePort`, `nodePort` fixes the port (empty => assigned) |

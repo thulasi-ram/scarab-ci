@@ -86,6 +86,7 @@ describe("one settings page, one group", () => {
         "/settings/profile",
         "/settings/security",
         "/settings/tokens",
+        "/settings/connected-apps",
         "/settings/appearance",
       ]);
       expect(g.orgs).toBeUndefined();

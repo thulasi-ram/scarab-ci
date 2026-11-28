@@ -37,7 +37,7 @@ helm install scarab oci://ghcr.io/thulasi-ram/charts/scarab --version {v} -n sca
 
 Images (linux/amd64 + linux/arm64), all tagged `{v}`:
 `ghcr.io/thulasi-ram/scarab-server`, `scarab-clone`, `scarab-wsfetch`, `scarab-results-sidecar`,
-`scarab-plugin-argocd`.
+`scarab-plugin-argocd`, `scarab-plugin-mcp`.
 """
 
 # The heading whose entries must link a docs page.

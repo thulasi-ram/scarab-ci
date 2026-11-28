@@ -27,6 +27,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 mod connection;
+mod delegation;
+mod extension;
 mod storage;
 mod store;
 mod upgrade;
@@ -37,6 +39,20 @@ pub use connection::{
     ReadRequestRefusal, BROKER_JOURNAL_RETENTION_MS, MAX_CONNECTION_BASE_URL_CHARS,
     MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES, MAX_PROXY_PATH_CHARS,
     MAX_PROXY_PATH_SEGMENTS, MAX_PROXY_QUERY_CHARS, MAX_PROXY_QUERY_PARAMS,
+};
+
+pub use delegation::{
+    DelegatedCallJournalEntry, DelegatedCallSpend, DelegatedCallStore, DelegatedCallerHandle,
+    DELEGATED_CALLER_HANDLE_HEARTBEAT_STALE_MS, DELEGATED_CALLER_HANDLE_MAX_CALLS,
+    DELEGATED_CALLER_HANDLE_MAX_LIFETIME_MS, DELEGATED_CALL_JOURNAL_RETENTION_MS,
+    MAX_PLUGIN_REQUEST_ID_CHARS,
+};
+
+pub use extension::{
+    PluginEndpointJsonCheck, PluginEndpointJsonPresence, PluginEndpointOperation,
+    PluginEndpointRequestRule, PluginExtensionPoint, PluginExtensionRegistration, PluginTrustTier,
+    MAX_ENDPOINT_JSON_CHECKS, MAX_ENDPOINT_MAY_OPERATIONS, MAX_ENDPOINT_OPERATIONS,
+    MAX_ENDPOINT_OPERATION_WRITES, MAX_EXTENSION_REGISTRATIONS,
 };
 
 pub use storage::{
@@ -95,6 +111,21 @@ pub const API_TOKEN_AUDIENCE: &str = "scarab-api";
 /// (`SCARAB_BROKER_URL`), the one its network reaches, under the public
 /// API's paths.
 pub const PLUGIN_ENV_API_TOKEN_FILE: &str = "SCARAB_API_TOKEN_FILE";
+
+/// The port a Plugin that registers an endpoint serves it on (ADR-0086 §1),
+/// inside its Pod. Core reaches it through the installation's own Service,
+/// and a NetworkPolicy admits the Scarab server to it and nothing else.
+pub const PLUGIN_ENDPOINT_PORT: u16 = 8080;
+
+/// The variable a Plugin that registers an endpoint reads its port from
+/// ([`PLUGIN_ENDPOINT_PORT`]). Core sends it a POST to `/<path>` for each
+/// request of a registered endpoint `path`, with the request's JSON body and
+/// the [`PLUGIN_DELEGATED_CALLER_HANDLE_HEADER`]; never the caller's token.
+pub const PLUGIN_ENV_ENDPOINT_PORT: &str = "SCARAB_ENDPOINT_PORT";
+
+/// The header core passes a Plugin's endpoint the DelegatedCallerHandle in,
+/// and the Plugin presents it back in on PluginApi.
+pub const PLUGIN_DELEGATED_CALLER_HANDLE_HEADER: &str = "x-scarab-delegated-caller-handle";
 
 /// The Plugin contract's environment, as the runtime sets it: where the
 /// broker is, and the file the projected broker token is kept current in.
@@ -263,23 +294,50 @@ pub struct PluginManifest {
     /// does not change.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub gates: BTreeMap<String, GateDefinition>,
-    /// Where core calls this Plugin, as a later release declares it
-    /// (ADR-0086 §1). This release does not act on it: it decodes and keeps
-    /// it, from any format a manifest is read in, so an installation a later
-    /// release made still reads after a rollback; gives the Plugin no
-    /// endpoint and no trust tier for it; and refuses to install or upgrade
-    /// to a manifest that has it ([`admit_for_mmp`]), so it never hashes
-    /// one. Absent from a manifest that has none, so the SHA-256 of every
-    /// other manifest does not change. A JSON value: the store keeps the
-    /// manifest as JSONB, which keeps neither key order nor layout.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extensions: Option<serde_json::Value>,
+    /// Where core calls this Plugin (ADR-0086 §1): its
+    /// PluginExtensionRegistrations, approved with the manifest. Absent from
+    /// a manifest that has none, so the SHA-256 of a manifest approved before
+    /// extensions existed does not change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<PluginExtensionRegistration>,
 }
 
 impl PluginManifest {
     /// Does it ask for `capability`?
     pub fn has(&self, capability: PluginCapability) -> bool {
         self.capabilities.contains(&capability)
+    }
+
+    /// The trust tier its registrations put it in (ADR-0086 §8): an endpoint
+    /// makes it `trusted_service`. `None`: no tier beyond the ordinary
+    /// isolation every Plugin gets.
+    pub fn trust_tier(&self) -> Option<PluginTrustTier> {
+        self.extensions
+            .iter()
+            .any(|r| r.point == PluginExtensionPoint::Endpoint)
+            .then_some(PluginTrustTier::TrustedService)
+    }
+
+    /// Every endpoint operation it declares, as `<path>/<operation>` with
+    /// the operation.
+    pub fn endpoint_operations(&self) -> Vec<(String, &PluginEndpointOperation)> {
+        self.extensions
+            .iter()
+            .filter(|r| r.point == PluginExtensionPoint::Endpoint)
+            .flat_map(|r| {
+                r.operations
+                    .iter()
+                    .map(move |(name, op)| (format!("{}/{name}", r.path), op))
+            })
+            .collect()
+    }
+
+    /// Every ApiOperation id any endpoint operation's `may` names, each once.
+    pub fn delegable_operations(&self) -> std::collections::BTreeSet<&str> {
+        self.endpoint_operations()
+            .into_iter()
+            .flat_map(|(_, op)| op.may.iter().map(String::as_str))
+            .collect()
     }
 
     /// Check every rule the types do not already guarantee: names, no
@@ -302,8 +360,13 @@ impl PluginManifest {
                 ));
             }
         }
-        if self.capabilities.is_empty() {
-            return invalid("a plugin must ask for at least one capability".into());
+        // An endpoint registration is itself what the plugin asks for
+        // (ADR-0086 §1): a plugin that only serves an endpoint needs no
+        // capability beside it.
+        if self.capabilities.is_empty() && self.extensions.is_empty() {
+            return invalid(
+                "a plugin must ask for at least one capability or register an extension".into(),
+            );
         }
         let mut seen = std::collections::BTreeSet::new();
         for capability in &self.capabilities {
@@ -366,6 +429,32 @@ impl PluginManifest {
                 "at most {MAX_CONFIG_KEYS} config keys, got {}",
                 self.config_keys.len()
             ));
+        }
+        if self.extensions.len() > MAX_EXTENSION_REGISTRATIONS {
+            return invalid(format!(
+                "at most {MAX_EXTENSION_REGISTRATIONS} extension registrations, got {}",
+                self.extensions.len()
+            ));
+        }
+        // A plugin that resolves gates holds a `scarab-api` token of its own
+        // that acts as its installation, and an endpoint plugin acts for many
+        // callers: one Plugin is never both, so neither authority can stand
+        // in for the other.
+        if !self.extensions.is_empty() && self.has(PluginCapability::ResolveGates) {
+            return invalid(
+                "a plugin that registers an extension may not also ask for `resolve_gates`".into(),
+            );
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        for registration in &self.extensions {
+            registration.validate()?;
+            if !paths.insert((registration.point, registration.path.as_str())) {
+                return invalid(format!(
+                    "{} `{}` is registered twice",
+                    registration.point.as_str(),
+                    registration.path
+                ));
+            }
         }
         let mut keys = std::collections::BTreeSet::new();
         for key in &self.config_keys {
@@ -622,13 +711,6 @@ pub fn image_repository(image: &str) -> &str {
 /// caller having validated first.
 pub fn admit_for_mmp(manifest: &PluginManifest) -> Result<(), PluginError> {
     manifest.validate()?;
-    if manifest.extensions.is_some() {
-        return Err(PluginError::InvalidManifest(
-            "the manifest declares `extensions`, which this Scarab release does not support; \
-             install or upgrade it on a release that does"
-                .into(),
-        ));
-    }
     let refused: Vec<&str> = manifest
         .capabilities
         .iter()
@@ -963,42 +1045,96 @@ mod tests {
             }],
             config_keys: vec!["ARGOCD_UI_URL".into()],
             gates: BTreeMap::new(),
-            extensions: None,
+            extensions: Vec::new(),
         }
     }
 
-    /// A manifest a later release wrote with `extensions` decodes the way
-    /// the store reads it (a JSON value from JSONB) and from text, keeps the
-    /// field when written back, validates and is refused at admission. A
-    /// manifest without it writes no `extensions` key, so its SHA-256 (over
-    /// what serde writes) is what it was.
+    /// A manifest without `extensions` writes no `extensions` key, so its
+    /// SHA-256 (over what serde writes) is what it was before the field
+    /// existed. One with them decodes the way the store reads it (a JSON
+    /// value from JSONB) and from text, and keeps them when written back.
     #[test]
-    fn extensions_from_a_later_release_are_kept_and_not_admitted() {
+    fn extensions_are_absent_unless_declared_and_kept_through_the_store() {
         let base = serde_json::to_string(&argo_like()).unwrap();
         assert!(!base.contains("extensions"), "{base}");
         let back: PluginManifest = serde_json::from_str(&base).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), base);
 
-        let extensions = serde_json::json!([
-            { "point": "endpoint", "path": "mcp", "operations": { "call": { "method": "POST" } } }
-        ]);
         let mut row = serde_json::to_value(argo_like()).unwrap();
-        row["extensions"] = extensions.clone();
+        row["extensions"] = serde_json::json!([{
+            "point": "endpoint",
+            "path": "mcp",
+            "operations": {
+                "ping": { "match": { "method": "POST", "json": { "/method": "ping" } }, "may": [] }
+            }
+        }]);
         // As `installation_from_row` decodes the manifest column.
         let stored: PluginManifest = serde_json::from_value(row.clone()).unwrap();
-        assert_eq!(stored.extensions.as_ref(), Some(&extensions));
-        assert_eq!(
-            serde_json::to_value(&stored).unwrap(),
-            row,
-            "kept when written back"
-        );
+        assert_eq!(stored.extensions.len(), 1);
+        let written = serde_json::to_value(&stored).unwrap();
+        let again: PluginManifest = serde_json::from_value(written).unwrap();
+        assert_eq!(again, stored, "kept when written back");
         let from_text: PluginManifest = serde_json::from_str(&row.to_string()).unwrap();
         assert_eq!(from_text, stored);
-        assert_eq!(stored.validate(), Ok(()));
-        assert!(
-            matches!(admit_for_mmp(&stored), Err(PluginError::InvalidManifest(e)) if e.contains("extensions")),
-            "a manifest with extensions is not installed by this release"
-        );
+    }
+
+    /// J7: an endpoint registration never comes with `resolve_gates`.
+    #[test]
+    fn an_endpoint_plugin_may_not_resolve_gates() {
+        let endpoint: PluginExtensionRegistration = serde_json::from_value(serde_json::json!({
+            "point": "endpoint",
+            "path": "mcp",
+            "operations": {
+                "tools_list": {
+                    "match": { "method": "POST", "json": { "/method": "tools/list" } },
+                    "may": []
+                }
+            }
+        }))
+        .unwrap();
+        let mut m = argo_like();
+        m.extensions = vec![endpoint];
+        assert_eq!(m.validate(), Ok(()));
+        assert_eq!(m.trust_tier(), Some(PluginTrustTier::TrustedService));
+
+        m.capabilities.push(PluginCapability::ResolveGates);
+        m.gates = BTreeMap::from([(
+            "wait-live".to_string(),
+            serde_json::from_value(serde_json::json!({ "description": "x" })).unwrap(),
+        )]);
+        assert!(matches!(
+            m.validate(),
+            Err(PluginError::InvalidManifest(msg)) if msg.contains("resolve_gates")
+        ));
+    }
+
+    /// 90ec77bf: an endpoint registration is what a plugin asks for, so a
+    /// plugin that only serves an endpoint (the MCP plugin) needs no
+    /// capability; a plugin that asks for nothing at all is still refused.
+    #[test]
+    fn an_endpoint_alone_is_enough_to_ask_for_and_nothing_is_not() {
+        let mut m = argo_like();
+        m.capabilities.clear();
+        m.connections.clear();
+        m.extensions = vec![serde_json::from_value(serde_json::json!({
+            "point": "endpoint",
+            "path": "mcp",
+            "operations": {
+                "ping": {
+                    "match": { "method": "POST", "json": { "/method": "ping" } },
+                    "may": []
+                }
+            }
+        }))
+        .unwrap()];
+        assert_eq!(m.validate(), Ok(()));
+        assert_eq!(admit_for_mmp(&m), Ok(()));
+
+        m.extensions.clear();
+        assert!(matches!(
+            m.validate(),
+            Err(PluginError::InvalidManifest(msg)) if msg.contains("at least one capability")
+        ));
     }
 
     #[test]

@@ -1,0 +1,112 @@
+---
+title: Fork Run approval
+description: An org setting that holds Runs of fork code at an approval gate until someone with write on the repository approves them. Approving starts the Run and unlocks nothing else.
+---
+
+Fork Run approval is an org setting that decides which Runs of **fork code** wait at an approval
+gate before any of their steps or shared services start. Someone with write on the repository
+approves the gate from the Run page, and the Run continues.
+
+| Setting | Which Runs of fork code wait |
+|---------|------------------------------|
+| `off` | none |
+| `agent_started` (the default) | those an app connected to Scarab started for someone, such as an AI agent: a Run whose dispatch came through an `oauth` token |
+| `all` | every one, whoever or whatever started it |
+
+Only the OAuth authorization server for plugin endpoints issues an `oauth` token (see
+[Connected apps](/scarab-ci/usage/connected-apps/)), and it is off until the operator turns it on.
+A Run started through a plugin endpoint also counts as started by an app. While no app is
+connected, no Run waits under `agent_started`. Choose `all` to hold Runs of fork code started by
+people, API tokens and pull requests from forks.
+
+A Run is fork code when it builds a pull request from another repository, or a commit that no
+branch or tag of the repository points at (see [Runs](/scarab-ci/usage/runs/#starting-a-run-by-hand)).
+Fork code gets no secrets whether or not this setting is on. The setting adds a person who
+decides whether the code runs at all.
+
+## Changing it
+
+In **Org settings › Security**, pick one of the three under **Fork Run approval**. Only an org admin
+can change it, and only from a signed-in browser: an API token, a session sent as `Bearer`, or an
+app acting for you cannot. A change that holds fewer Runs (`all` to `agent_started`, `all` to
+`off`, `agent_started` to `off`) asks you to confirm with your passkey; a change that holds more
+does not. Each change is recorded in the org's security events as `fork_run_approval.changed`,
+with the old and new setting.
+
+The API is `GET` and `PUT /v1/orgs/{org}/security/fork-run-approval`:
+
+```bash
+curl -s "$SCARAB_ADDR/v1/orgs/acme/security/fork-run-approval" \
+  -H "Authorization: Bearer $SCARAB_TOKEN"
+# {"setting":"all","can_change":false}
+```
+
+Reading it needs the `settings.read` operation. The `PUT` body is
+`{"setting": "off" | "agent_started" | "all"}`.
+
+The setting applies to Runs created after the change. A Run created before it keeps its gate, or
+runs without one.
+
+## The gate
+
+For each Run of fork code the setting holds, Scarab adds one `manual` gate, `fork-run-approval`, with no `needs`, and puts it in the `needs`
+of every step that had none, including a step whose `when:` is false. Nothing in the Run starts
+before it is approved, and the Run's shared services wait too. The Run page labels the gate
+"added by Fork Run approval".
+
+In the stored Run the gate looks like this:
+
+```yaml
+- id: fork-run-approval
+  gate: manual
+  gate_expires_after: 259200
+  environment_approval_gate: false
+  origin: [{ kind: fork_run_approval_gate, name: fork_run_approval, content_hash: "" }]
+```
+
+A gate that nobody approves fails the Run after 72 hours. Rejecting it fails the Run.
+
+## Who can approve it
+
+| Who | What happens |
+|-----|--------------|
+| A person with write on the repository, in a browser | approved at once, like any plain `manual` gate |
+| An API token whose owner has write on the repository | refused with `403 step_up_required`; the approval counts once the owner confirms it with a passkey |
+| An app connected to Scarab for you (an `oauth` token) | refused; an app never approves a gate |
+
+The Run's events record who approved it, and the token when one was used.
+
+## It is not an Environment approval
+
+The gate never counts as an Environment's approval gate. A pipeline that deploys to an
+Environment with approvers still gets that Environment's own gate, behind this one, and the
+Environment's approvers still decide. Approving the Fork Run approval gate does not approve a
+deploy, and an Environment's gate does not stand in for this one.
+
+## What approving does not unlock
+
+An approved Run is still fork code. It still gets no Environment secrets, no registry credentials,
+the `env=none` OIDC subject, a read-only clone token and no image push. Approving the gate lets the
+code run; it does not give the code anything a Run of fork code would not get.
+
+## Reruns and retries
+
+An approval covers the version of the Run it was given in. A **Rerun** opens a new version, so in
+a Run of fork code it puts the gate back: the gate waits for approval again, and the steps between
+the gate and the step you reran wait behind it. Those steps are skipped when their inputs did not
+change, but a gate among them asks again: an Environment's approvers are asked again, and a
+plugin gate runs again. The rerun's confirm box lists them under "Waits for Fork Run approval
+again".
+
+In a Run with the gate, Scarab refuses a Rerun of a step its `when:` skipped (409): a Rerun does
+not evaluate `when:` again. Start a new Run instead.
+
+A **Retry** of a failed step stays in the current version and does not ask again.
+
+## Rolling back
+
+The setting is stored in migration 0114. 0.8.4 is the release to roll back to: it reads Runs that
+have the gate and holds them at it, and an earlier server cannot load such a Run. On 0.8.4 a Rerun
+of a Run whose gate was released does not put the gate back. Before you roll back, set it to `off`
+in every org and let the Runs that have the gate finish. See the chart README, "Upgrading from
+0.8.4", for the revert script.

@@ -49,6 +49,8 @@ machine, see [Local Development](/scarab-ci/get-started/local-development/).
 | `SCARAB_OIDC_ISSUER` | Enables the OIDC issuer for keyless federation. |
 | `SCARAB_OIDC_SIGNING_KEY_FILE` | PKCS#8 RSA PEM the issuer signs with, required when the issuer is enabled. |
 | `SCARAB_OIDC_AUDIENCE` | `aud` of minted per-run tokens (default `scarab`). |
+| `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` | The longest a step OIDC token lives, in seconds (default `3600`, from 60 to 43200, the 12 hours AWS allows a session). A token lives for its step's timeout, at most this long, and this long for a step with no timeout. |
+| `SCARAB_OIDC_PUBLIC_KEYS` | Further RSA public keys, as `-----BEGIN PUBLIC KEY-----` PEM blocks one after the other, that the JWKS lists beside the signing key. Used during a key change: see the chart README, "Changing the signing key". |
 
 **Forge & webhooks**
 

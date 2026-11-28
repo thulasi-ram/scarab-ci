@@ -11,6 +11,8 @@ import { refusalText, type MatchRefusal, type SecretMatchAnswer } from "../secre
 import type { LeakCheckLimits } from "../leak-checks";
 
 export type RunStatus = components["schemas"]["RunStatusResponse"];
+export type ForkRunApprovalSetting = components["schemas"]["ForkRunApprovalDto"];
+export type ForkRunApprovalChoice = components["schemas"]["ForkRunApprovalSettingDto"];
 export type CreateRunRequest = components["schemas"]["CreateRunRequest"];
 export type RunSummary = components["schemas"]["RunSummaryDto"];
 export type CatalogEntry = components["schemas"]["CatalogEntry"];
@@ -2441,6 +2443,34 @@ export async function setLeakCheckLimits(
   return (await res.json()) as LeakCheckLimits;
 }
 
+/** The org's Fork Run approval setting
+ * (`GET /v1/orgs/{org}/security/fork-run-approval`): which Runs of fork code
+ * wait at an approval gate, and whether the caller may change it.
+ * `null` when the caller may not read it or the server has no such route. */
+export async function getForkRunApproval(org: string): Promise<ForkRunApprovalSetting | null> {
+  const res = await fetch(`/v1/orgs/${encodeURIComponent(org)}/security/fork-run-approval`);
+  if (res.status === 401) setUnauthenticated(true);
+  if (!res.ok) return null;
+  return (await res.json()) as ForkRunApprovalSetting;
+}
+
+/** An org admin changes the Fork Run approval setting
+ * (`PUT …/security/fork-run-approval`). A change that gates fewer Runs asks
+ * for a passkey confirmation, through the same step-up retry `send` does. A
+ * refusal (not an admin, a cancelled confirmation) throws the server's own
+ * message. */
+export async function setForkRunApproval(
+  org: string,
+  setting: ForkRunApprovalChoice,
+): Promise<ForkRunApprovalSetting> {
+  const res = await send(
+    `/v1/orgs/${encodeURIComponent(org)}/security/fork-run-approval`,
+    "PUT",
+    { setting },
+  );
+  return (await res.json()) as ForkRunApprovalSetting;
+}
+
 /** An Owner resets a member's passkeys
  * (`POST /v1/orgs/{org}/members/{id}/passkeys/reset`, by Principal id) —
  * always-ask. */
@@ -2687,4 +2717,87 @@ export async function policyDecisionCounts(org: string, since: number): Promise<
   if (response.status === 404) return null;
   if (error || !data) throw new Error(errorText(error) || "failed to count the org's policy decisions");
   return data;
+}
+
+// ── Connected apps and OAuth consent ──────────────────────────────────────
+// Plain `send` calls: these routes are not in the generated client yet.
+
+/** One of your connected apps: an OAuth grant an app such as claude.ai holds
+ * to act for you at one plugin endpoint. */
+export type ConnectedApp = {
+  id: string;
+  client_host: string;
+  client_id: string;
+  org: string;
+  installation_id: string;
+  resource: string;
+  operations: string[];
+  role: string;
+  created_at: number;
+  last_used_at: number;
+  ends_at: number;
+  revoked_at?: number | null;
+};
+
+/** Your connected apps, newest first; `null` when the server has no OAuth
+ * authorization server. */
+export async function listConnectedApps(): Promise<ConnectedApp[] | null> {
+  const res = await fetch("/v1/me/connected-apps");
+  if (res.status === 404) return null;
+  if (res.status === 401) setUnauthenticated(true);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(errorMessage(text, `could not list connected apps (${res.status})`));
+  }
+  return (await res.json()) as ConnectedApp[];
+}
+
+/** Disconnect an app: its grant and token are revoked at once. */
+export async function disconnectApp(id: string): Promise<void> {
+  await send(`/v1/me/connected-apps/${encodeURIComponent(id)}`, "DELETE");
+}
+
+/** The query `/oauth/authorize` is opened with, passed on as is. */
+export type OAuthAuthorizationParams = {
+  response_type: string;
+  client_id: string;
+  redirect_uri: string;
+  code_challenge: string;
+  code_challenge_method: string;
+  resource: string;
+  state?: string;
+  scope?: string;
+};
+
+/** What the consent page shows. */
+export type OAuthAuthorization = {
+  client_id: string;
+  client_host: string;
+  redirect_uri: string;
+  org: string;
+  installation_id: string;
+  installation_name: string;
+  plugin: string;
+  endpoint_path: string;
+  resource: string;
+  operations: { id: string; label: string; selected: boolean }[];
+  role: string;
+};
+
+/** Check an authorization request and get what to show for consent. */
+export async function describeAuthorizationRequest(
+  params: OAuthAuthorizationParams,
+): Promise<OAuthAuthorization> {
+  const res = await send("/v1/oauth/authorization-requests", "POST", params);
+  return (await res.json()) as OAuthAuthorization;
+}
+
+/** Consent (a passkey confirmation each time): where to send the browser. */
+export async function consentToAuthorization(
+  params: OAuthAuthorizationParams,
+  operations: string[],
+): Promise<string> {
+  const res = await send("/v1/oauth/consent", "POST", { ...params, operations });
+  const body = (await res.json()) as { redirect_to: string };
+  return body.redirect_to;
 }

@@ -1,0 +1,43 @@
+[package]
+name = "scarab-plugin-mcp"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# The MCP Plugin (ADR-0086 §10): an MCP server an app such as claude.ai
+# reaches through the plugin endpoint core serves. Stateless Streamable HTTP,
+# JSON responses only: core forwards one POST per MCP message with a
+# delegated caller handle, and the plugin calls PluginApi on the broker with
+# its `scarab-api` token and that handle. It never sees a user's token.
+#
+# Like the Argo CD plugin it names NO `scarab-*` crate outside
+# `[dev-dependencies]`: everything it knows about Scarab is the public API's
+# HTTP contract. It has no special standing: an operator lists its image
+# repository in `plugins.trustedPublishers` and an org admin installs it like
+# any other plugin.
+#
+# The MCP JSON-RPC surface (initialize, ping, tools/list, tools/call) is
+# written here with serde_json rather than with an MCP SDK: it is a few message
+# shapes, the plugin serves no stream and keeps no session, and a library
+# that has to be vetted, pinned and upgraded buys nothing for that.
+
+[lib]
+name = "scarab_plugin_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scarab-plugin-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["signal"] }
+axum = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# The manifest test checks manifest.json against the rules core installs it
+# under. Test-only: not linked into the plugin binary.
+scarab-plugin = { workspace = true }

@@ -592,6 +592,9 @@ if e["V_MODE"] == "chaos":
     # 8 x 15 s leaves it stopped until the scenario resumes it.
     v["livenessProbe"] = {"failureThreshold": 8}
 if e["V_MODE"] == "dogfood":
+    # The published MCP plugin may run here as `trusted_service` (ADR-0086
+    # §8). Whether plugins run here at all is unchanged.
+    v["plugins"] = {"trustedPublishers": ["ghcr.io/thulasi-ram/scarab-plugin-mcp"]}
     v["scarab"].update(githubAppId=e["V_APP_ID"], publicUrl=e["V_PUBLIC_URL"], stepTimeoutSecs=e["V_TIMEOUT"],
                        uiUrl=e["V_UI_URL"])
     # A named provider `github`, so Principal ids are github:<login>. The

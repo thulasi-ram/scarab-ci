@@ -10128,6 +10128,7 @@ mod tests {
             connections: vec![],
             plugins: crate::config::PluginsConfig::off(),
             step_up: crate::config::StepUpMode::Off,
+            oauth_server: None,
         };
 
         let err = run(&config)

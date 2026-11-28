@@ -96,6 +96,7 @@ fn state(pg: Arc<PostgresDb>, clock: Arc<FakeClock>) -> AppState {
                 enabled: true,
                 namespace: NAMESPACE.into(),
                 dev_allow_tag: false,
+                trusted_publishers: Vec::new(),
             },
         )
         .with_plugin_tokens(Arc::new(FakeTokenReview))

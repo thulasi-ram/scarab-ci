@@ -402,6 +402,7 @@ async fn a_racing_approval_cannot_slip_past_a_gate_resolve_deny() {
                     kind: scarab_engine::EventPayload::GateApproved {
                         step: scarab_engine::StepId("approve".into()),
                         by: "carol".into(),
+                        via: None,
                     },
                     at: scarab_engine::Timestamp(1_000),
                 })

@@ -194,6 +194,9 @@ async fn invalid_writes_are_refused_and_store_nothing() {
         "/v1/orgs/acme/environments/prod%09eu",
         // A dot segment for a name: a client would normalise it away.
         "/v1/orgs/acme/environments/%2E%2E",
+        // Reserved: a step's OIDC subject says `env/none` when no
+        // Environment admits the step.
+        "/v1/orgs/acme/environments/none",
     ] {
         let (status, body_out) = call(&app, "PUT", uri, None, Some(json!({}))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body_out}");

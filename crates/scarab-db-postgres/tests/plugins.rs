@@ -16,7 +16,8 @@ use std::collections::BTreeMap;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_plugin::{
-    ConnectionSlot, InstallationState, PluginCapability, PluginConnection,
+    ConnectionSlot, DelegatedCallJournalEntry, DelegatedCallSpend, DelegatedCallStore,
+    DelegatedCallerHandle, InstallationState, PluginCapability, PluginConnection,
     PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStorage, PluginStore,
     PluginStoreError, PluginUpgrade, RequestRule, RuntimeStatus,
 };
@@ -47,7 +48,7 @@ fn manifest() -> PluginManifest {
         }],
         config_keys: vec![],
         gates: Default::default(),
-        extensions: None,
+        extensions: Vec::new(),
     }
 }
 
@@ -555,3 +556,217 @@ async fn an_upgrade_is_conditional_on_the_manifest_and_records_the_version_it_re
     assert_eq!(db.installation_versions(&argo.id).await.unwrap(), vec![]);
     tdb.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------
+// DelegatedCallerHandles and the delegated-call journal (ADR-0086 §3, §4,
+// migration 0112)
+// ---------------------------------------------------------------------------
+
+fn handle(id: &str, writes: u32, calls: u32, expires_at: i64) -> DelegatedCallerHandle {
+    DelegatedCallerHandle {
+        id: id.into(),
+        installation_id: "0000000001".into(),
+        org: "acme".into(),
+        token_id: "t-amy".into(),
+        operations: vec!["run.cancel".into(), "run.read".into()],
+        writes_left: writes,
+        calls_left: calls,
+        created_at: 1_000,
+        heartbeat_at: 1_000,
+        expires_at,
+    }
+}
+
+fn journal_entry(handle_id: &str, started_at: i64) -> DelegatedCallJournalEntry {
+    DelegatedCallJournalEntry {
+        installation_id: "0000000001".into(),
+        org: "acme".into(),
+        handle_id: handle_id.into(),
+        caller_subject: "amy".into(),
+        token_id: "t-amy".into(),
+        token_kind: "oauth".into(),
+        oauth_client: Some("https://claude.ai".into()),
+        operation: "run.read".into(),
+        method: "GET".into(),
+        path: "/v1/runs/r1".into(),
+        request_id: format!("req-{started_at}"),
+        plugin_request_id: None,
+        started_at,
+    }
+}
+
+/// A handle is read back by its hash only. Each spend takes one call, and
+/// one write for a write, in one statement that refuses at zero: a write
+/// with no write left takes nothing and a read still goes through; at no
+/// call left both are refused; past its expiry the handle is gone, not
+/// exhausted. The sweep deletes expired handles only, and journal rows
+/// older than the cut only; a journal row is finished with its status.
+#[tokio::test]
+async fn a_delegated_caller_handle_spends_to_zero_expires_and_is_swept() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    let h = handle("h1", 1, 3, 10_000);
+    db.put_delegated_caller_handle(&h, "hash-1").await.unwrap();
+    db.put_delegated_caller_handle(&handle("h-old", 0, 50, 2_000), "hash-old")
+        .await
+        .unwrap();
+    assert_eq!(
+        db.delegated_caller_handle_by_hash("hash-1").await.unwrap(),
+        Some(h)
+    );
+    assert_eq!(
+        db.delegated_caller_handle_by_hash("h1").await.unwrap(),
+        None
+    );
+
+    let counters = |id: &'static str| {
+        let pool = tdb.pool.clone();
+        async move {
+            sqlx::query_as::<_, (i32, i32)>(
+                "SELECT calls_left, writes_left FROM delegated_caller_handles WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    for (write, expected, left) in [
+        (true, DelegatedCallSpend::Spent, (2, 0)),
+        (true, DelegatedCallSpend::Exhausted, (2, 0)),
+        (false, DelegatedCallSpend::Spent, (1, 0)),
+        (false, DelegatedCallSpend::Spent, (0, 0)),
+        (false, DelegatedCallSpend::Exhausted, (0, 0)),
+    ] {
+        assert_eq!(
+            db.spend_delegated_caller_handle("h1", write, 5_000)
+                .await
+                .unwrap(),
+            expected,
+            "write={write}"
+        );
+        assert_eq!(counters("h1").await, left, "write={write}");
+    }
+    assert_eq!(
+        db.spend_delegated_caller_handle("h1", false, 10_000)
+            .await
+            .unwrap(),
+        DelegatedCallSpend::Gone
+    );
+    assert_eq!(
+        db.spend_delegated_caller_handle("nope", false, 5_000)
+            .await
+            .unwrap(),
+        DelegatedCallSpend::Gone
+    );
+
+    let old = db
+        .journal_delegated_call(&journal_entry("h1", 1_000))
+        .await
+        .unwrap();
+    let new = db
+        .journal_delegated_call(&journal_entry("h1", 5_000))
+        .await
+        .unwrap();
+    db.finish_delegated_call(new, 429, 5_001).await.unwrap();
+    let finished: (Option<i32>, Option<i64>) =
+        sqlx::query_as("SELECT status, finished_at FROM delegated_call_journal WHERE id = $1")
+            .bind(new)
+            .fetch_one(&tdb.pool)
+            .await
+            .unwrap();
+    assert_eq!(finished, (Some(429), Some(5_001)));
+
+    assert_eq!(
+        db.delete_expired_delegated_caller_handles(5_000)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.delegated_caller_handle_by_hash("hash-old")
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(db
+        .delegated_caller_handle_by_hash("hash-1")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(db.prune_delegated_call_journal(5_000).await.unwrap(), 1);
+    let left: Vec<i64> = sqlx::query_scalar("SELECT id FROM delegated_call_journal")
+        .fetch_all(&tdb.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, vec![new]);
+    assert_ne!(old, new);
+
+    assert_eq!(
+        db.delete_installation_delegated_caller_handles("0000000001")
+            .await
+            .unwrap(),
+        1
+    );
+    tdb.cleanup().await;
+}
+
+/// A server before 0112 cannot read a manifest with `extensions`, so the
+/// 0112 revert refuses while an installation's manifest has one and
+/// changes nothing; once none does, it drops the two tables.
+#[tokio::test]
+async fn the_0112_revert_refuses_while_an_endpoint_plugin_is_installed() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    let mut endpoint = installation("acme", "mcp", "0000000001");
+    endpoint.manifest.extensions = vec![serde_json::from_value(serde_json::json!({
+        "point": "endpoint",
+        "path": "mcp",
+        "operations": {
+            "tools_list": {
+                "match": { "method": "POST", "json": { "/method": "tools/list" } },
+                "may": []
+            }
+        }
+    }))
+    .unwrap()];
+    db.install(&endpoint).await.unwrap();
+    db.install(&installation("acme", "argocd", "0000000002"))
+        .await
+        .unwrap();
+
+    let table = |name: &'static str| {
+        let pool = tdb.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT to_regclass($1)::text")
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let mut conn = tdb.pool.acquire().await.unwrap();
+    let refused = sqlx::raw_sql(REVERT_0112).execute(&mut *conn).await;
+    let err = refused.expect_err("the revert must refuse while an endpoint plugin is installed");
+    assert!(
+        err.to_string()
+            .contains("uninstall it before reverting 0112"),
+        "{err}"
+    );
+    sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await.unwrap();
+    drop(conn);
+    assert!(table("delegated_caller_handles").await.is_some());
+
+    sqlx::query("UPDATE plugin_installations SET manifest = manifest - 'extensions'")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(REVERT_0112).execute(&tdb.pool).await.unwrap();
+    assert_eq!(table("delegated_caller_handles").await, None);
+    assert_eq!(table("delegated_call_journal").await, None);
+    tdb.cleanup().await;
+}
+
+const REVERT_0112: &str = include_str!("../rollback/0112_revert.sql");

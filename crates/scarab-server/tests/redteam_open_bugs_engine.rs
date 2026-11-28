@@ -286,7 +286,7 @@ async fn second_cancel_after_rerun_tears_down(w: World) {
     w.running_on("ra", "bump", "a1").await;
 
     assert!(
-        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()))
+        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()), None)
             .await
             .unwrap()
     );
@@ -313,7 +313,7 @@ async fn second_cancel_after_rerun_tears_down(w: World) {
     // a2's Pod will linger through a few teardown checks.
     w.exec.linger_after_cancel(3);
     assert!(
-        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()))
+        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()), None)
             .await
             .unwrap()
     );
@@ -358,7 +358,7 @@ async fn a_launch_landing_after_the_cancel_teardown_is_torn_down(w: World) {
     );
 
     assert!(
-        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()))
+        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()), None)
             .await
             .unwrap()
     );
@@ -395,7 +395,7 @@ async fn a_cancel_landing_while_the_launch_is_in_flight_tears_it_down(w: World) 
         Box::pin(async move {
             let clock = FakeClock::new(T0);
             assert!(
-                cancel_run_request(&*db, &clock, &rid("ra"), Some("amy".into()))
+                cancel_run_request(&*db, &clock, &rid("ra"), Some("amy".into()), None)
                     .await
                     .unwrap()
             );
@@ -454,7 +454,7 @@ async fn a_cancel_failing_after_its_intent_neither_kills_a_live_run_nor_orphans(
         )
     });
     assert!(
-        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()))
+        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()), None)
             .await
             .is_err()
     );
@@ -470,7 +470,7 @@ async fn a_cancel_failing_after_its_intent_neither_kills_a_live_run_nor_orphans(
     // The operator re-sends the cancel.
     w.exec.linger_after_cancel(3);
     assert!(
-        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()))
+        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()), None)
             .await
             .unwrap()
     );
@@ -516,13 +516,13 @@ async fn a_cancel_interrupted_before_its_run_commit_still_ends_cancelled() {
         )
     });
     assert!(
-        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()))
+        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()), None)
             .await
             .is_err()
     );
     assert_eq!(w.step("ra", "bump").await.status, StepStatus::Cancelled);
     w.ticks(1).await;
-    let resent = cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()))
+    let resent = cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()), None)
         .await
         .unwrap();
     assert_eq!(
@@ -547,7 +547,7 @@ async fn a_step_claimed_mid_cancel_ends_terminal() {
     w.seed_deploy("ra", None).await;
     w.mem().arm_toctou_race(&id("bump"), &aid("a1"));
     assert!(
-        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()))
+        cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()), None)
             .await
             .unwrap()
     );
@@ -816,7 +816,7 @@ async fn results_posts_land_only_on_the_running_frontier(w: World) {
         .await
         .unwrap();
 
-    assert!(cancel_run_request(&*w.db, &w.clock, &run, None)
+    assert!(cancel_run_request(&*w.db, &w.clock, &run, None, None)
         .await
         .unwrap());
     assert!(conflict(
@@ -844,7 +844,7 @@ async fn a_pod_that_never_terminates_is_abandoned_at_the_ceiling(w: World) {
     w.running_on("ra", "bump", "a1").await;
 
     w.exec.linger_after_cancel(u32::MAX);
-    assert!(cancel_run_request(&*w.db, &w.clock, &rid("ra"), None)
+    assert!(cancel_run_request(&*w.db, &w.clock, &rid("ra"), None, None)
         .await
         .unwrap());
     let abandoned = |w: &World| {

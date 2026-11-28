@@ -160,10 +160,13 @@ pipeline's `validate:` rules run on the server when you press **Run**.
 
 A Run started at a commit that no branch or tag of the repository points at, or at a pull request
 from another repository, runs as **fork code**. It gets the limits a fork's pull request gets: no
-secrets, the `env=none` OIDC subject, a read-only clone token and no image push, whoever started
+secrets, the `env=none` OIDC subject in an Environment and no OIDC token outside one (see
+[Step OIDC tokens](/scarab-ci/usage/oidc-tokens/)), a read-only clone token and no image push, whoever started
 it. Scarab asks the forge which branch, tag or pull request points at the commit it resolved, so
 spelling the ref differently (a short SHA, `pull/5/head`) does not change the answer. When the
 forge cannot answer, the Run is refused. `HEAD`, the CLI's default ref, means the default branch.
+An org can also hold every Run of fork code at an approval gate until someone with write on the
+repository approves it: see [Fork Run approval](/scarab-ci/usage/fork-run-approval/).
 
 ### New run with these inputs
 

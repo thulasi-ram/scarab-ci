@@ -1259,6 +1259,10 @@ async fn exempt_operations_never_need_a_step_up() {
                 last_used_at: None,
                 use_count: 0,
                 revoked_at: None,
+                kind: scarab_identity::PrincipalTokenKind::Issued,
+                operations: None,
+                audience: None,
+                oauth_client: None,
             },
             "hash-1",
         )
@@ -1306,7 +1310,7 @@ fn plugin_installation() -> scarab_plugin::PluginInstallation {
             }],
             config_keys: vec![],
             gates: Default::default(),
-            extensions: None,
+            extensions: Vec::new(),
         },
         manifest_sha256: "0".repeat(64),
         source: None,
@@ -1343,6 +1347,7 @@ async fn moving_plugin_storage_needs_a_step_up_and_adding_or_removing_does_not()
                 enabled: true,
                 namespace: "scarab-plugins".into(),
                 dev_allow_tag: false,
+                trusted_publishers: Vec::new(),
             },
         )
     });
@@ -1481,6 +1486,7 @@ async fn upgrades() -> Option<Upgrades> {
                 enabled: true,
                 namespace: "scarab-plugins".into(),
                 dev_allow_tag: false,
+                trusted_publishers: Vec::new(),
             },
         )
         .with_library_fetcher(f)
@@ -1666,6 +1672,7 @@ async fn moving_a_plugin_to_another_image_repository_needs_a_step_up() {
                 enabled: true,
                 namespace: "scarab-plugins".into(),
                 dev_allow_tag: false,
+                trusted_publishers: Vec::new(),
             },
         )
         .with_library_fetcher(f)

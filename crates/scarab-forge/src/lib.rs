@@ -642,6 +642,25 @@ pub fn is_full_commit_id(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// How a dispatch reached Scarab when a PrincipalToken made it rather than
+/// its Principal's own session (ADR-0086 §6): the same record as
+/// `scarab_engine::DelegationTrail`, field for field and on the wire. This
+/// crate depends on no Scarab crate, so it holds its own copy, and the server
+/// converts between the two.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationTrail {
+    /// The PrincipalToken's row id. Never the secret.
+    pub token_id: String,
+    /// The PrincipalToken's kind: `issued` or `oauth`.
+    pub token_kind: String,
+    /// The OAuth client an `oauth` token was granted to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client: Option<String>,
+    /// The Plugin installation (its id) the dispatch came through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_installation: Option<String>,
+}
+
 /// A forge event, normalized across providers into Scarab's own vocabulary.
 ///
 /// Adapters parse a vendor payload into exactly one of these (see
@@ -795,6 +814,10 @@ pub enum Event {
         /// dispatcher gave none; requiredness is an Environment `ProtectionRule`
         /// enforced at admission (thread D), never at the dispatch endpoint.
         reason: Option<String>,
+        /// How the dispatch arrived when a token made it (ADR-0086 §6); absent
+        /// for a session and on events recorded before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<DelegationTrail>,
     },
     /// Started programmatically via the REST API (CLI / third party), as opposed
     /// to a human [`Manual`](Event::Manual) trigger. Repo + ref-aware for the same
@@ -817,6 +840,10 @@ pub enum Event {
         /// caller gave none; requiredness is an Environment `ProtectionRule` enforced
         /// at admission (thread D), never at the dispatch endpoint.
         reason: Option<String>,
+        /// How the dispatch arrived when a token made it (ADR-0086 §6); absent
+        /// for a session and on events recorded before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<DelegationTrail>,
     },
     /// Another Pipeline's Run in the same repository finished (`on:
     /// upstream:`). The downstream Run builds the same commit. Built by the
@@ -899,6 +926,15 @@ impl Event {
             Event::Manual { .. } => TriggerKind::Manual,
             Event::Api { .. } => TriggerKind::Api,
             Event::Upstream { .. } => TriggerKind::Upstream,
+        }
+    }
+
+    /// How a manual or API dispatch arrived when a token made it (ADR-0086
+    /// §6); `None` for every other event.
+    pub fn delegation_trail(&self) -> Option<&DelegationTrail> {
+        match self {
+            Event::Manual { via, .. } | Event::Api { via, .. } => via.as_ref(),
+            _ => None,
         }
     }
 
@@ -1202,7 +1238,8 @@ impl Event {
                 // Whether the dispatched commit is fork code (ADR-0086 §9),
                 // recorded with the Run like a pull request's, so the paths
                 // that read the recorded trigger back see it: a fork dispatch
-                // starts no follow-up, and its launches count as fork code.
+                // starts no follow-up, its launches count as fork code, and it
+                // gets no step OIDC token outside an Environment.
                 e.insert("fork".into(), json!(fork));
                 // Exposed like push's (ADR-0043): `ref` is the symbolic dispatch
                 // ref, `branch` its short form, and `sha` the resolved commit the
@@ -2421,6 +2458,7 @@ mod tests {
                     r#ref: "refs/heads/main".into(),
                     sha: "deadbeef".into(),
                     reason: None,
+                    via: None,
                 },
                 TriggerKind::Manual,
             ),
@@ -2432,6 +2470,7 @@ mod tests {
                     r#ref: "refs/heads/main".into(),
                     sha: "deadbeef".into(),
                     reason: None,
+                    via: None,
                 },
                 TriggerKind::Api,
             ),
@@ -2481,6 +2520,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 sha: "abc".into(),
                 reason: None,
+                via: None,
             }
             .actor(),
             Some("alice")
@@ -2566,6 +2606,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 sha: "cafef00d".into(),
                 reason: None,
+                via: None,
             },
             Event::Api {
                 fork: false,
@@ -2574,6 +2615,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 sha: "cafef00d".into(),
                 reason: None,
+                via: None,
             },
         ] {
             assert_eq!(event.repo(), Some(&repo()));
@@ -2627,6 +2669,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 sha: "deadbeef".into(),
                 reason: None,
+                via: None,
             }
             .protection_ref()
             .as_deref(),
@@ -2640,6 +2683,7 @@ mod tests {
                 r#ref: "refs/heads/release/1.2".into(),
                 sha: "deadbeef".into(),
                 reason: None,
+                via: None,
             }
             .protection_ref()
             .as_deref(),
@@ -3155,6 +3199,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 sha: "cafef00d".into(),
                 reason: Some("$(rm -rf /) ship it".into()),
+                via: None,
             },
             Event::Api {
                 fork: false,
@@ -3163,6 +3208,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 sha: "cafef00d".into(),
                 reason: Some("$(rm -rf /) ship it".into()),
+                via: None,
             },
         ] {
             let ctx = event.context();
@@ -3190,6 +3236,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 sha: "abc".into(),
                 reason: Some("  hotfix the prod outage  ".into()),
+                via: None,
             }
             .trigger_title()
             .as_deref(),
@@ -3204,6 +3251,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 sha: "abc".into(),
                 reason: Some("nightly deploy".into()),
+                via: None,
             }
             .trigger_title()
             .as_deref(),
@@ -3218,6 +3266,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 sha: "abc".into(),
                 reason: None,
+                via: None,
             }
             .trigger_title(),
             None
@@ -3265,6 +3314,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 sha: "abc".into(),
                 reason: None,
+                via: None,
             }
             .trigger_title(),
             None

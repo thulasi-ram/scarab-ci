@@ -32,6 +32,9 @@ pub use environment_governance::InMemoryEnvironmentGovernance;
 /// versioning, name and concurrency rules.
 mod policies;
 pub use policies::InMemoryPolicies;
+// The in-memory `ForkRunApprovalStore` (ADR-0086 §9).
+mod fork_run_approval;
+pub use fork_run_approval::InMemoryForkRunApproval;
 // The in-memory `LibraryStore` (ADR-0076).
 mod leak_checks;
 pub use leak_checks::InMemoryLeakCheckLimits;
@@ -488,6 +491,8 @@ struct InMemoryState {
     run_pipeline_source: HashMap<RunId, scarab_engine::RunPipelineSource>,
     /// Per-run Headline / trigger title (mirrors the `trigger_title` column).
     run_trigger_title: HashMap<RunId, String>,
+    /// Per-run start DelegationTrail (mirrors the `origin_via` column).
+    run_origin_via: HashMap<RunId, scarab_engine::DelegationTrail>,
     /// Refused Run creations (ADR-0076; mirrors `refused_runs`).
     refused_runs: Vec<scarab_engine::RefusedRun>,
     /// ForgeConnection registry rows (ADR-0046).
@@ -2068,6 +2073,26 @@ impl Db for InMemoryDb {
             .cloned())
     }
 
+    async fn set_run_origin_via(
+        &self,
+        run: &RunId,
+        via: &scarab_engine::DelegationTrail,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_origin_via
+            .insert(run.clone(), via.clone());
+        Ok(())
+    }
+
+    async fn run_origin_via(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::DelegationTrail>, DbError> {
+        Ok(self.state.lock().unwrap().run_origin_via.get(run).cloned())
+    }
+
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
         let st = self.state.lock().unwrap();
         let n = st
@@ -2533,6 +2558,22 @@ impl Db for InMemoryDb {
             .filter(|e| &e.run == run)
             .cloned()
             .collect())
+    }
+
+    async fn run_trigger_record(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|e| &e.run == run)
+            .find_map(|e| match &e.kind {
+                scarab_engine::EventPayload::Raw(v) if v["trigger"]["event"].is_object() => {
+                    Some(v.clone())
+                }
+                _ => None,
+            }))
     }
 
     async fn append_log_row(
@@ -3470,6 +3511,7 @@ impl Db for InMemoryDb {
                 reason: "released".to_string(),
                 expired: false,
                 by: None,
+                via: None,
                 fence: None,
                 legacy_started_at: at,
                 at,
@@ -6174,9 +6216,15 @@ impl scarab_identity::ApiTokenStore for InMemoryApiTokens {
 
     async fn by_hash(
         &self,
-        hash: &str,
+        plain_hash: &str,
+        restricted_hash: &str,
     ) -> Result<Option<scarab_identity::ApiToken>, IdentityError> {
-        Ok(self.tokens.lock().unwrap().get(hash).cloned())
+        // The Postgres adapter's rule: a row matches only under the hash its
+        // restrictions call for.
+        let tokens = self.tokens.lock().unwrap();
+        let plain = tokens.get(plain_hash).filter(|t| !t.is_restricted());
+        let restricted = tokens.get(restricted_hash).filter(|t| t.is_restricted());
+        Ok(plain.or(restricted).cloned())
     }
 
     async fn by_id(&self, id: &str) -> Result<Option<scarab_identity::ApiToken>, IdentityError> {
@@ -7095,4 +7143,343 @@ pub async fn seed_log_row(
     // Let it go, so the next writer of the stream can take it.
     db.release_lease(&resource, "seed").await.expect("release");
     meta
+}
+
+/// An in-memory [`scarab_identity::OAuthStore`] with the Postgres adapter's
+/// rules: a code is spent once, only before it expires and only by its
+/// client, redirect and challenge; a rotation moves only the generation and
+/// access token it names; one retry per rotation; a revocation happens once
+/// and revokes every access token minted for the grant. Access tokens go
+/// into the [`InMemoryApiTokens`] it was given.
+#[derive(Default)]
+pub struct InMemoryOAuth {
+    state: Mutex<InMemoryOAuthState>,
+    tokens: Arc<InMemoryApiTokens>,
+}
+
+#[derive(Default)]
+struct InMemoryOAuthState {
+    hosts: Vec<scarab_identity::OAuthClientMetadataHost>,
+    /// code hash → (code, consumed).
+    codes: HashMap<String, (scarab_identity::OAuthAuthorizationCode, bool)>,
+    grants: HashMap<String, scarab_identity::OAuthGrant>,
+    /// access token id → the grant it was minted for.
+    token_grants: HashMap<String, String>,
+}
+
+impl InMemoryOAuth {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// One whose access tokens are stored in `tokens`, the store the server
+    /// authenticates with.
+    pub fn with_api_tokens(tokens: Arc<InMemoryApiTokens>) -> Self {
+        Self {
+            state: Mutex::default(),
+            tokens,
+        }
+    }
+
+    /// Revoke every live access token minted for one of `grant_ids`.
+    fn revoke_grant_tokens(&self, st: &InMemoryOAuthState, grant_ids: &[String], now_ms: i64) {
+        let mut tokens = self.tokens.tokens.lock().unwrap();
+        for t in tokens.values_mut() {
+            let of_grant = st
+                .token_grants
+                .get(&t.id)
+                .is_some_and(|g| grant_ids.contains(g));
+            if of_grant && t.revoked_at.is_none() {
+                t.revoked_at = Some(now_ms);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl scarab_identity::OAuthStore for InMemoryOAuth {
+    async fn client_metadata_hosts(
+        &self,
+        org: &str,
+    ) -> Result<Vec<scarab_identity::OAuthClientMetadataHost>, IdentityError> {
+        let mut out: Vec<_> = self
+            .state
+            .lock()
+            .unwrap()
+            .hosts
+            .iter()
+            .filter(|h| h.org == org)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.host.cmp(&b.host));
+        Ok(out)
+    }
+
+    async fn put_client_metadata_host(
+        &self,
+        host: &scarab_identity::OAuthClientMetadataHost,
+    ) -> Result<(), IdentityError> {
+        let mut st = self.state.lock().unwrap();
+        if !st
+            .hosts
+            .iter()
+            .any(|h| h.org == host.org && h.host == host.host)
+        {
+            st.hosts.push(host.clone());
+        }
+        Ok(())
+    }
+
+    async fn delete_client_metadata_host(
+        &self,
+        org: &str,
+        host: &str,
+        now_ms: i64,
+    ) -> Result<bool, IdentityError> {
+        let mut st = self.state.lock().unwrap();
+        let before = st.hosts.len();
+        st.hosts.retain(|h| !(h.org == org && h.host == host));
+        if st.hosts.len() == before {
+            return Ok(false);
+        }
+        let mut revoked = Vec::new();
+        for g in st.grants.values_mut() {
+            if g.org == org && g.client_host == host && g.revoked_at.is_none() {
+                g.revoked_at = Some(now_ms);
+                g.revoked_reason = Some("client metadata host removed".to_string());
+                revoked.push(g.id.clone());
+            }
+        }
+        self.revoke_grant_tokens(&st, &revoked, now_ms);
+        Ok(true)
+    }
+
+    async fn put_authorization_code(
+        &self,
+        code: &scarab_identity::OAuthAuthorizationCode,
+        code_hash: &str,
+    ) -> Result<(), IdentityError> {
+        self.state
+            .lock()
+            .unwrap()
+            .codes
+            .insert(code_hash.to_string(), (code.clone(), false));
+        Ok(())
+    }
+
+    async fn consume_authorization_code(
+        &self,
+        code_hash: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code_challenge: &str,
+        now_ms: i64,
+    ) -> Result<Option<scarab_identity::OAuthAuthorizationCode>, IdentityError> {
+        let mut st = self.state.lock().unwrap();
+        match st.codes.get_mut(code_hash) {
+            Some((code, consumed))
+                if !*consumed
+                    && code.expires_at > now_ms
+                    && code.client_id == client_id
+                    && code.redirect_uri == redirect_uri
+                    && code.code_challenge == code_challenge =>
+            {
+                *consumed = true;
+                Ok(Some(code.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn pending_authorization_code(
+        &self,
+        code_hash: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code_challenge: &str,
+        now_ms: i64,
+    ) -> Result<Option<scarab_identity::OAuthAuthorizationCode>, IdentityError> {
+        let st = self.state.lock().unwrap();
+        Ok(match st.codes.get(code_hash) {
+            Some((code, false))
+                if code.expires_at > now_ms
+                    && code.client_id == client_id
+                    && code.redirect_uri == redirect_uri
+                    && code.code_challenge == code_challenge =>
+            {
+                Some(code.clone())
+            }
+            _ => None,
+        })
+    }
+
+    async fn replayed_authorization_code(
+        &self,
+        code_hash: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code_challenge: &str,
+    ) -> Result<Option<String>, IdentityError> {
+        let st = self.state.lock().unwrap();
+        Ok(match st.codes.get(code_hash) {
+            Some((code, true))
+                if code.client_id == client_id
+                    && code.redirect_uri == redirect_uri
+                    && code.code_challenge == code_challenge =>
+            {
+                Some(code.grant_id.clone())
+            }
+            _ => None,
+        })
+    }
+
+    async fn delete_expired_authorization_codes(&self, now_ms: i64) -> Result<u64, IdentityError> {
+        let mut st = self.state.lock().unwrap();
+        let before = st.codes.len();
+        st.codes.retain(|_, (c, _)| c.expires_at > now_ms);
+        Ok((before - st.codes.len()) as u64)
+    }
+
+    async fn put_oauth_grant(
+        &self,
+        grant: &scarab_identity::OAuthGrant,
+    ) -> Result<(), IdentityError> {
+        self.state
+            .lock()
+            .unwrap()
+            .grants
+            .insert(grant.id.clone(), grant.clone());
+        Ok(())
+    }
+
+    async fn put_oauth_access_token(
+        &self,
+        token: &scarab_identity::PrincipalToken,
+        stored_hash: &str,
+        grant_id: &str,
+    ) -> Result<(), IdentityError> {
+        scarab_identity::ApiTokenStore::put(self.tokens.as_ref(), token, stored_hash).await?;
+        self.state
+            .lock()
+            .unwrap()
+            .token_grants
+            .insert(token.id.clone(), grant_id.to_string());
+        Ok(())
+    }
+
+    async fn oauth_grant(
+        &self,
+        id: &str,
+    ) -> Result<Option<scarab_identity::OAuthGrant>, IdentityError> {
+        Ok(self.state.lock().unwrap().grants.get(id).cloned())
+    }
+
+    async fn oauth_grants_of(
+        &self,
+        principal: &str,
+    ) -> Result<Vec<scarab_identity::OAuthGrant>, IdentityError> {
+        let mut out: Vec<_> = self
+            .state
+            .lock()
+            .unwrap()
+            .grants
+            .values()
+            .filter(|g| g.principal_subject == principal)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
+    async fn rotate_oauth_grant(
+        &self,
+        id: &str,
+        from_generation: i64,
+        previous_access_token_id: Option<&str>,
+        access_token_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, IdentityError> {
+        let mut st = self.state.lock().unwrap();
+        match st.grants.get_mut(id) {
+            Some(g)
+                if g.generation == from_generation
+                    && g.revoked_at.is_none()
+                    && g.access_token_id.as_deref() == previous_access_token_id =>
+            {
+                g.generation += 1;
+                g.rotated_at = Some(now_ms);
+                g.last_used_at = now_ms;
+                g.access_token_id = Some(access_token_id.to_string());
+                g.retried = false;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn replace_oauth_grant_access_token(
+        &self,
+        id: &str,
+        generation: i64,
+        previous_access_token_id: Option<&str>,
+        access_token_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, IdentityError> {
+        let mut st = self.state.lock().unwrap();
+        match st.grants.get_mut(id) {
+            Some(g)
+                if g.generation == generation
+                    && g.revoked_at.is_none()
+                    && !g.retried
+                    && g.access_token_id.as_deref() == previous_access_token_id =>
+            {
+                g.access_token_id = Some(access_token_id.to_string());
+                g.last_used_at = now_ms;
+                g.retried = true;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn revoke_oauth_grant(
+        &self,
+        id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<Option<scarab_identity::OAuthGrant>, IdentityError> {
+        let mut st = self.state.lock().unwrap();
+        let revoked = match st.grants.get_mut(id) {
+            Some(g) if g.revoked_at.is_none() => {
+                g.revoked_at = Some(now_ms);
+                g.revoked_reason = Some(reason.to_string());
+                Some(g.clone())
+            }
+            _ => None,
+        };
+        if revoked.is_some() {
+            self.revoke_grant_tokens(&st, &[id.to_string()], now_ms);
+        }
+        Ok(revoked)
+    }
+
+    async fn revoke_installation_oauth_grants(
+        &self,
+        installation_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<Vec<scarab_identity::OAuthGrant>, IdentityError> {
+        let mut st = self.state.lock().unwrap();
+        let mut out = Vec::new();
+        for g in st.grants.values_mut() {
+            if g.installation_id == installation_id && g.revoked_at.is_none() {
+                g.revoked_at = Some(now_ms);
+                g.revoked_reason = Some(reason.to_string());
+                out.push(g.clone());
+            }
+        }
+        let ids: Vec<String> = out.iter().map(|g| g.id.clone()).collect();
+        self.revoke_grant_tokens(&st, &ids, now_ms);
+        Ok(out)
+    }
 }

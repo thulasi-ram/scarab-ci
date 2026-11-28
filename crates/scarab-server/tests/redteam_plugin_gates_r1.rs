@@ -107,6 +107,7 @@ fn state(pg: Arc<PostgresDb>, clock: Arc<FakeClock>) -> AppState {
                 enabled: true,
                 namespace: NAMESPACE.into(),
                 dev_allow_tag: false,
+                trusted_publishers: Vec::new(),
             },
         )
         .with_plugin_tokens(Arc::new(Verifier {
@@ -722,9 +723,15 @@ async fn a_cancelled_run_s_gate_is_neither_listed_nor_released() {
     };
     let (_, page) = pending(&w.broker, "acme", &w.prod, "").await;
     let attempt = attempt_of(&page, "live");
-    scarab_engine::cancel_run_request(w.pg.as_ref(), w.clock.as_ref(), &w.run, Some("ada".into()))
-        .await
-        .unwrap();
+    scarab_engine::cancel_run_request(
+        w.pg.as_ref(),
+        w.clock.as_ref(),
+        &w.run,
+        Some("ada".into()),
+        None,
+    )
+    .await
+    .unwrap();
     let (_, page) = pending(&w.broker, "acme", &w.prod, "").await;
     assert_eq!(page["gates"], json!([]), "{page}");
     let (status, body) = release(&w.broker, &w.run, "live", &w.prod, pass(&attempt)).await;
@@ -759,6 +766,7 @@ async fn a_release_landing_after_a_person_s_reject_takes_nothing() {
         &StepId("live".into()),
         "ada",
         "rolled back",
+        None,
     )
     .await
     .unwrap();
@@ -769,6 +777,7 @@ async fn a_release_landing_after_a_person_s_reject_takes_nothing() {
         reason: "released by plugin:argocd-prod".into(),
         expired: false,
         by: Some("plugin:argocd-prod".into()),
+        via: None,
         fence: Some(AttemptId(attempt.clone())),
         legacy_started_at: now,
         at: now,

@@ -100,7 +100,25 @@ async fn the_0106_revert_runs_twice_and_the_migrator_upgrades_again() {
     .await
     .unwrap();
 
-    // The migrator ran the newer migrations too: back to 0.8.2, then 0.7.5.
+    // The migrator ran the newer migrations too: back past the Fork Run
+    // approval setting, then the OAuth and delegated-call tables, then to
+    // 0.8.3, then 0.8.2, then 0.7.5.
+    sqlx::raw_sql(include_str!("../rollback/0114_revert.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../rollback/0113_revert.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../rollback/0112_revert.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../rollback/0111_revert.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::raw_sql(include_str!("../rollback/0110_revert.sql"))
         .execute(&pool)
         .await

@@ -292,13 +292,13 @@ async fn a_cancelled_step_and_its_event_are_one_commit() {
     assert_eq!(status_of(&db, "s").await, StepStatus::Running);
 
     db.fail_next_event_append(is_step_transitioned);
-    assert!(cancel_run_request(&db, &clock, &run_id(), None)
+    assert!(cancel_run_request(&db, &clock, &run_id(), None, None)
         .await
         .is_err());
     every_terminal_step_is_journaled(&db).await;
     assert_eq!(status_of(&db, "s").await, StepStatus::Running);
 
-    assert!(cancel_run_request(&db, &clock, &run_id(), None)
+    assert!(cancel_run_request(&db, &clock, &run_id(), None, None)
         .await
         .unwrap());
     assert_eq!(status_of(&db, "s").await, StepStatus::Cancelled);
@@ -327,7 +327,7 @@ fn is_run_transitioned(p: &EventPayload) -> bool {
 /// the run must stay as it was, and the re-sent cancel lands all three.
 async fn run_transition_crash(db: &dyn Db, clock: &FakeClock) {
     assert!(
-        cancel_run_request(db, clock, &run_id(), None)
+        cancel_run_request(db, clock, &run_id(), None, None)
             .await
             .is_err(),
         "the crash was injected"
@@ -341,7 +341,7 @@ async fn run_transition_crash(db: &dyn Db, clock: &FakeClock) {
 
 async fn run_transition_converges(db: &dyn Db, clock: &FakeClock) {
     use scarab_engine::RunStatus;
-    assert!(cancel_run_request(db, clock, &run_id(), None)
+    assert!(cancel_run_request(db, clock, &run_id(), None, None)
         .await
         .unwrap());
     assert_eq!(

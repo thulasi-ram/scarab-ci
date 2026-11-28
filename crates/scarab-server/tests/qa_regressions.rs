@@ -231,7 +231,7 @@ async fn operator_cancel_is_attributed_to_the_authenticated_principal() {
         .unwrap()
         .into_iter()
         .filter_map(|e| match e.kind {
-            EventPayload::RunCancelRequested { by } => Some(by),
+            EventPayload::RunCancelRequested { by, .. } => Some(by),
             _ => None,
         })
         .collect();

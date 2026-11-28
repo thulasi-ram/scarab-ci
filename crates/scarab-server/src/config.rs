@@ -42,10 +42,14 @@
 //! | `SCARAB_OIDC_ISSUER` | env | enables the OIDC issuer (keyless federation, ADR-0015) |
 //! | `SCARAB_OIDC_SIGNING_KEY_FILE` | env | PKCS#8 RSA PEM the issuer signs with — **required** when the issuer is enabled (persistent across restarts/replicas) |
 //! | `SCARAB_OIDC_AUDIENCE` | env | `aud` of minted per-run tokens (ADR-0015); default `scarab` |
+//! | `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` | env | the longest a step OIDC token lives; a token lives for its step's timeout, at most this long, and this long for a step with no timeout. Default 3600, from 60 to 43200 (12h, the longest AWS session) |
+//! | `SCARAB_OIDC_PUBLIC_KEYS` | env | further RSA public keys (SPKI PEM blocks) the JWKS lists beside the signing key: the previous and the next key of a key change. Never signed with |
 //! | `SCARAB_MASTER_KEYS` | env | comma-separated base64 32-byte KEKs for envelope encryption; **first = active writer**, the rest decrypt-only (rotation, git-bug f37463a). Authoritative when set |
 //! | `SCARAB_MASTER_KEY` | env | legacy single KEK ≡ a one-key list (ADR-0014) — one of the two is **required** unless `SCARAB_DEV_INSECURE=1`. When both are set the list wins; a legacy key that is not a list member refuses to boot |
 //! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
 //! | `SCARAB_STEP_UP` | env | step-up confirmation (ADR-0073). Unset/blank or `enforce` = **enforce** (production: crown-jewel operations need a passkey confirmation); any other value refuses boot — there is no `off` or `log` mode. Under `SCARAB_DEV_INSECURE=1` it is off unless explicitly `enforce` (local passkey testing). Enforce with OAuth login needs an `https` (or loopback) `SCARAB_PUBLIC_URL` |
+//! | `SCARAB_OAUTH_SERVER` | env | the OAuth authorization server for plugin endpoints (ADR-0086 §7): `on` or `off` (default `off`). Off, every OAuth route and every plugin endpoint answers 404; any other value refuses boot |
+//! | `SCARAB_OAUTH_REFRESH_KEY` | env | the key refresh secrets are an HMAC under; required when `SCARAB_OAUTH_SERVER=on`, at least 32 bytes, the same on every replica. Changing it ends every connected app's refresh |
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
 //! | `SCARAB_DRIVER_STALL_CUTOFF_SECS` | env | seconds a scheduler driver cycle may go without progress before it is cut off and the next starts (git-bug afa9f07); default 60, from 30 to 3600 |
 //! | `SCARAB_DRIVER_STALLED_AFTER_SECS` | env | seconds the scheduler driver may go without progress before `/livez` fails, so Kubernetes restarts the Pod; default 90 (or the cutoff plus 30 when that is more), at least the cutoff plus 30, at most 3600 |
@@ -75,7 +79,7 @@
 //! | `SCARAB_PLUGIN_NAMESPACE` | env | the one shared namespace Plugins run in (ADR-0072 §9); default `scarab-plugins`. A broker caller's ServiceAccount must be in it. Never `SCARAB_NAMESPACE`, `default` or `kube-*` (refused at boot) |
 //! | `SCARAB_PLUGIN_BROKER_URL` | env | the broker URL the runtime injects into every Plugin Pod (`SCARAB_BROKER_URL`); default `http://scarab-broker:8090`. Plugins have no DNS, so a host NAME is resolved by the runtime every pass and injected as an IP |
 //! | `SCARAB_PLUGIN_OWNER` | env | which Scarab release this is, `<release namespace>.<release name>` (a label value): stamped on the plugin namespace (`scarab.io/plugin-runtime-owner`) and on everything the runtime creates. The runtime refuses a namespace stamped for another release, or not stamped. Unset = the runtime refuses its baseline and no Plugin runs. The chart sets it |
-//! | `SCARAB_PLUGIN_BROKER_PEER` | env | how the `plugin-egress` NetworkPolicy names the broker: `pods:<namespace>:<k=v,…>` or `cidr:<ip>/<prefix>` (at most a /24). Unset = the runtime refuses its baseline and no Plugin runs |
+//! | `SCARAB_PLUGIN_BROKER_PEER` | env | how the `plugin-egress` and `plugin-endpoint-ingress` NetworkPolicies name the broker (the server): `pods:<namespace>:<k=v,…>` or `cidr:<ip>/<prefix>` (at most a /24). A `cidr:` peer admits every address in that block to a plugin's endpoint port. Unset = the runtime refuses its baseline and no Plugin runs |
 //! | `SCARAB_PLUGIN_PROBE_IMAGE` | env | the isolation-probe and per-Pod self-check image (ADR-0072 §9); default `busybox:1.36.1` pinned by digest. Pin an override by digest too |
 //! | `SCARAB_PLUGIN_PLACEMENT` | env | JSON `{"tolerations": [...], "nodeSelector": {...}}`: put on every plugin Pod and every isolation-probe Pod, for clusters whose nodes are all tainted (git-bug 1b8202c). Unset = none. An unknown key, top-level or in a toleration, refuses boot |
 //! | `SCARAB_DEV_PLUGIN_TOKENS` | env | **dev only, needs `SCARAB_DEV_INSECURE`**: `<installation-id>=<token>,…` static broker tokens standing in for TokenReview (slice d2). Loud at boot |
@@ -484,6 +488,14 @@ pub struct OidcConfig {
     /// The `aud` claim of minted per-run tokens (ADR-0015) — what the cloud's
     /// trust policy is configured to expect. Default `scarab`.
     pub audience: String,
+    /// Further RSA public keys (`SCARAB_OIDC_PUBLIC_KEYS`, SPKI PEM blocks one
+    /// after the other) the JWKS lists beside the signing key: the previous
+    /// and the next key of a key change. The issuer never signs with them.
+    pub public_keys_pem: Option<String>,
+    /// The longest a step token lives, in seconds
+    /// (`SCARAB_OIDC_TOKEN_MAX_TTL_SECS`, default 3600). A token lives for its
+    /// Step's timeout, at most this long, and this long when the Step has none.
+    pub token_max_ttl_secs: u32,
 }
 
 /// A string whose value must never reach a log line. `Debug` prints `***`, so
@@ -753,6 +765,10 @@ pub struct Config {
     pub plugins: PluginsConfig,
     /// Step-up confirmation (ADR-0073, `SCARAB_STEP_UP`).
     pub step_up: StepUpMode,
+    /// The OAuth authorization server for Plugin endpoints (ADR-0086 §7),
+    /// `SCARAB_OAUTH_SERVER=on`. `None`: off, and every OAuth route answers
+    /// 404.
+    pub oauth_server: Option<OAuthServerConfig>,
 }
 
 /// Whether crown-jewel operations need a passkey StepUpConfirmation
@@ -848,6 +864,11 @@ pub struct PluginsConfig {
     /// Dev only: static `(installation id, token)` pairs standing in for
     /// TokenReview.
     pub dev_tokens: Vec<(String, Redacted)>,
+    /// `SCARAB_PLUGIN_TRUSTED_PUBLISHERS` (ADR-0086 §8): the image
+    /// repositories (`registry/namespace/name`, the registry lowercased) a
+    /// `trusted_service` Plugin may run from, compared whole. Empty (the
+    /// default): no Plugin with an endpoint can be installed.
+    pub trusted_publishers: Vec<String>,
 }
 
 impl PluginsConfig {
@@ -994,6 +1015,25 @@ impl PluginsConfig {
                 tokens
             }
         };
+        let trusted_publishers = match set("SCARAB_PLUGIN_TRUSTED_PUBLISHERS") {
+            None => Vec::new(),
+            Some(raw) => {
+                let mut publishers: Vec<String> = Vec::new();
+                for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+                    let publisher = crate::plugins::trusted_publisher(entry).ok_or_else(|| {
+                        invalid(format!(
+                            "SCARAB_PLUGIN_TRUSTED_PUBLISHERS: `{entry}` is not an image \
+                             repository `registry/namespace/name` (or `registry/name`) with no tag, digest or \
+                             glob"
+                        ))
+                    })?;
+                    if !publishers.contains(&publisher) {
+                        publishers.push(publisher);
+                    }
+                }
+                publishers
+            }
+        };
         Ok(PluginsConfig {
             enabled,
             broker_addr,
@@ -1005,6 +1045,7 @@ impl PluginsConfig {
             owner,
             dev_allow_tag,
             dev_tokens,
+            trusted_publishers,
         })
     }
 
@@ -1021,6 +1062,7 @@ impl PluginsConfig {
             owner: None,
             dev_allow_tag: false,
             dev_tokens: Vec::new(),
+            trusted_publishers: Vec::new(),
         }
     }
 }
@@ -1407,6 +1449,13 @@ pub enum ConfigError {
     InvalidStepTimeout,
 
     #[error(
+        "SCARAB_OIDC_TOKEN_MAX_TTL_SECS is set but invalid — want a whole number of seconds \
+         from 60 to 43200 (12h, the longest session AWS grants for one). It caps how long \
+         a step OIDC token lives; default 3600."
+    )]
+    InvalidOidcTokenMaxTtl,
+
+    #[error(
         "SCARAB_PROJECT_RUN_CAP is set but invalid (got {0:?}) — want a non-negative \
          integer: the most Runs of one project that may be Running at once (ADR-0011); \
          0 or unset means no cap."
@@ -1508,6 +1557,57 @@ pub enum ConfigError {
          boot (ADR-0048), so this refuses to start."
     )]
     InvalidPlugins(String),
+    #[error(
+        "the OAuth authorization server configuration is invalid (ADR-0086 §7): {0}. Refresh \
+         secrets are derived with one key every replica shares, so the server refuses to start \
+         without it rather than mint secrets another replica cannot check."
+    )]
+    InvalidOAuthServer(String),
+}
+
+/// The OAuth authorization server's settings (ADR-0086 §7).
+#[derive(Debug, Clone)]
+pub struct OAuthServerConfig {
+    /// `SCARAB_OAUTH_REFRESH_KEY`: the HMAC key refresh secrets are derived
+    /// with, the same on every replica, at least [`MIN_OAUTH_REFRESH_KEY_BYTES`].
+    pub refresh_key: Redacted,
+}
+
+/// The shortest refresh key accepted.
+pub const MIN_OAUTH_REFRESH_KEY_BYTES: usize = 32;
+
+impl OAuthServerConfig {
+    /// `SCARAB_OAUTH_SERVER` (`on` | `off`, default off) and, when on,
+    /// `SCARAB_OAUTH_REFRESH_KEY`.
+    fn resolve(env: &impl Fn(&str) -> Option<String>) -> Result<Option<Self>, ConfigError> {
+        let set = |k: &str| {
+            env(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        match set("SCARAB_OAUTH_SERVER").as_deref() {
+            None | Some("off") => Ok(None),
+            Some("on") => {
+                let key = set("SCARAB_OAUTH_REFRESH_KEY").ok_or_else(|| {
+                    ConfigError::InvalidOAuthServer(
+                        "SCARAB_OAUTH_SERVER=on needs SCARAB_OAUTH_REFRESH_KEY".into(),
+                    )
+                })?;
+                if key.len() < MIN_OAUTH_REFRESH_KEY_BYTES {
+                    return Err(ConfigError::InvalidOAuthServer(format!(
+                        "SCARAB_OAUTH_REFRESH_KEY must be at least {MIN_OAUTH_REFRESH_KEY_BYTES} \
+                         bytes"
+                    )));
+                }
+                Ok(Some(OAuthServerConfig {
+                    refresh_key: Redacted::new(&key),
+                }))
+            }
+            Some(other) => Err(ConfigError::InvalidOAuthServer(format!(
+                "SCARAB_OAUTH_SERVER must be `on` or `off`, got {other:?}"
+            ))),
+        }
+    }
 }
 
 impl Config {
@@ -1643,6 +1743,20 @@ impl Config {
                 audience: env("SCARAB_OIDC_AUDIENCE")
                     .filter(|v| !v.is_empty())
                     .unwrap_or_else(|| "scarab".into()),
+                public_keys_pem: env("SCARAB_OIDC_PUBLIC_KEYS").filter(|v| !v.trim().is_empty()),
+                token_max_ttl_secs: match env("SCARAB_OIDC_TOKEN_MAX_TTL_SECS")
+                    .filter(|v| !v.trim().is_empty())
+                {
+                    Some(v) => v
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|s| {
+                            (60..=crate::secret_executor::MAX_OIDC_TOKEN_MAX_TTL_SECS).contains(s)
+                        })
+                        .ok_or(ConfigError::InvalidOidcTokenMaxTtl)?,
+                    None => crate::secret_executor::DEFAULT_OIDC_TOKEN_MAX_TTL_SECS,
+                },
             }),
             None => None,
         };
@@ -1999,6 +2113,7 @@ impl Config {
             connections,
             plugins,
             step_up,
+            oauth_server: OAuthServerConfig::resolve(&env)?,
         })
     }
 
@@ -2237,8 +2352,13 @@ impl Config {
             ),
             match &self.oidc {
                 Some(o) => format!(
-                    "oidc issuer: {} (signing key: {})",
-                    o.issuer_url, o.signing_key_file,
+                    "oidc issuer: {} (signing key: {}; token max ttl: {}s; further public keys: {})",
+                    o.issuer_url,
+                    o.signing_key_file,
+                    o.token_max_ttl_secs,
+                    o.public_keys_pem
+                        .as_deref()
+                        .map_or(0, |pem| pem.matches("-----BEGIN ").count()),
                 ),
                 None => "oidc issuer: disabled".to_string(),
             },

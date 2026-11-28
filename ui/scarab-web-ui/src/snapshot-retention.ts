@@ -32,7 +32,7 @@ export type RetentionInfo = {
 /** One plan member with its WHY (`RerunPlanResponse.steps[]`, git-bug 4afaa3e). */
 export type PlannedStepInfo = {
   step: string;
-  reason: "target" | "cascade" | "regenerate" | "regenerate_cascade";
+  reason: "target" | "cascade" | "regenerate" | "regenerate_cascade" | "fork_run_approval";
   /** The in-set step this one is here because of; absent only on the target. */
   because_of?: string | null;
   /** A gate: the rerun pauses for approval here — it never "runs". */

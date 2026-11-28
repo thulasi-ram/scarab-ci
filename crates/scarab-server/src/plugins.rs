@@ -80,6 +80,9 @@ pub struct PluginPolicy {
     /// Dev only: any install may name `<repository>:<tag>` instead of a
     /// digest.
     pub dev_allow_tag: bool,
+    /// The image repositories a `trusted_service` Plugin may run from
+    /// (ADR-0086 §8), as [`trusted_publisher`] normalises them. Empty: none.
+    pub trusted_publishers: Vec<String>,
 }
 
 impl PluginPolicy {
@@ -88,6 +91,7 @@ impl PluginPolicy {
             enabled: c.enabled,
             namespace: c.namespace.clone(),
             dev_allow_tag: c.dev_allow_tag,
+            trusted_publishers: c.trusted_publishers.clone(),
         }
     }
 
@@ -137,6 +141,82 @@ fn check_image(image: &str, allow_tag: bool) -> Result<(), ApiError> {
             ""
         }
     )))
+}
+
+/// An operator's trusted-publisher entry, or an installed image's
+/// repository, as the two are compared (ADR-0086 §8): `registry/namespace/
+/// name` (or `registry/name` on a registry without namespaces) with the
+/// registry lowercased, no tag, no digest, no glob. `None` for anything
+/// else, a reference without a registry host included: the registry is part
+/// of who published it.
+pub fn trusted_publisher(repository: &str) -> Option<String> {
+    let (registry, rest) = repository.split_once('/')?;
+    let registry = registry.to_ascii_lowercase();
+    let normalised = format!("{registry}/{rest}");
+    let looks_like_registry = registry.contains('.') || registry.contains(':');
+    (looks_like_registry && is_image_repository(&normalised)).then_some(normalised)
+}
+
+/// Check a manifest's endpoint registrations against this server
+/// (ADR-0086 §4): every ApiOperation an endpoint operation `may` use exists
+/// and is one a DelegatedCallerHandle can be given ([`ops::delegable`]).
+fn check_endpoint_operations(manifest: &PluginManifest) -> Result<(), String> {
+    for (name, operation) in manifest.endpoint_operations() {
+        for id in &operation.may {
+            let Some(op) = crate::step_up::ops::by_id(id) else {
+                return Err(format!(
+                    "endpoint operation `{name}` may use `{id}`, which is not an operation"
+                ));
+            };
+            if let Err(why) = crate::step_up::ops::delegable(op) {
+                return Err(format!(
+                    "endpoint operation `{name}` may use `{id}`, which a plugin can never use \
+                     for a caller: {why}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// May `image` run as a `trusted_service` Plugin with `manifest` (ADR-0086
+/// §8)? Only when the manifest has an endpoint registration does this ask
+/// anything: then the image must be pinned by digest (a tag under the dev
+/// knob, in dev only) and its repository must be one the operator lists in
+/// `plugins.trustedPublishers`. No publisher is trusted by default, Scarab's
+/// own included.
+///
+/// `policy` is the server's live one, so a publisher the operator delists
+/// is refused at once. Install, upgrade and enable call this, PluginApi on
+/// every call, and the endpoint that forwards outside requests (step 7) must
+/// call it before forwarding. It does not stop a running Pod: the runtime
+/// keeps it until an admin kills or uninstalls it.
+pub(crate) fn check_trusted_service(
+    policy: &PluginPolicy,
+    manifest: &PluginManifest,
+    image: &str,
+) -> Result<(), ApiError> {
+    if manifest.trust_tier().is_none() {
+        return Ok(());
+    }
+    if !image.contains("@sha256:") && !policy.dev_allow_tag {
+        return Err(ApiError::BadRequest(format!(
+            "image `{image}` is not pinned by digest; a plugin with an endpoint runs as \
+             `trusted_service` and only from a digest"
+        )));
+    }
+    let repository = image_repository(image);
+    let trusted = trusted_publisher(repository)
+        .is_some_and(|r| policy.trusted_publishers.iter().any(|t| *t == r));
+    if !trusted {
+        return Err(ApiError::Denied(format!(
+            "plugin `{}` registers an endpoint, so it runs as `trusted_service`, and the \
+             operator has not listed its image repository `{repository}` in \
+             plugins.trustedPublishers (SCARAB_PLUGIN_TRUSTED_PUBLISHERS)",
+            manifest.plugin
+        )));
+    }
+    Ok(())
 }
 
 /// A server-minted installation id: 10 random lowercase hex characters. It
@@ -282,6 +362,14 @@ pub struct PluginManifestDto {
     /// The gates the plugin resolves, by name; empty without
     /// `resolve_gates`.
     pub gates: Vec<GateDefinitionDto>,
+    /// `trusted_service` when the plugin registers an endpoint: it acts for
+    /// many callers, and runs only from a publisher the operator lists.
+    /// Absent otherwise.
+    pub trust_tier: Option<String>,
+    /// Each request its endpoints take, one line each: `<path>/<operation>:
+    /// <method> <JSON checks>; may <operations>; writes <n>`. Empty when it
+    /// registers no endpoint.
+    pub endpoint_operations: Vec<String>,
 }
 
 /// A gate a plugin resolves: a Pipeline waits on it with `invoke:
@@ -357,6 +445,12 @@ impl From<&PluginManifest> for PluginManifestDto {
                         })
                         .collect(),
                 })
+                .collect(),
+            trust_tier: m.trust_tier().map(|t| t.as_str().to_string()),
+            endpoint_operations: m
+                .endpoint_operations()
+                .into_iter()
+                .map(|(name, op)| format!("{name}: {}", op.describe()))
                 .collect(),
         }
     }
@@ -663,6 +757,9 @@ pub struct ManifestDiffDto {
     pub gates: ManifestDiffGroupDto,
     /// The image repository the manifest names.
     pub image: ManifestDiffGroupDto,
+    /// Endpoint operations by `<path>/<operation>`, each compared as its
+    /// whole definition; one that changed is both removed and added.
+    pub endpoint_operations: ManifestDiffGroupDto,
 }
 
 impl From<&ManifestDiff> for ManifestDiffDto {
@@ -675,6 +772,7 @@ impl From<&ManifestDiff> for ManifestDiffDto {
             config_keys: (&d.config_keys).into(),
             gates: (&d.gates).into(),
             image: (&d.image).into(),
+            endpoint_operations: (&d.endpoint_operations).into(),
         }
     }
 }
@@ -1044,6 +1142,8 @@ async fn read_manifest(
     .map_err(|e| ApiError::BadRequest(format!("{src} is not a plugin manifest: {e}")))?;
     admit_for_mmp(&manifest)
         .map_err(|e| ApiError::BadRequest(format!("{src} cannot be installed: {e}")))?;
+    check_endpoint_operations(&manifest)
+        .map_err(|e| ApiError::BadRequest(format!("{src} cannot be installed: {e}")))?;
     Ok((src, content, manifest))
 }
 
@@ -1178,6 +1278,7 @@ pub(crate) async fn install_plugin(
     manifest
         .check_image(&body.image)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    check_trusted_service(&st.plugin_policy, &manifest, &body.image)?;
     manifest
         .validate_config(&body.config)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -1312,11 +1413,22 @@ pub(crate) async fn uninstall_plugin(
 ) -> Result<Json<UninstalledPluginDto>, ApiError> {
     let by = org_admin(&st, &headers, &org).await?;
     let now = st.clock.now().await.0;
+    // Its id, for the delegated caller handles that go with it.
+    let installation_id = store(&st)?
+        .installation(&org, &name)
+        .await
+        .map_err(plugin_store_api_error)?
+        .map(|i| i.id);
     let removed = store(&st)?
         .uninstall(&org, &name, &by, now)
         .await
         .map_err(plugin_store_api_error)?
         .ok_or(ApiError::NotFound)?;
+    if let Some(id) = &installation_id {
+        delete_delegated_caller_handles(&st, id, "uninstalled").await;
+        // Every connected app's grant for its endpoints goes with it.
+        crate::oauth_server::revoke_installation_grants(&st, id).await;
+    }
     // Its connections went with it; their credentials live in another store.
     for credential_ref in &removed.connection_credential_refs {
         delete_connection_credential(&st, credential_ref).await;
@@ -1345,6 +1457,7 @@ async fn set_state(
             by,
             "plugin installation killed (ADR-0072 §10)"
         );
+        delete_delegated_caller_handles(st, &installation.id, "killed").await;
     }
     Ok(Json(installation_view(&st, &installation).await))
 }
@@ -1393,7 +1506,41 @@ pub(crate) async fn enable_plugin(
     headers: HeaderMap,
     Path((org, name)): Path<(String, String)>,
 ) -> Result<Json<PluginInstallationDto>, ApiError> {
+    // A `trusted_service` plugin is re-enabled only while its publisher is
+    // still listed (ADR-0086 §8).
+    org_admin(&st, &headers, &org).await?;
+    if let Some(current) = store(&st)?
+        .installation(&org, &name)
+        .await
+        .map_err(plugin_store_api_error)?
+    {
+        check_trusted_service(&st.plugin_policy, &current.manifest, &current.image)?;
+    }
     set_state(&st, &headers, &org, &name, InstallationState::Enabled).await
+}
+
+/// Delete every DelegatedCallerHandle of installation `id` (ADR-0086 §11):
+/// it was killed, uninstalled, or upgraded. Best-effort:
+/// PluginApi refuses a killed or uninstalled installation's calls anyway,
+/// and a handle lives at most ten minutes.
+async fn delete_delegated_caller_handles(st: &AppState, id: &str, why: &str) {
+    let Some(store) = st.delegated_calls.as_deref() else {
+        return;
+    };
+    match scarab_plugin::DelegatedCallStore::delete_installation_delegated_caller_handles(store, id)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            installation = id,
+            handles = n,
+            why,
+            "delegated caller handles deleted"
+        ),
+        Err(e) => {
+            tracing::warn!(installation = id, why, error = %e, "delegated caller handles not deleted")
+        }
+    }
 }
 
 /// The installed manifest against `new`, and why the upgrade needs a
@@ -1509,6 +1656,13 @@ pub(crate) async fn fetch_plugin_upgrade(
             .check_image(image)
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
+    // Refused here too, so an admin learns before the upgrade that this
+    // image cannot run the new manifest as `trusted_service`.
+    check_trusted_service(
+        &st.plugin_policy,
+        &manifest,
+        image.unwrap_or(current.image.as_str()),
+    )?;
     let (diff, reasons) = upgrade_step_up_reasons(&current, &manifest, image);
     Ok(Json(FetchedPluginUpgradeDto {
         source: src.to_string(),
@@ -1615,6 +1769,7 @@ pub(crate) async fn upgrade_plugin(
     manifest
         .check_image(&body.image)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    check_trusted_service(&st.plugin_policy, &manifest, &body.image)?;
     let (_, reasons) = upgrade_step_up_reasons(&current, &manifest, Some(&body.image));
     if reasons.is_empty() {
         guard.exempt("a same-or-narrower manifest on the installed image");
@@ -1644,6 +1799,10 @@ pub(crate) async fn upgrade_plugin(
     for credential_ref in &upgraded.connection_credential_refs {
         delete_connection_credential(&st, credential_ref).await;
     }
+    // Every upgrade ends the handles the old approval held: a new digest
+    // is new code, and a new manifest can drop or narrow the operations a
+    // handle was minted for.
+    delete_delegated_caller_handles(&st, &current.id, "upgraded").await;
     tracing::warn!(
         org,
         installation = name,
@@ -2160,5 +2319,85 @@ mod tests {
         for _ in 0..32 {
             assert!(scarab_plugin::is_installation_id(&mint_installation_id()));
         }
+    }
+
+    /// An operator's `plugins.trustedPublishers` entry and an image's
+    /// repository compare as `registry/namespace/name`, the registry
+    /// lowercased; a reference with no registry host, a tag, a digest or a
+    /// glob names no publisher.
+    #[test]
+    fn a_trusted_publisher_is_a_whole_repository_with_its_registry() {
+        for (entry, publisher) in [
+            ("ghcr.io/acme/mcp", Some("ghcr.io/acme/mcp")),
+            ("GHCR.io/acme/mcp", Some("ghcr.io/acme/mcp")),
+            (
+                "registry.example.com:5000/mcp",
+                Some("registry.example.com:5000/mcp"),
+            ),
+            ("acme/mcp", None),
+            ("mcp", None),
+            ("ghcr.io/acme/mcp:v1", None),
+            ("ghcr.io/acme/mcp@sha256:abc", None),
+            ("ghcr.io/acme/*", None),
+            ("ghcr.io/Acme/mcp", None),
+        ] {
+            assert_eq!(trusted_publisher(entry).as_deref(), publisher, "{entry}");
+        }
+    }
+
+    /// A plugin with an endpoint runs only by digest and only from a
+    /// repository the operator lists whole; a plugin without one is not
+    /// asked.
+    #[test]
+    fn a_trusted_service_plugin_runs_only_from_a_listed_publisher() {
+        let plain: PluginManifest =
+            serde_json::from_str(include_str!("../../scarab-plugin-argocd/manifest.json")).unwrap();
+        let mut endpoint = plain.clone();
+        endpoint.extensions = vec![serde_json::from_value(serde_json::json!({
+            "point": "endpoint",
+            "path": "mcp",
+            "operations": {
+                "tools_list": {
+                    "match": { "method": "POST", "json": { "/method": "tools/list" } },
+                    "may": []
+                }
+            }
+        }))
+        .unwrap()];
+        let policy = |publishers: &[&str], dev_allow_tag: bool| PluginPolicy {
+            enabled: true,
+            namespace: "scarab-plugins".into(),
+            dev_allow_tag,
+            trusted_publishers: publishers.iter().map(|p| p.to_string()).collect(),
+        };
+        let digest = format!("ghcr.io/acme/mcp@sha256:{}", "a".repeat(64));
+        let listed = policy(&["ghcr.io/acme/mcp"], false);
+
+        assert!(check_trusted_service(&policy(&[], false), &plain, &digest).is_ok());
+        assert!(check_trusted_service(&listed, &endpoint, &digest).is_ok());
+        for (why, publishers) in [
+            ("nothing listed", vec![]),
+            ("another repository", vec!["ghcr.io/acme/other"]),
+            ("a namespace is not a repository", vec!["ghcr.io/acme"]),
+            ("another registry", vec!["docker.io/acme/mcp"]),
+        ] {
+            assert!(
+                matches!(
+                    check_trusted_service(&policy(&publishers, false), &endpoint, &digest),
+                    Err(ApiError::Denied(_))
+                ),
+                "{why}"
+            );
+        }
+        assert!(matches!(
+            check_trusted_service(&listed, &endpoint, "ghcr.io/acme/mcp:v1"),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(check_trusted_service(
+            &policy(&["ghcr.io/acme/mcp"], true),
+            &endpoint,
+            "ghcr.io/acme/mcp:v1"
+        )
+        .is_ok());
     }
 }

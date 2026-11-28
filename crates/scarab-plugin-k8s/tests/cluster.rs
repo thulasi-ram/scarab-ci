@@ -533,7 +533,7 @@ fn installation(image: &str) -> PluginInstallation {
             }],
             config_keys: vec![],
             gates: Default::default(),
-            extensions: None,
+            extensions: Vec::new(),
         },
         manifest_sha256: "f".repeat(64),
         source: None,

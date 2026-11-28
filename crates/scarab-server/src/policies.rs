@@ -1372,6 +1372,7 @@ fn test_event(
             sha,
             fork: false,
             reason: t.reason,
+            via: None,
         },
         TriggerKind::Api => Event::Api {
             actor,
@@ -1380,6 +1381,7 @@ fn test_event(
             sha,
             fork: false,
             reason: t.reason,
+            via: None,
         },
         TriggerKind::Cron => Event::Cron {
             repo,

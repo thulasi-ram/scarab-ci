@@ -18,6 +18,164 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **The OIDC issuer's key id changes.** The `kid` of the signing key, in the JWKS and in every
+  step token's header, was the fixed string `scarab-key-1`. It is now the RFC 7638 thumbprint of
+  the public key (SHA-256, base64url), so the same key keeps the same `kid` on every replica. A
+  verifier that looks the key up in the JWKS by `kid` picks up the new value when it fetches the
+  JWKS again. One that has `scarab-key-1` written into its own configuration must be changed to
+  the new value, which `/.well-known/jwks.json` shows after the upgrade.
+- **Step OIDC tokens of Runs in an Environment change, though their `sub` does not.** Check any
+  trust policy that matches on more than `sub` and `aud`:
+  - A token lives for the step's `timeout:`, at most `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` (default
+    one hour, at most 12 hours); it lived 15 minutes. A copy that leaks from a step stays usable
+    for that long. Set the maximum lower if your steps exchange the token only at the start.
+  - `event` is the Run's trigger kind (`push`, `pull_request`, `manual`, ...); it was always
+    `deploy`. A policy that matched `event` = `deploy` no longer matches.
+  - `sha` is the commit the Run builds; it was always empty. A token with no known commit (a tag
+    or release Run) has no `sha` claim at all.
+  - A Step whose ref has a path component named `env` or `ref` (a branch `env/prod` is
+    `refs/heads/env/prod`), or whose org, repository or Environment name holds a `/`, gets no
+    token. So does a Step of an Environment named `none`.
+- **No new Environment can be named `none`.** It is the `env` segment of the subject of a Step
+  that no Environment admits (fork code, or before its approval). Creating or duplicating to that
+  name answers 400. An Environment named `none` from before this release can still be edited and
+  deleted, but its Steps get no OIDC token: create an Environment with another name and move its
+  pipelines there.
+- **The OIDC issuer refuses keys under 2048 bits.** A signing key or a
+  `SCARAB_OIDC_PUBLIC_KEYS` entry with a shorter RSA modulus stops the server at boot.
+- **Migration 0111 adds `kind`, `operations`, `audience` and `oauth_client` to `api_tokens`.**
+  No row is rewritten; every existing token keeps working as before. A 0.8.4 server does not
+  start on a database that ran it: to roll back, run
+  `crates/scarab-db-postgres/rollback/0111_revert.sql` with the server scaled to zero. It revokes
+  the tokens that carry an operation list. See the chart README, "Upgrading from 0.8.4".
+- **Migration 0112 adds `delegated_caller_handles` and `delegated_call_journal`.** Two new
+  tables; nothing existing changes. To roll back, uninstall every plugin that registers an
+  endpoint, then run `crates/scarab-db-postgres/rollback/0112_revert.sql` before
+  `0111_revert.sql`; it refuses while one is installed.
+- **Migration 0113 adds `oauth_client_metadata_hosts`, `oauth_authorization_codes` and
+  `oauth_grants`.** Three new tables; nothing existing changes. To roll back, run
+  `crates/scarab-db-postgres/rollback/0113_revert.sql` before `0112_revert.sql`; it revokes every
+  connected app's token.
+- **Migration 0114 adds the table `org_fork_run_approval`** (each org's Fork Run approval
+  setting; an org with no row has `agent_started`). No row is rewritten. A server that does not
+  know 0114 does not start on a database that ran it: to roll back, set it to `off` in every org,
+  then run
+  `crates/scarab-db-postgres/rollback/0114_revert.sql` with the server scaled to zero. Roll back
+  to 0.8.4, not further: 0.8.4 is the first release that can load a Run with the Fork Run approval
+  gate. See the chart README, "Upgrading from 0.8.4".
+- **An API token no longer approves a gate by itself.** Its approval of any `manual` gate, a
+  plain one included, answers `403 step_up_required` with a confirmation request its owner
+  confirms with a passkey. A script that approved plain gates with a token must confirm each
+  approval or approve from a browser. Rejecting is unchanged. Under `SCARAB_DEV_INSECURE`, where
+  step-up is off, a token's approval is still recorded at once.
+- **Reads are named by the data they return.** The shared `read` operation is split into
+  `run.read`, `step.logs.read`, `step.workspace.read`, `run.artifacts.read`, `repo.read`,
+  `account.read`, `access.read`, `security.read`, `secret.names.read`, `settings.read` and
+  `server.read`. Security events for reads carry the new names. No operation implies another:
+  a token with a list needs `account.read` for `GET /v1/me` and `server.read` for
+  `GET /v1/about`.
+- **A plugin that registers an endpoint gets a Service and an ingress policy.** Its Pods accept
+  connections on port 8080 from the Scarab server's Pods and nothing else. The chart grants the
+  plugin runtime `services` in the plugin namespace.
+
+### Security
+
+- **A plugin that registers an endpoint runs only from a publisher the operator trusts.** A
+  manifest may now register an endpoint and the API operations each of its requests may use. Such
+  a plugin is `trusted_service`: an org admin can install or upgrade it only from a digest of an
+  image repository listed in `plugins.trustedPublishers`, which is empty by default, and is
+  refused again (install, upgrade, enable, and every PluginApi call) once the operator delists
+  it. Its `may` can name only `repo.read`, `run.read`, `step.logs.read`, `step.workspace.read`,
+  `run.artifacts.read`, `repo.dispatch`, `step.rerun`, `step.retry`, `run.cancel` and
+  `gate.reject`. Such a plugin may not also resolve gates.
+- **A plugin acts for a caller only with a handle.** On the broker listener a plugin calls the
+  public API for one caller with its installation token and a delegated caller handle bound to
+  that installation and its org, the caller's `oauth` token (granted for that installation's
+  endpoint) and an operation list. The installation token alone acts as nobody. A delegated call
+  obeys the handle's, the token's and the manifest's operation lists, spends the installation's
+  broker permits and the handle's counters, is journaled before it runs (refusals included),
+  never raises or satisfies a step-up, and never approves a gate. Killing, uninstalling or
+  upgrading the plugin to a new digest deletes its handles. The handles and journal use the
+  broker's own database pool; the API handlers a delegated call runs use the main pool.
+- **No step OIDC token when its subject could read another way.** A Step gets no token when the
+  org, repository or Environment name holds a `/`, the ref has a path component named `env` or
+  `ref` (a branch `ref/x` is `refs/heads/ref/x`), or its Environment is named `none`. Its launch
+  goes on without a token, and the server logs a warning naming the Run and the reason. See
+  [Step OIDC tokens](/scarab-ci/usage/oidc-tokens/#which-steps-get-no-token).
+- **Trust policies: a `*` belongs only after `/ref/`.** A `*` in a cloud trust policy matches `/`
+  too, so `…/repo/app/*` or `…/repo/app/env/*` also matches the `env/none` subject of a fork pull
+  request's Step, and `…/repo/app*` matches another repository. The docs now say so and give
+  exact patterns. See
+  [Matching the subject](/scarab-ci/usage/oidc-tokens/#matching-the-subject-in-a-trust-policy).
+
+### Features
+
+- **Step OIDC tokens outside an Environment.** A Run bound to no Environment that builds the
+  repository's own code now gets a token with the subject
+  `scarab:org/<org>/repo/<repo>/ref/<ref>`, with no `env/` segment, so a trust policy can name a
+  repository and a ref without an Environment. Fork code, comment-triggered Runs, Runs with no
+  repository and Runs whose ref is unknown or `HEAD` get none; so do manual and API Runs created
+  before this release, which did not record whether they were fork code. The `sub` of a Run bound
+  to an Environment does not change; Breaking changes lists what else in its token does. See
+  [Step OIDC tokens](/scarab-ci/usage/oidc-tokens/).
+- **The OIDC issuer's signing key can be changed without breaking cloud trust.** The chart's
+  `scarab.oidcPublicKeys` (server: `SCARAB_OIDC_PUBLIC_KEYS`) lists further RSA public keys that
+  `/.well-known/jwks.json` publishes beside the signing key: the next key before servers sign with
+  it, and the previous key until its last token has expired. The server still signs with the one
+  private key in `SCARAB_OIDC_SIGNING_KEY_FILE`. The chart README, "Changing the signing key",
+  gives the three upgrades in order. See
+  [Environment variables](/scarab-ci/usage/environment-variables/).
+- **Step OIDC tokens live as long as the step may run.** A token lived 15 minutes; it now lives
+  for the step's `timeout:`, at most `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` (chart:
+  `scarab.oidcTokenMaxTtlSecs`, default one hour, at most 12 hours), so a cloud SDK that exchanges
+  the token again later in the step still can. A new docs page shows how to publish the issuer as static files
+  and how a step assumes an AWS role with two `env:` lines. See
+  [Assuming an AWS role from a step](/scarab-ci/usage/aws-roles/).
+- **The MCP plugin.** `scarab-plugin-mcp` is an MCP server that runs as a plugin behind a plugin
+  endpoint, so claude.ai can read your repositories, Runs, Step logs, results and artifact names,
+  start a pipeline, rerun or retry a Step, or cancel a Run as you, within the operations you tick.
+  It has no approve tool and no tool for secrets, settings or Policies, and it returns text from
+  logs and results inside a block marked as untrusted. The image is published as
+  `ghcr.io/thulasi-ram/scarab-plugin-mcp`. See
+  [Using Scarab from Claude](/scarab-ci/usage/mcp-plugin/).
+- **Connected apps.** An app such as claude.ai can act for you at one plugin endpoint with an OAuth
+  token you approve with your passkey; you list and disconnect your apps under Account settings.
+  Off by default (`oauthServer.enabled`). See
+  [Connected apps](/scarab-ci/usage/connected-apps/).
+- **Limit an API token to a list of operations.** A token minted with `operations` may use only
+  those; every other request is refused with `403 operation_not_granted`. Each token records its
+  kind (`issued`), and every rerun, retry, cancel, pin, approval and rejection made with a token
+  records the token beside the person in the Run's events, and so does a dispatch on the Run
+  itself. The token's id (never its secret) is visible to anyone who can read the Run. A token
+  with a list is stored under a different hash, so a server older than this release cannot find
+  it during a rolling upgrade. See
+  [API tokens](/scarab-ci/usage/api-tokens/#operations).
+- **Fork Run approval.** An org setting that holds Runs of fork code at a `manual` gate,
+  `fork-run-approval`, before any of their steps or shared services start: `off`,
+  `agent_started` (the default: Runs an app started through an `oauth` token, such as a
+  connected app) or `all`. Choose
+  `all` to hold every Run of fork code. Anyone with write on the repository approves
+  the gate from the Run page; an API token's owner confirms each approval, and an app cannot
+  approve. The gate fails the Run after 72 hours. It never counts as an Environment approval gate,
+  and approving it unlocks no Environment secrets, registry credentials or OIDC roles: the Run is
+  still fork code. A Rerun waits at the gate again, and asks the other gates between it and the
+  rerun step again (an Environment's approvers, a plugin gate); a Retry does not. After a
+  rollback to 0.8.4 a Rerun no longer puts the gate back, so set the setting to `off` and let gated
+  Runs finish first. An org admin changes the
+  setting from a browser in Org settings › Security
+  (`/v1/orgs/{org}/security/fork-run-approval`); a change that holds fewer Runs asks for a passkey
+  confirmation. See [Fork Run approval](/scarab-ci/usage/fork-run-approval/).
+
+### Enhancement
+
+- **Step OIDC tokens carry `iat` and `nbf`.** Both are set 60 seconds before the token is minted,
+  so a cloud whose clock runs up to a minute behind the server still accepts the token.
+- **A step launch reads only its Run's trigger record.** Deciding a Step's OIDC token, its fork
+  status and its follow-ups read the one event Run creation records, not the Run's whole event
+  log, at each launch.
+
 ## [0.8.4] - 2026-11-28
 
 ### Security

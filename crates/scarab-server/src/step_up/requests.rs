@@ -425,7 +425,10 @@ pub(crate) async fn replay_caller(st: &AppState, a: &ReplayAuthority) -> Result<
                 .map_err(|_| ApiError::Unauthorized)?
                 .ok_or(ApiError::Unauthorized)?;
             // Revoked or expired since it asked: it asks for nothing now.
-            if !token.is_live(now) || token.owner_subject != a.for_human {
+            if !token.is_live(now)
+                || token.owner_subject != a.for_human
+                || !crate::usable_on_core_routes(&token)
+            {
                 return Err(ApiError::Unauthorized);
             }
             // The token's grant stays attached, so every decision is
@@ -446,6 +449,7 @@ pub(crate) async fn replay_caller(st: &AppState, a: &ReplayAuthority) -> Result<
                 grant: Some(token),
                 via: Some(AuthVia::Bearer),
                 session: None,
+                plugin_installation: None,
             })
         }
         ReplayRequester::BearerSession(sid) => {
@@ -481,6 +485,7 @@ pub(crate) async fn replay_caller(st: &AppState, a: &ReplayAuthority) -> Result<
                     id_hash: crate::session_hash(&session.id),
                     fresh_login_until: None,
                 }),
+                plugin_installation: None,
             })
         }
     }

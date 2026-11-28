@@ -1716,6 +1716,7 @@ const argocdManifest: PluginManifestDto = {
       outputs: [{ name: "revision", type: "string", required: true }],
     },
   ],
+  endpoint_operations: [],
 };
 const ARGOCD_MANIFEST_SHA = "b7e3".padEnd(64, "9");
 const ARGOCD_SOURCE_PATH = "github.com/acme/scarab-plugin-argocd//manifest.json";
@@ -1761,6 +1762,7 @@ const fetchedPluginUpgrade = (
       config_keys: group([], [], [...argocdManifest.config_keys]),
       gates: group(wider ? ["wait-synced"] : [], [], ["wait-live"]),
       image: group([], [], [ARGOCD_REPO]),
+      endpoint_operations: group([], [], []),
     },
     ...(() => {
       const reasons = [
@@ -2387,6 +2389,7 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
     last_used_at: ago(4 * min),
     use_count: 18_412,
     revoked_at: null,
+    kind: "issued",
   },
   {
     id: "3b7a9c02-6d41-4b8e-8c22-71f0ab993c55",
@@ -2402,6 +2405,7 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
     last_used_at: ago(20 * min),
     use_count: 1_203,
     revoked_at: null,
+    kind: "issued",
   },
   {
     id: "c41e7f60-2a88-4f19-b0d3-5e6a7c1b2d34",
@@ -2417,6 +2421,7 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
     last_used_at: ago(52 * min),
     use_count: 9_870,
     revoked_at: null,
+    kind: "issued",
   },
   {
     id: "7d5b0e13-9c44-4a27-8e61-0f3d2c8a55b7",
@@ -2432,6 +2437,7 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
     last_used_at: ago(30 * day),
     use_count: 312,
     revoked_at: ago(11 * day),
+    kind: "issued",
   },
 ];
 
@@ -2446,6 +2452,7 @@ function mintMockToken(body: string, pathOrg?: string): Response {
     project?: string;
     role?: string;
     expires_in_days?: number;
+    operations?: string[] | null;
   };
   mintedTokens += 1;
   const record: MockToken = {
@@ -2462,6 +2469,8 @@ function mintMockToken(body: string, pathOrg?: string): Response {
     last_used_at: null,
     use_count: 0,
     revoked_at: null,
+    kind: "issued",
+    operations: req.operations ?? null,
   };
   apiTokens.unshift(record);
   return json(
@@ -2640,6 +2649,22 @@ const leakCheckLimits: components["schemas"]["LeakCheckLimitsDto"] = {
   max_per_day: 1000,
   caller_role: "owner",
 };
+const forkRunApproval: components["schemas"]["ForkRunApprovalDto"] = {
+  setting: "agent_started",
+  can_change: true,
+};
+function mockForkRunApproval(method: string, body: string): Response {
+  if (method === "PUT") {
+    const req = JSON.parse(body || "{}") as { setting?: unknown };
+    if (req.setting !== "off" && req.setting !== "agent_started" && req.setting !== "all") {
+      return new Response('the body must be JSON of the form {"setting": "off" | "agent_started" | "all"}', {
+        status: 400,
+      });
+    }
+    forkRunApproval.setting = req.setting as typeof forkRunApproval.setting;
+  }
+  return json(forkRunApproval);
+}
 function mockLeakChecks(method: string, body: string): Response {
   if (method === "PUT") {
     const req = JSON.parse(body || "{}") as { per_hour?: unknown; per_day?: unknown };
@@ -2725,11 +2750,14 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   const pol = policyRoute(p, search, method, body, json);
   if (pol) return pol;
   if (p === "/v1/me/security") return json(meSecurity);
+  // No connected apps in the fixture: the page shows its empty state.
+  if (p === "/v1/me/connected-apps") return json([]);
   if (p === "/v1/me/security/events") {
     return json({ events: securityEvents.filter((e) => e.subject === "a.kim") });
   }
   if (/^\/v1\/orgs\/[^/]+\/security\/summary$/.test(p)) return json(orgSecuritySummary);
   if (/^\/v1\/orgs\/[^/]+\/security\/leak-checks$/.test(p)) return mockLeakChecks(method, body);
+  if (/^\/v1\/orgs\/[^/]+\/security\/fork-run-approval$/.test(p)) return mockForkRunApproval(method, body);
   if (/^\/v1\/orgs\/[^/]+\/security\/events$/.test(p)) return orgEventsPage(search);
   // An owner resets a member's passkeys. The mock lets it through with no
   // step-up; an admin left with none joins the summary's list.

@@ -56,9 +56,9 @@ const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
 pub const PROVISIONING_DEADLINE_SECS: u32 = 30 * 60;
 use crate::{
     ports::WorkspaceSnapshots, Attempt, AttemptFrontier, AttemptId, AttemptOutcome, AttemptStamp,
-    Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, ExecError, Executor,
-    FailureKind, GateResolution, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec,
-    StepStatus, Timestamp, TransitionError, EVENT_VERSION,
+    Clock, ConcurrencyPolicy, Db, DbError, DelegationTrail, EventKind, EventPayload, ExecError,
+    Executor, FailureKind, GateResolution, OutboxMessage, RunId, RunStatus, StepId, StepRun,
+    StepSpec, StepStatus, Timestamp, TransitionError, EVENT_VERSION,
 };
 
 /// Outbox `kind` for "launch this step".
@@ -258,6 +258,15 @@ pub enum RerunError {
     /// its creation never finished (ADR-0083 §4). Mapped to 409.
     #[error("this Run's creation did not finish and Run {} replaced it", .0 .0)]
     Replaced(RunId),
+    /// Rerun refused in a Run with a Fork Run approval gate (ADR-0086 §9):
+    /// the Step was skipped by its `when:` at creation, and a Rerun does not
+    /// evaluate `when:` again, so it would run a Step the Run never meant
+    /// to. Mapped to 409. A Run without such a gate reruns it, as before.
+    #[error(
+        "step {0:?} was skipped by its `when:`, and a rerun does not evaluate `when:` again; \
+         start a new Run"
+    )]
+    WhenExcluded(StepId),
 }
 
 /// Refuse to act on `run` while its creation is unfinished
@@ -308,6 +317,12 @@ pub enum PlanReason {
     /// A descendant of a [`Regenerate`](PlanReason::Regenerate) root that the
     /// target's own cascade did not already contain.
     RegenerateCascade,
+    /// A Rerun in a Run of fork code (ADR-0086 §9): the Fork Run approval
+    /// gate, which waits for a release again, or a Step between it
+    /// and the target's cascade, which re-arms so the cascade waits behind the
+    /// gate through its `needs`. Such a Step skips when its inputs are
+    /// unchanged. A Retry re-arms none of these.
+    ForkRunApproval,
 }
 
 /// One member of a [`RerunPlan`], with its WHY — the per-step disclosure the
@@ -321,7 +336,8 @@ pub struct PlannedStep {
     /// The in-set step this one is here BECAUSE OF: the cascade parent for
     /// `Cascade`/`RegenerateCascade` (multi-parent members attribute to the
     /// minimum in-set `need` by id — deterministic), the consumer whose input
-    /// expired for `Regenerate`. `None` only for the target.
+    /// expired for `Regenerate`, the target for `ForkRunApproval`. `None`
+    /// only for the target.
     pub because_of: Option<StepId>,
     /// This member is a gate (ADR-0008): re-arming it pauses the run for a
     /// decision — the copy must say "pauses for approval at X", never claim it
@@ -391,6 +407,9 @@ impl RerunPlan {
 /// [`rerun_step`] this does **not** reject on an unsatisfied prerequisite,
 /// because a preview of a blocked rerun is still a useful thing to render (the
 /// UI already knows the prerequisite rule and the POST still enforces it).
+///
+/// It plans a Rerun: in a Run with a Fork Run approval gate the plan holds the [`PlanReason::ForkRunApproval`] members, which a Retry
+/// leaves out, so a client previewing a Retry drops them.
 pub async fn plan_rerun(
     db: &dyn Db,
     snapshots: Option<&dyn WorkspaceSnapshots>,
@@ -401,18 +420,74 @@ pub async fn plan_rerun(
     if !steps.iter().any(|s| &s.step == target) {
         return Err(RerunError::StepNotFound(target.clone()));
     }
-    plan_rerun_over(db, snapshots, run, target, &steps).await
+    plan_rerun_over(db, snapshots, run, target, &steps, true).await
+}
+
+/// The ids of the Fork Run approval gates (ADR-0086 §9) of the Run whose
+/// stored IR is `ir`, read as JSON.
+fn fork_run_approval_gate_ids(ir: &serde_json::Value) -> Vec<StepId> {
+    ir.get("steps")
+        .and_then(|s| s.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|s| is_fork_run_approval_gate(s))
+        .filter_map(|s| s.get("id").and_then(|i| i.as_str()))
+        .map(|id| StepId(id.to_string()))
+        .collect()
+}
+
+/// What a Rerun re-arms besides `base` (the target's cascade, widened for
+/// expired snapshots) in a Run of fork code (ADR-0086 §9): each of `gates`
+/// (the Run's Fork Run approval gates) that is upstream of a member of
+/// `base`, and every Step
+/// that is both downstream of such a gate and upstream of a member of
+/// `base`. Re-armed with the cascade, those Steps put the gate back in front
+/// of it through `needs`, so nothing of the cascade starts, and the scheduler
+/// holds every shared service of the new Take, until the gate is released
+/// again. A release covers the Take it was given in, not the next one.
+/// Empty when no gate is upstream of `base`.
+fn fork_run_approval_rearm(
+    gates: &[StepId],
+    base: &std::collections::HashSet<StepId>,
+    steps: &[StepRun],
+) -> std::collections::HashSet<StepId> {
+    let by_id: HashMap<&StepId, &StepRun> = steps.iter().map(|s| (&s.step, s)).collect();
+    // Every Step upstream of a member of `base`, `base` left out.
+    let mut upstream: std::collections::HashSet<StepId> = std::collections::HashSet::new();
+    let mut stack: Vec<&StepId> = steps
+        .iter()
+        .filter(|s| base.contains(&s.step))
+        .flat_map(|s| s.needs.iter())
+        .collect();
+    while let Some(id) = stack.pop() {
+        if base.contains(id) || !upstream.insert(id.clone()) {
+            continue;
+        }
+        if let Some(s) = by_id.get(id) {
+            stack.extend(s.needs.iter());
+        }
+    }
+    let mut rearm = std::collections::HashSet::new();
+    for gate in gates.iter().filter(|g| upstream.contains(*g)) {
+        let below = crate::invalidation_set(gate, steps);
+        rearm.extend(upstream.iter().filter(|s| below.contains(*s)).cloned());
+    }
+    rearm
 }
 
 /// [`plan_rerun`] over an already-read step snapshot (the rerun path has one in
 /// hand and must not re-read it — the plan it records has to describe the same
-/// instant its prerequisite check ran against).
+/// instant its prerequisite check ran against). `rearm_fork_gates`: a Rerun,
+/// which re-arms a released Fork Run approval gate in front of the target's
+/// cascade ([`fork_run_approval_rearm`]); a Retry stays in its Take and does
+/// not.
 async fn plan_rerun_over(
     db: &dyn Db,
     snapshots: Option<&dyn WorkspaceSnapshots>,
     run: &RunId,
     target: &StepId,
     steps: &[StepRun],
+    rearm_fork_gates: bool,
 ) -> Result<RerunPlan, RerunError> {
     let base = crate::invalidation_set(target, steps);
     let mut invalid = base.clone();
@@ -491,10 +566,58 @@ async fn plan_rerun_over(
         }
     }
 
-    let mut invalidated: Vec<StepId> = invalid.iter().cloned().collect();
-    invalidated.sort_by(|a, b| a.0.cmp(&b.0));
+    // The widened set: the cascade, plus what expired snapshots dragged in.
     let mut widened: Vec<StepId> = invalid.difference(&base).cloned().collect();
     widened.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // ADR-0086 §9: then the Fork Run approval gates, against the widened set,
+    // so a producer whose snapshot expired is a Regenerate root (it re-runs,
+    // its signature cleared) and never a Step that skips and carries the dead
+    // snapshot forward. Every Fork Run approval gate re-arms, whatever its
+    // status: one left `Pending` by a Rerun that failed partway still puts the
+    // path back in front of the cascade, so the target never runs while the
+    // gate waits.
+    let fork_gates = if rearm_fork_gates {
+        match db.run_ir(run).await? {
+            Some(ir) => fork_run_approval_gate_ids(&ir),
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    // In a Run with a Fork Run approval gate a Rerun evaluates no `when:`, so
+    // it leaves alone every Step its `when:` skipped at creation and every
+    // Step skipped only because it is behind one: they stay Skipped, as in
+    // the first Take, whether they are in the target's cascade or on the
+    // path to it. The target itself is re-armed (a `when:`-excluded target is
+    // refused before this); behind a Step that stays Skipped, the scheduler
+    // skips it again, and it re-arms no gate: the gate re-arms only in front
+    // of a Step that can run. A Run without such a gate re-arms as before.
+    let stays_skipped = if fork_gates.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        skipped_by_when(steps)
+    };
+    invalid.retain(|s| s == target || !stays_skipped.contains(s));
+    widened.retain(|s| invalid.contains(s));
+    let behind_skipped: std::collections::HashSet<StepId> = stays_skipped
+        .iter()
+        .flat_map(|e| crate::invalidation_set(e, steps))
+        .collect();
+    let can_run: std::collections::HashSet<StepId> = invalid
+        .iter()
+        .filter(|s| !behind_skipped.contains(*s))
+        .cloned()
+        .collect();
+    let fork_rearm: std::collections::HashSet<StepId> =
+        fork_run_approval_rearm(&fork_gates, &can_run, steps)
+            .into_iter()
+            .filter(|s| !stays_skipped.contains(s))
+            .collect();
+    invalid.extend(fork_rearm.iter().cloned());
+
+    let mut invalidated: Vec<StepId> = invalid.iter().cloned().collect();
+    invalidated.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Where the run effectively restarts: the members with no dependency inside
     // the set. `needs` (not the consumption subset) is the right edge here — a
@@ -508,7 +631,7 @@ async fn plan_rerun_over(
         .collect();
     starts_from.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let planned = planned_steps(target, steps, &invalid, &base, &expired);
+    let planned = planned_steps(target, steps, &invalid, &base, &expired, &fork_rearm);
 
     Ok(RerunPlan {
         target: target.clone(),
@@ -526,6 +649,8 @@ async fn plan_rerun_over(
 /// Partition (mutually exclusive, exhaustive over `invalid`):
 /// - `Target` — the step the human pointed at;
 /// - `Regenerate` — a producer of an expired snapshot (`expired[].produced_by`);
+/// - `ForkRunApproval` — in `fork_rearm`: a released Fork Run approval gate
+///   or a Step between it and the base cascade ([`fork_run_approval_rearm`]);
 /// - `RegenerateCascade` — in the widened set (`invalid − base`) but not a
 ///   producer: a descendant of a Regenerate root the base cascade missed;
 /// - `Cascade` — the rest: an ordinary descendant of the target.
@@ -533,15 +658,16 @@ async fn plan_rerun_over(
 /// `because_of` attribution: `Cascade`/`RegenerateCascade` members point at
 /// their minimum in-set `need` (by id — a deterministic tie-break for
 /// multi-parent members); a `Regenerate` root points at the consumer whose
-/// expired input dragged it in. The order is topological over `needs`
-/// restricted to the set, ties broken by step id — so two identical plans
-/// render identically, always.
+/// expired input dragged it in; a `ForkRunApproval` member at the target.
+/// The order is topological over `needs` restricted to the set, ties broken
+/// by step id — so two identical plans render identically, always.
 fn planned_steps(
     target: &StepId,
     steps: &[StepRun],
     invalid: &std::collections::HashSet<StepId>,
     base: &std::collections::HashSet<StepId>,
     expired: &[ExpiredInput],
+    fork_rearm: &std::collections::HashSet<StepId>,
 ) -> Vec<PlannedStep> {
     // A Regenerate root appears at most once in `expired` (the widening loop
     // guards on `new_roots`), but `.or_insert`-style first-wins keeps the
@@ -557,6 +683,9 @@ fn planned_steps(
         }
         if let Some(consumer) = consumer_of.get(&s.step) {
             return (PlanReason::Regenerate, Some((*consumer).clone()));
+        }
+        if fork_rearm.contains(&s.step) {
+            return (PlanReason::ForkRunApproval, Some(target.clone()));
         }
         // Multi-parent tie-break: the minimum in-set need, by id.
         let parent = s
@@ -634,6 +763,7 @@ pub async fn pin_run_snapshots(
     clock: &dyn Clock,
     run: &RunId,
     by: Option<String>,
+    via: Option<DelegationTrail>,
 ) -> Result<bool, DbError> {
     let now = clock.now().await;
     if !db.pin_run_snapshots(run, by.as_deref(), now).await? {
@@ -642,7 +772,7 @@ pub async fn pin_run_snapshots(
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
-        kind: EventPayload::RunSnapshotsPinned { by },
+        kind: EventPayload::RunSnapshotsPinned { by, via },
         at: now,
     })
     .await?;
@@ -656,6 +786,7 @@ pub async fn unpin_run_snapshots(
     clock: &dyn Clock,
     run: &RunId,
     by: Option<String>,
+    via: Option<DelegationTrail>,
 ) -> Result<bool, DbError> {
     if !db.unpin_run_snapshots(run).await? {
         return Ok(false);
@@ -664,7 +795,7 @@ pub async fn unpin_run_snapshots(
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
-        kind: EventPayload::RunSnapshotsUnpinned { by },
+        kind: EventPayload::RunSnapshotsUnpinned { by, via },
         at: now,
     })
     .await?;
@@ -707,7 +838,7 @@ pub async fn rerun_step(
     target: &StepId,
     by: Option<String>,
 ) -> Result<(), RerunError> {
-    rerun_step_widened(db, clock, None, run, target, by)
+    rerun_step_widened(db, clock, None, run, target, by, None)
         .await
         .map(|_| ())
 }
@@ -733,6 +864,7 @@ pub async fn rerun_step_widened(
     run: &RunId,
     target: &StepId,
     by: Option<String>,
+    via: Option<DelegationTrail>,
 ) -> Result<RerunPlan, RerunError> {
     ensure_creation_finished(db, run).await?;
     let steps = db.steps_of_run(run).await?;
@@ -751,7 +883,16 @@ pub async fn rerun_step_widened(
             blocker,
         });
     }
-    let plan = plan_rerun_over(db, snapshots, run, target, &steps).await?;
+    // ADR-0086 §9: the Run's Fork Run approval gates; empty for a Run
+    // without one, which reruns exactly as before.
+    let fork_gates: Vec<StepId> = match db.run_ir(run).await? {
+        Some(ir) => fork_run_approval_gate_ids(&ir),
+        None => Vec::new(),
+    };
+    if !fork_gates.is_empty() && when_excluded(target_step, &steps) {
+        return Err(RerunError::WhenExcluded(target.clone()));
+    }
+    let plan = plan_rerun_over(db, snapshots, run, target, &steps, true).await?;
 
     // The Take boundary (ADR-0056): record the human intervention FIRST, so a
     // Take view — a pure event-log replay up to this event — sees the run
@@ -767,10 +908,41 @@ pub async fn rerun_step_widened(
             invalidated: plan.invalidated.clone(),
             by: by.clone(),
             widened: plan.widened.clone(),
+            via: via.clone(),
         },
         at: now,
     })
     .await?;
+
+    // Each resolved Fork Run approval gate (ADR-0086 §9) the Rerun re-arms
+    // goes back to `Pending` before the new Take's shared services are born,
+    // so it holds them from their birth: no service of the new Take launches
+    // on the old Take's release. The rest of the set is re-armed below, from
+    // a fresh read of the Steps. Only those gates: a Run without one writes
+    // exactly the events it did before.
+    let resolved_gates: Vec<&StepRun> = steps
+        .iter()
+        .filter(|s| {
+            fork_gates.contains(&s.step)
+                && s.status.is_terminal()
+                && plan.invalidated.contains(&s.step)
+        })
+        .collect();
+    for s in &resolved_gates {
+        match commit_rearm(db, clock, run, target, s, by.as_deref(), via.as_ref()).await {
+            Ok(()) => {}
+            Err(DbError::Conflict) => {
+                rearm_raced_step(db, clock, run, target, &s.step, by.as_deref(), via.as_ref())
+                    .await?
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let steps = if resolved_gates.is_empty() {
+        steps
+    } else {
+        db.steps_of_run(run).await?
+    };
 
     // Fresh service instance per Take (ADR-0058): a Rerun opens a new Take, so
     // birth a new generation of every shared service keyed by the new take. The
@@ -791,7 +963,7 @@ pub async fn rerun_step_widened(
         }
     }
 
-    rearm_invalidation_set(db, clock, run, target, &plan, &steps, by).await?;
+    rearm_invalidation_set(db, clock, run, target, &plan, &steps, by, via).await?;
     Ok(plan)
 }
 
@@ -809,7 +981,7 @@ pub async fn retry_step(
     target: &StepId,
     by: Option<String>,
 ) -> Result<(), RerunError> {
-    retry_step_widened(db, clock, None, run, target, by)
+    retry_step_widened(db, clock, None, run, target, by, None)
         .await
         .map(|_| ())
 }
@@ -825,6 +997,7 @@ pub async fn retry_step_widened(
     run: &RunId,
     target: &StepId,
     by: Option<String>,
+    via: Option<DelegationTrail>,
 ) -> Result<RerunPlan, RerunError> {
     ensure_creation_finished(db, run).await?;
     let steps = db.steps_of_run(run).await?;
@@ -845,7 +1018,9 @@ pub async fn retry_step_widened(
             blocker,
         });
     }
-    let plan = plan_rerun_over(db, snapshots, run, target, &steps).await?;
+    // A Retry stays in its Take: a released Fork Run approval gate stays
+    // released (ADR-0086 §9).
+    let plan = plan_rerun_over(db, snapshots, run, target, &steps, false).await?;
 
     // Attribution/audit fact — NOT a Take boundary (`deriveTakes` ignores it),
     // so the retried attempts land in the current Take's history.
@@ -858,13 +1033,48 @@ pub async fn retry_step_widened(
             invalidated: plan.invalidated.clone(),
             by: by.clone(),
             widened: plan.widened.clone(),
+            via: via.clone(),
         },
         at: now,
     })
     .await?;
 
-    rearm_invalidation_set(db, clock, run, target, &plan, &steps, by).await?;
+    rearm_invalidation_set(db, clock, run, target, &plan, &steps, by, via).await?;
     Ok(plan)
+}
+
+/// The Steps a Rerun in a Run with a Fork Run approval gate leaves Skipped
+/// (ADR-0086 §9): each Step its `when:` skipped at creation
+/// ([`when_excluded`]), and each `Skipped` Step downstream of one, which
+/// the scheduler skipped for that need.
+fn skipped_by_when(steps: &[StepRun]) -> std::collections::HashSet<StepId> {
+    let mut out = std::collections::HashSet::new();
+    for e in steps.iter().filter(|s| when_excluded(s, steps)) {
+        out.extend(
+            crate::invalidation_set(&e.step, steps)
+                .into_iter()
+                .filter(|d| {
+                    steps
+                        .iter()
+                        .any(|s| &s.step == d && s.status == StepStatus::Skipped)
+                }),
+        );
+    }
+    out
+}
+
+/// Was `step` skipped by its `when:` at Run creation? A Step that is not a
+/// gate, `Skipped`, with every need `Succeeded` (or none): the scheduler
+/// skips a Step only for a need that did not succeed, so nothing else skips
+/// such a Step. A `when:`-excluded Step that also has a skipped need reads
+/// as skipped by that need, which a rerun skips again.
+fn when_excluded(step: &StepRun, steps: &[StepRun]) -> bool {
+    let succeeded = |id: &StepId| {
+        steps
+            .iter()
+            .any(|s| &s.step == id && s.status == StepStatus::Succeeded)
+    };
+    !step.is_gate() && step.status == StepStatus::Skipped && step.needs.iter().all(succeeded)
 }
 
 /// The first `need` of `step` that is **not** in a non-failing terminal state
@@ -890,6 +1100,7 @@ fn blocking_dep(step: &StepRun, steps: &[StepRun]) -> Option<StepId> {
 /// Shared by rerun ([`rerun_step`]) and retry ([`retry_step`]); the caller has
 /// already emitted the boundary/attribution event (and, for rerun, bumped the
 /// service generation).
+#[allow(clippy::too_many_arguments)] // the re-arm's arguments plus who acted and how
 async fn rearm_invalidation_set(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -898,6 +1109,7 @@ async fn rearm_invalidation_set(
     plan: &RerunPlan,
     steps: &[StepRun],
     by: Option<String>,
+    via: Option<DelegationTrail>,
 ) -> Result<(), RerunError> {
     // The set to re-arm comes from the PLAN, not from a second `invalidation_set`
     // call: the plan is what was recorded on the boundary event and (for a widened
@@ -943,19 +1155,28 @@ async fn rearm_invalidation_set(
         // Pod, so nothing joins the teardown intent.
         if invalid.contains(&s.step) && s.status == StepStatus::Pending {
             if let Some(a) = open_gate_attempt(s) {
-                let closed =
-                    supersede_gate_attempt(db, clock, run, &s.step, &a.id, by.as_deref()).await?;
+                let closed = supersede_gate_attempt(
+                    db,
+                    clock,
+                    run,
+                    &s.step,
+                    &a.id,
+                    by.as_deref(),
+                    via.as_ref(),
+                )
+                .await?;
                 if !closed {
                     // The wait ended under us — the gate resolved between the
                     // snapshot and now (or a cancel closed it). A resolved gate
                     // is terminal, so re-arm it from its LIVE status, exactly
                     // like a step that raced past the snapshot.
-                    rearm_raced_step(db, clock, run, target, &s.step, by.as_deref()).await?;
+                    rearm_raced_step(db, clock, run, target, &s.step, by.as_deref(), via.as_ref())
+                        .await?;
                 }
             }
         }
         if invalid.contains(&s.step) && s.status != StepStatus::Pending {
-            match commit_rearm(db, clock, run, target, s, by.as_deref()).await {
+            match commit_rearm(db, clock, run, target, s, by.as_deref(), via.as_ref()).await {
                 Ok(()) => {}
                 // TOCTOU (orphan fix): the optimistic `from` came from a stale
                 // snapshot. A descendant may have raced Pending/Ready→Running
@@ -965,7 +1186,8 @@ async fn rearm_invalidation_set(
                 // Re-read the live row and re-arm from its ACTUAL status,
                 // capturing an in-flight attempt for teardown.
                 Err(DbError::Conflict) => {
-                    rearm_raced_step(db, clock, run, target, &s.step, by.as_deref()).await?;
+                    rearm_raced_step(db, clock, run, target, &s.step, by.as_deref(), via.as_ref())
+                        .await?;
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -1027,6 +1249,7 @@ async fn commit_rearm(
     target: &StepId,
     s: &StepRun,
     by: Option<&str>,
+    via: Option<&DelegationTrail>,
 ) -> Result<(), DbError> {
     let now = clock.now().await;
     let mut events = vec![event(
@@ -1061,6 +1284,7 @@ async fn commit_rearm(
                     step: s.step.clone(),
                     attempt: a.id.clone(),
                     by: by.map(str::to_string),
+                    via: via.cloned(),
                 },
                 now,
             ));
@@ -1107,6 +1331,7 @@ async fn rearm_raced_step(
     target: &StepId,
     step: &StepId,
     by: Option<&str>,
+    via: Option<&DelegationTrail>,
 ) -> Result<(), RerunError> {
     for _ in 0..8 {
         let live = db.steps_of_run(run).await?;
@@ -1116,7 +1341,7 @@ async fn rearm_raced_step(
         if s.status == StepStatus::Pending {
             return Ok(());
         }
-        match commit_rearm(db, clock, run, target, s, by).await {
+        match commit_rearm(db, clock, run, target, s, by, via).await {
             Ok(()) => return Ok(()),
             Err(DbError::Conflict) => continue,
             Err(e) => return Err(e.into()),
@@ -1163,7 +1388,7 @@ pub async fn release_gate(
         expired: false,
     };
     // Already resolved (or never gated) — exactly-once: do not resume again.
-    if !resolve_gate(db, clock, run, gate, &verdict, None, None).await? {
+    if !resolve_gate(db, clock, run, gate, &verdict, None, None, None).await? {
         return Ok(());
     }
     reopen_if_runnable(db, clock, run).await
@@ -1192,6 +1417,7 @@ pub async fn reject_gate(
     step: &StepId,
     by: &str,
     reason: &str,
+    via: Option<DelegationTrail>,
 ) -> Result<bool, RerunError> {
     ensure_creation_finished(db, run).await?;
     let steps = db.steps_of_run(run).await?;
@@ -1218,7 +1444,17 @@ pub async fn reject_gate(
         reason: reason.to_string(),
         expired: false,
     };
-    let resolved = resolve_gate(db, clock, run, gate, &verdict, Some(by.to_string()), None).await?;
+    let resolved = resolve_gate(
+        db,
+        clock,
+        run,
+        gate,
+        &verdict,
+        Some(by.to_string()),
+        via,
+        None,
+    )
+    .await?;
     if resolved {
         reopen_if_runnable(db, clock, run).await?;
     }
@@ -1359,6 +1595,7 @@ pub async fn resolve_plugin_gate(
         reason,
         expired: false,
         by: Some(releaser.to_string()),
+        via: None,
         fence: Some(attempt.clone()),
         legacy_started_at: now,
         at: now,
@@ -1541,7 +1778,7 @@ pub fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
         .map_or(0, |i| i + 1);
     let mut seen: Vec<String> = Vec::new();
     for e in &events[from..] {
-        if let EventPayload::GateApproved { step: s, by } = &e.kind {
+        if let EventPayload::GateApproved { step: s, by, .. } = &e.kind {
             if s == step && !seen.contains(by) {
                 seen.push(by.clone());
             }
@@ -1694,6 +1931,7 @@ pub fn wait_began_at(events: &[EventKind], gate: &StepRun, now: Timestamp) -> Ti
 /// writes nothing.
 ///
 /// Returns whether this call resolved it.
+#[allow(clippy::too_many_arguments)] // the verdict's arguments plus who decided and how
 async fn resolve_gate(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -1701,6 +1939,7 @@ async fn resolve_gate(
     gate: &StepRun,
     verdict: &GateVerdict,
     by: Option<String>,
+    via: Option<DelegationTrail>,
     fence: Option<AttemptId>,
 ) -> Result<bool, DbError> {
     let now = clock.now().await;
@@ -1715,6 +1954,7 @@ async fn resolve_gate(
         reason: verdict.reason.clone(),
         expired: verdict.expired,
         by,
+        via,
         fence,
         legacy_started_at,
         at: now,
@@ -1737,6 +1977,7 @@ async fn supersede_gate_attempt(
     step: &StepId,
     attempt: &AttemptId,
     by: Option<&str>,
+    via: Option<&DelegationTrail>,
 ) -> Result<bool, DbError> {
     let now = clock.now().await;
     let event = EventKind {
@@ -1746,6 +1987,7 @@ async fn supersede_gate_attempt(
             step: step.clone(),
             attempt: attempt.clone(),
             by: by.map(str::to_string),
+            via: via.cloned(),
         },
         at: now,
     };
@@ -1883,6 +2125,7 @@ pub async fn record_gate_approval(
     run: &RunId,
     step: &StepId,
     by: &str,
+    via: Option<DelegationTrail>,
 ) -> Result<(), RerunError> {
     ensure_creation_finished(db, run).await?;
     // The target must be a known step (404 otherwise) ...
@@ -1932,6 +2175,7 @@ pub async fn record_gate_approval(
         kind: EventPayload::GateApproved {
             step: step.clone(),
             by: by.to_string(),
+            via,
         },
         at: now,
     })
@@ -1950,6 +2194,7 @@ pub async fn cancel_run_request(
     clock: &dyn Clock,
     run: &RunId,
     by: Option<String>,
+    via: Option<DelegationTrail>,
 ) -> Result<bool, SchedulerError> {
     let Some(current) = db.run_status(run).await? else {
         return Ok(false);
@@ -1976,7 +2221,7 @@ pub async fn cancel_run_request(
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
-        kind: EventPayload::RunCancelRequested { by },
+        kind: EventPayload::RunCancelRequested { by, via },
         at: now,
     })
     .await?;
@@ -4699,7 +4944,7 @@ impl<'a> Scheduler<'a> {
                 .all(|d| status_by_id.get(d).copied() == Some(StepStatus::Succeeded));
             if !reached {
                 if let Some(a) = open_gate_attempt(gate) {
-                    supersede_gate_attempt(self.db, self.clock, run, &gate.step, &a.id, None)
+                    supersede_gate_attempt(self.db, self.clock, run, &gate.step, &a.id, None, None)
                         .await?;
                 }
                 continue;
@@ -4755,6 +5000,7 @@ impl<'a> Scheduler<'a> {
                             run,
                             gate,
                             &verdict,
+                            None,
                             None,
                             Some(attempt.id.clone()),
                         )
@@ -4814,6 +5060,7 @@ impl<'a> Scheduler<'a> {
                     run,
                     gate,
                     &verdict,
+                    None,
                     None,
                     Some(attempt.id.clone()),
                 )
@@ -6181,6 +6428,50 @@ mod tests {
         event(&RunId("r".into()), kind, Timestamp(0))
     }
 
+    /// ADR-0086 §9: a Rerun of `test` re-arms the Fork Run approval gate and
+    /// the Steps between it and `test`, and leaves alone a sibling branch and
+    /// the cascade's own members. A gate upstream of nothing in the cascade
+    /// re-arms nothing.
+    #[test]
+    fn a_rerun_re_arms_the_fork_gate_and_the_path_to_the_cascade() {
+        let step = |id: &str, needs: &[&str]| StepRun {
+            run: RunId("r".into()),
+            step: StepId(id.into()),
+            status: StepStatus::Succeeded,
+            attempts: vec![],
+            needs: needs.iter().map(|n| StepId(n.to_string())).collect(),
+            gate_kind: None,
+            key: None,
+        };
+        let steps = vec![
+            step("fork", &[]),
+            step("clone", &["fork"]),
+            step("build", &["clone"]),
+            step("test", &["build"]),
+            step("report", &["test"]),
+            step("lint", &["clone"]),
+            step("docs", &["fork"]),
+        ];
+        let ids = |set: std::collections::HashSet<StepId>| {
+            let mut v: Vec<String> = set.into_iter().map(|s| s.0).collect();
+            v.sort();
+            v
+        };
+        let gate = [StepId("fork".into())];
+        let base = crate::invalidation_set(&StepId("test".into()), &steps);
+        assert_eq!(
+            ids(fork_run_approval_rearm(&gate, &base, &steps)),
+            vec!["build", "clone", "fork"]
+        );
+        // The gate is the target: its cascade already holds everything.
+        let base = crate::invalidation_set(&StepId("fork".into()), &steps);
+        assert!(fork_run_approval_rearm(&gate, &base, &steps).is_empty());
+        // A gate that is not upstream of the cascade.
+        let other = [StepId("docs".into())];
+        let base = crate::invalidation_set(&StepId("test".into()), &steps);
+        assert!(fork_run_approval_rearm(&other, &base, &steps).is_empty());
+    }
+
     fn unneeded_skip(gate: &StepId) -> [EventKind; 2] {
         [
             ev(EventPayload::StepSkipped {
@@ -6210,6 +6501,7 @@ mod tests {
             invalidated: vec![StepId("build".into()), gate.clone()],
             by: None,
             widened: vec![],
+            via: None,
         }));
         assert!(!skipped_as_unneeded(&events, &gate), "a rerun re-armed it");
 

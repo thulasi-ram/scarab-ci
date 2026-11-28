@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  MAX_NEXT_LEN,
   confirmMerge,
   mergedNotice,
   pendingMergeId,
@@ -49,7 +50,11 @@ describe("loginChoices", () => {
     expect(loginChoices([], "//evil.example/x")[0]!.href).toBe("/v1/auth/login");
     // What the server's `safe_next` refuses (400) is dropped, not sent: the
     // sign-in must still work.
-    expect(loginChoices([], `/${"a".repeat(600)}`)[0]!.href).toBe("/v1/auth/login");
+    expect(loginChoices([], `/${"a".repeat(MAX_NEXT_LEN)}`)[0]!.href).toBe("/v1/auth/login");
+    // One byte under the cap is still carried.
+    expect(loginChoices([], `/${"a".repeat(MAX_NEXT_LEN - 1)}`)[0]!.href).toBe(
+      `/v1/auth/login?next=%2F${"a".repeat(MAX_NEXT_LEN - 1)}`,
+    );
     expect(loginChoices([], "/a\\b")[0]!.href).toBe("/v1/auth/login");
     expect(loginChoices([], "/a\nb")[0]!.href).toBe("/v1/auth/login");
   });

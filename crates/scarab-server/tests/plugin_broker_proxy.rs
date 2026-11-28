@@ -216,6 +216,7 @@ async fn harness_with(adjust: impl FnOnce(AppState) -> AppState) -> Option<Harne
                 enabled: true,
                 namespace: NAMESPACE.into(),
                 dev_allow_tag: false,
+                trusted_publishers: Vec::new(),
             },
         )
         .with_plugin_tokens(Arc::new(FakeTokenReview))

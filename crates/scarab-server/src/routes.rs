@@ -2,13 +2,14 @@
 //! its Implementation notes).
 //!
 //! Every route is registered through [`Routes`], which takes the route's
-//! [`Op`] classification as an argument: a GET is [`ops::READ`] unless it
-//! names its op (the debug shell's WebSocket upgrade); a POST, PUT
-//! or DELETE cannot be registered without naming its `&'static Op`. So a new
-//! mutating route cannot exist without saying whether it is a crown jewel,
-//! and [`route_table`] is the complete, test-enumerable list the step-up
-//! guard consults at runtime. A mutating request the table does not know is
-//! refused 500 by the guard (fail-closed).
+//! [`Op`] classification as an argument: no route, a GET included, can be
+//! registered without naming its `&'static Op` (ADR-0086 §5: a GET names
+//! the read operation of the data it exposes). So a new mutating route
+//! cannot exist without saying whether it is a crown jewel, a new read
+//! cannot exist without saying what it exposes, and [`route_table`] is the
+//! complete, test-enumerable list the step-up guard consults at runtime. A
+//! mutating request the table does not know is refused 500 by the guard
+//! (fail-closed).
 //!
 //! There is deliberately no `.any(...)`, no `.route(...)` escape hatch and no
 //! nesting: `tests/step_up_routes.rs` scans the sources for `.route(` outside
@@ -39,13 +40,22 @@ pub struct RouteEntry {
 pub(crate) struct Routes {
     pub(crate) router: Router<AppState>,
     pub(crate) table: Vec<RouteEntry>,
+    /// Which routes of the list this router serves: every one for the main
+    /// API; for PluginApi, only those a delegated call may use.
+    keep: fn(&'static str, &'static Op) -> bool,
 }
 
 impl Routes {
     fn new() -> Self {
+        Self::keeping(|_, _| true)
+    }
+
+    /// A router that serves only the routes `keep` accepts.
+    fn keeping(keep: fn(&'static str, &'static Op) -> bool) -> Self {
         Self {
             router: Router::new(),
             table: Vec::new(),
+            keep,
         }
     }
 
@@ -56,6 +66,9 @@ impl Routes {
         op: &'static Op,
         mr: MethodRouter<AppState>,
     ) -> Self {
+        if !(self.keep)(path, op) {
+            return self;
+        }
         // axum merges method routers registered on the same path, and panics
         // on a duplicate (path, method) — so the table cannot hold one either.
         self.router = self.router.route(path, mr);
@@ -63,18 +76,11 @@ impl Routes {
         self
     }
 
-    /// A read: always [`ops::READ`].
-    fn get<H, T>(self, path: &'static str, h: H) -> Self
-    where
-        H: Handler<T, AppState>,
-        T: 'static,
-    {
-        self.add(Method::GET, path, &ops::READ, axum::routing::get(h))
-    }
-
-    /// A GET that is not a plain read: the debug shell's WebSocket upgrade,
-    /// which the guard governs by `op` like a write.
-    fn get_governed<H, T>(self, path: &'static str, op: &'static Op, h: H) -> Self
+    /// A GET names its operation like any other route: a read operation
+    /// named by the data it exposes ([`ops::RUN_READ`], …), or, for the
+    /// debug shell's WebSocket upgrade, a crown jewel the guard governs like
+    /// a write.
+    fn get<H, T>(self, path: &'static str, op: &'static Op, h: H) -> Self
     where
         H: Handler<T, AppState>,
         T: 'static,
@@ -88,6 +94,21 @@ impl Routes {
         T: 'static,
     {
         self.add(Method::POST, path, op, axum::routing::post(h))
+    }
+
+    /// A POST whose body is refused past `limit` bytes before the handler
+    /// reads it.
+    fn post_limited<H, T>(self, path: &'static str, op: &'static Op, h: H, limit: usize) -> Self
+    where
+        H: Handler<T, AppState>,
+        T: 'static,
+    {
+        self.add(
+            Method::POST,
+            path,
+            op,
+            axum::routing::post(h).layer(axum::extract::DefaultBodyLimit::max(limit)),
+        )
     }
 
     fn put<H, T>(self, path: &'static str, op: &'static Op, h: H) -> Self
@@ -113,31 +134,98 @@ pub fn route_table() -> &'static [RouteEntry] {
     TABLE.get_or_init(|| governed_routes().table)
 }
 
-/// The single route list.
+/// The single route list, every route of it.
 pub(crate) fn governed_routes() -> Routes {
+    route_list(Routes::new())
+}
+
+/// The routes PluginApi serves on the broker listener (ADR-0086 §4): the
+/// public API's own routes and handlers, only those whose ApiOperation a
+/// DelegatedCallerHandle could name ([`crate::plugin_api::served`]).
+pub(crate) fn plugin_api_routes() -> Routes {
+    route_list(Routes::keeping(crate::plugin_api::served))
+}
+
+/// The single route list, registered on `routes`.
+fn route_list(routes: Routes) -> Routes {
     use crate::step_up::ceremony;
     use crate::*;
-    Routes::new()
-        .get("/healthz", healthz)
-        .get("/livez", livez)
-        .get("/readyz", readyz)
-        .get("/metrics", metrics)
-        .get("/openapi.json", openapi)
-        .get("/.well-known/jwks.json", jwks)
-        .get("/.well-known/openid-configuration", openid_configuration)
+    routes
+        .get("/healthz", &ops::SERVER_READ, healthz)
+        .get("/livez", &ops::SERVER_READ, livez)
+        .get("/readyz", &ops::SERVER_READ, readyz)
+        .get("/metrics", &ops::SERVER_READ, metrics)
+        .get("/openapi.json", &ops::SERVER_READ, openapi)
+        .get("/.well-known/jwks.json", &ops::SERVER_READ, jwks)
+        // ADR-0086 §7: the OAuth authorization server for plugin endpoints.
+        .get(
+            "/.well-known/oauth-authorization-server",
+            &ops::SERVER_READ,
+            crate::oauth_server::authorization_server_metadata,
+        )
+        .get(
+            "/.well-known/oauth-protected-resource/v1/orgs/{org}/plugin-installations/{id}/endpoints/{*endpoint_path}",
+            &ops::SERVER_READ,
+            crate::oauth_server::protected_resource_metadata,
+        )
+        .post(
+            "/v1/oauth/authorization-requests",
+            &ops::OAUTH_AUTHORIZATION_REQUEST,
+            crate::oauth_server::describe_authorization_request,
+        )
+        .post(
+            "/v1/oauth/consent",
+            &ops::OAUTH_CONSENT,
+            crate::oauth_server::consent,
+        )
+        .post("/oauth/token", &ops::OAUTH_TOKEN, crate::oauth_server::token)
+        .get(
+            "/v1/me/connected-apps",
+            &ops::ACCOUNT_READ,
+            crate::oauth_server::list_connected_apps,
+        )
+        .delete(
+            "/v1/me/connected-apps/{id}",
+            &ops::OAUTH_GRANT_REVOKE_OWN,
+            crate::oauth_server::revoke_connected_app,
+        )
+        .get(
+            "/v1/orgs/{org}/oauth/client-metadata-hosts",
+            &ops::SETTINGS_READ,
+            crate::oauth_server::list_client_metadata_hosts,
+        )
+        .put(
+            "/v1/orgs/{org}/oauth/client-metadata-hosts/{host}",
+            &ops::OAUTH_CLIENT_METADATA_HOST_ADD,
+            crate::oauth_server::put_client_metadata_host,
+        )
+        .delete(
+            "/v1/orgs/{org}/oauth/client-metadata-hosts/{host}",
+            &ops::OAUTH_CLIENT_METADATA_HOST_REMOVE,
+            crate::oauth_server::delete_client_metadata_host,
+        )
+        .get(
+            "/.well-known/openid-configuration",
+            &ops::SERVER_READ,
+            openid_configuration,
+        )
         .post("/v1/auth/login", &ops::AUTH_LOGIN, login)
-        .get("/v1/auth/login", oauth_login_redirect)
-        .get("/v1/auth/callback", oauth_callback)
-        .get("/v1/auth/providers", auth_providers)
+        .get("/v1/auth/login", &ops::SERVER_READ, oauth_login_redirect)
+        .get("/v1/auth/callback", &ops::SERVER_READ, oauth_callback)
+        .get("/v1/auth/providers", &ops::SERVER_READ, auth_providers)
         .post("/v1/auth/logout", &ops::AUTH_LOGOUT, logout)
-        .get("/v1/me", me)
-        .get("/v1/about", about)
+        .get("/v1/me", &ops::ACCOUNT_READ, me)
+        .get("/v1/about", &ops::SERVER_READ, about)
         .post(
             "/v1/me/identities/link",
             &ops::IDENTITY_LINK,
             begin_link_identity,
         )
-        .get("/v1/me/identities/merges/{id}", identity_merge)
+        .get(
+            "/v1/me/identities/merges/{id}",
+            &ops::ACCOUNT_READ,
+            identity_merge,
+        )
         .post(
             "/v1/me/identities/merges/{id}",
             &ops::IDENTITY_MERGE_CONFIRM,
@@ -149,7 +237,7 @@ pub(crate) fn governed_routes() -> Routes {
             unlink_identity,
         )
         // ADR-0073: the caller's passkeys and the step-up ceremony.
-        .get("/v1/me/security", ceremony::me_security)
+        .get("/v1/me/security", &ops::ACCOUNT_READ, ceremony::me_security)
         .post(
             "/v1/me/passkeys/registration/options",
             &ops::PASSKEY_ADD,
@@ -179,28 +267,36 @@ pub(crate) fn governed_routes() -> Routes {
         // and an Owner's passkey reset. (The operator break-glass has no route.)
         .get(
             "/v1/me/security/events",
+            &ops::ACCOUNT_READ,
             step_up::events::my_security_events,
         )
         // The caller's own API tokens (git-bug a4cb94f).
-        .get("/v1/me/tokens", list_own_api_tokens)
+        .get("/v1/me/tokens", &ops::ACCOUNT_READ, list_own_api_tokens)
         .post("/v1/me/tokens", &ops::TOKEN_MINT_OWN, mint_own_api_token)
         .delete(
             "/v1/me/tokens/{id}",
             &ops::TOKEN_REVOKE_OWN,
             revoke_own_api_token,
         )
-        .get("/v1/security/events", step_up::events::security_events)
+        .get(
+            "/v1/security/events",
+            &ops::SECURITY_READ,
+            step_up::events::security_events,
+        )
         .get(
             "/v1/orgs/{org}/security/events",
+            &ops::SECURITY_READ,
             step_up::events::org_security_events,
         )
         .get(
             "/v1/orgs/{org}/security/summary",
+            &ops::SECURITY_READ,
             step_up::events::org_security_summary,
         )
         // An org's leak check limits: Admins read them, Owners change them.
         .get(
             "/v1/orgs/{org}/security/leak-checks",
+            &ops::SECURITY_READ,
             crate::secret_match::get_leak_check_limits,
         )
         .put(
@@ -208,12 +304,28 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::LEAK_CHECK_LIMITS_PUT,
             crate::secret_match::put_leak_check_limits,
         )
+        // An org's Fork Run approval setting (ADR-0086 §9): members read
+        // it, admins change it from a browser.
+        .get(
+            "/v1/orgs/{org}/security/fork-run-approval",
+            &ops::SETTINGS_READ,
+            crate::fork_run_approval::get_fork_run_approval,
+        )
+        .put(
+            "/v1/orgs/{org}/security/fork-run-approval",
+            &ops::FORK_RUN_APPROVAL_PUT,
+            crate::fork_run_approval::put_fork_run_approval,
+        )
         .post(
             "/v1/orgs/{org}/members/{id}/passkeys/reset",
             &ops::PASSKEY_RESET,
             step_up::admin::reset_member_passkeys,
         )
-        .get("/v1/step-up/requests/{id}", step_up::requests::get_request)
+        .get(
+            "/v1/step-up/requests/{id}",
+            &ops::ACCOUNT_READ,
+            step_up::requests::get_request,
+        )
         .post(
             "/v1/step-up/requests/{id}/options",
             &ops::STEP_UP_REQUEST_OPTIONS,
@@ -224,16 +336,20 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::STEP_UP_REQUEST_CONFIRM,
             step_up::requests::confirm_request,
         )
-        .get("/v1/orgs/{org}/bindings", list_bindings)
+        .get("/v1/orgs/{org}/bindings", &ops::ACCESS_READ, list_bindings)
         .put("/v1/orgs/{org}/bindings", &ops::BINDING_PUT, put_binding)
         .delete(
             "/v1/orgs/{org}/bindings",
             &ops::BINDING_DELETE,
             delete_binding,
         )
-        .get("/v1/orgs/{org}/principals", search_principals)
-        .get("/v1/orgs/{org}/members/{id}", get_member)
-        .get("/v1/orgs/{org}/tokens", list_api_tokens)
+        .get(
+            "/v1/orgs/{org}/principals",
+            &ops::ACCESS_READ,
+            search_principals,
+        )
+        .get("/v1/orgs/{org}/members/{id}", &ops::ACCESS_READ, get_member)
+        .get("/v1/orgs/{org}/tokens", &ops::ACCESS_READ, list_api_tokens)
         .post("/v1/orgs/{org}/tokens", &ops::TOKEN_MINT, mint_api_token)
         .delete(
             "/v1/orgs/{org}/tokens/{id}",
@@ -245,21 +361,27 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::BINDINGS_IMPORT,
             import_bindings,
         )
-        .get("/v1/repos", list_projects)
-        .get("/v1/repos/{org}/{repo}/runs", list_repo_runs)
+        .get("/v1/repos", &ops::REPO_READ, list_projects)
+        .get(
+            "/v1/repos/{org}/{repo}/runs",
+            &ops::RUN_READ,
+            list_repo_runs,
+        )
         .get(
             "/v1/repos/{org}/{repo}/refused-runs",
+            &ops::RUN_READ,
             refused_runs::list_refused_runs,
         )
         .get(
             "/v1/repos/{org}/{repo}/schedules",
+            &ops::REPO_READ,
             crate::schedules::list_schedules,
         )
         .post("/v1/runs", &ops::RUN_CREATE, create_run)
-        .get("/v1/runs", list_runs)
-        .get("/v1/runs/{id}", get_run)
-        .get("/v1/runs/{id}/events", get_events)
-        .get("/v1/runs/{id}/logs", get_logs)
+        .get("/v1/runs", &ops::RUN_READ, list_runs)
+        .get("/v1/runs/{id}", &ops::RUN_READ, get_run)
+        .get("/v1/runs/{id}/events", &ops::RUN_READ, get_events)
+        .get("/v1/runs/{id}/logs", &ops::STEP_LOGS_READ, get_logs)
         .post(
             "/v1/runs/{id}/steps/{step}/rerun",
             &ops::STEP_RERUN,
@@ -279,12 +401,21 @@ pub(crate) fn governed_routes() -> Routes {
         )
         // The rerun PREVIEW (ADR-0061 s5): what the rerun would actually execute,
         // read before the button is pressed so a widened scope is never a surprise.
-        .get("/v1/runs/{id}/steps/{step}/rerun-plan", rerun_plan)
+        .get(
+            "/v1/runs/{id}/steps/{step}/rerun-plan",
+            &ops::RUN_READ,
+            rerun_plan,
+        )
         .get(
             "/v1/runs/{id}/steps/{step}/origin",
+            &ops::RUN_READ,
             run_origin::get_step_origin,
         )
-        .get("/v1/runs/{id}/manifest", run_origin::get_run_manifest)
+        .get(
+            "/v1/runs/{id}/manifest",
+            &ops::RUN_READ,
+            run_origin::get_run_manifest,
+        )
         // The manual Workspace-Snapshot pin (ADR-0061 s5) — one resource, two
         // verbs, because pin and unpin are the same fact in two states.
         .post(
@@ -298,29 +429,55 @@ pub(crate) fn governed_routes() -> Routes {
             unpin_run_snapshots,
         )
         .post("/v1/runs/{id}/cancel", &ops::RUN_CANCEL, cancel_run)
-        .get("/v1/runs/{id}/artifacts", list_artifacts)
-        .get("/v1/runs/{id}/artifacts/{*name}", download_artifact)
-        .get("/v1/runs/{id}/steps/{step}/logs", get_step_logs)
-        .get("/v1/runs/{id}/steps/{step}/logs/raw", get_step_logs_raw)
-        .get("/v1/runs/{id}/services", get_services)
-        .get("/v1/runs/{id}/services/{service}/logs", get_service_logs)
+        .get(
+            "/v1/runs/{id}/artifacts",
+            &ops::RUN_ARTIFACTS_READ,
+            list_artifacts,
+        )
+        .get(
+            "/v1/runs/{id}/artifacts/{*name}",
+            &ops::RUN_ARTIFACTS_READ,
+            download_artifact,
+        )
+        .get(
+            "/v1/runs/{id}/steps/{step}/logs",
+            &ops::STEP_LOGS_READ,
+            get_step_logs,
+        )
+        .get(
+            "/v1/runs/{id}/steps/{step}/logs/raw",
+            &ops::STEP_LOGS_READ,
+            get_step_logs_raw,
+        )
+        .get("/v1/runs/{id}/services", &ops::RUN_READ, get_services)
+        .get(
+            "/v1/runs/{id}/services/{service}/logs",
+            &ops::STEP_LOGS_READ,
+            get_service_logs,
+        )
         .get(
             "/v1/runs/{id}/services/{service}/logs/raw",
+            &ops::STEP_LOGS_READ,
             get_service_logs_raw,
         )
-        .get_governed(
+        .get(
             "/v1/runs/{id}/steps/{step}/attach",
             &ops::STEP_ATTACH,
             attach_step,
         )
-        .get_governed(
+        .get(
             "/v1/runs/{id}/steps/{step}/debug-pod",
             &ops::STEP_DEBUG_POD,
             debug_pod_step,
         )
-        .get("/v1/runs/{id}/steps/{step}/workspace", list_workspace)
+        .get(
+            "/v1/runs/{id}/steps/{step}/workspace",
+            &ops::STEP_WORKSPACE_READ,
+            list_workspace,
+        )
         .get(
             "/v1/runs/{id}/steps/{step}/workspace/file",
+            &ops::STEP_WORKSPACE_READ,
             get_workspace_file,
         )
         .post(
@@ -338,17 +495,29 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::GATE_RELEASE,
             release_gate_external,
         )
-        .get("/v1/runs/{id}/steps/{step}/results", get_step_results)
+        .get(
+            "/v1/runs/{id}/steps/{step}/results",
+            &ops::RUN_READ,
+            get_step_results,
+        )
         .post(
             "/v1/runs/{id}/steps/{step}/results",
             &ops::STEP_RESULTS,
             ingest_step_results,
         )
-        .get("/v1/runs/{id}/steps/{step}/consumed", get_attempt_consumed)
+        .get(
+            "/v1/runs/{id}/steps/{step}/consumed",
+            &ops::RUN_READ,
+            get_attempt_consumed,
+        )
         .post("/v1/secrets", &ops::SECRET_PUT, put_secret)
-        .get("/v1/secrets", list_secrets)
+        .get("/v1/secrets", &ops::SECRET_NAMES_READ, list_secrets)
         .delete("/v1/secrets", &ops::SECRET_DELETE, delete_secret)
-        .get("/v1/repos/{org}/{repo}/environments", list_environments)
+        .get(
+            "/v1/repos/{org}/{repo}/environments",
+            &ops::SETTINGS_READ,
+            list_environments,
+        )
         .put(
             "/v1/repos/{org}/{repo}/environments/{name}",
             &ops::ENV_LEGACY_PUT,
@@ -356,6 +525,7 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get(
             "/v1/repos/{org}/{repo}/environments/{name}",
+            &ops::SETTINGS_READ,
             get_environment,
         )
         .delete(
@@ -363,9 +533,21 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::ENV_LEGACY_DELETE,
             delete_environment,
         )
-        .get("/v1/orgs/{org}/environments", oe::list_org_environments)
-        .get("/v1/orgs/{org}/secrets/orphaned", oe::list_orphaned_secrets)
-        .get("/v1/orgs/{org}/secrets/matrix", org_secret_matrix)
+        .get(
+            "/v1/orgs/{org}/environments",
+            &ops::SETTINGS_READ,
+            oe::list_org_environments,
+        )
+        .get(
+            "/v1/orgs/{org}/secrets/orphaned",
+            &ops::SECRET_NAMES_READ,
+            oe::list_orphaned_secrets,
+        )
+        .get(
+            "/v1/orgs/{org}/secrets/matrix",
+            &ops::SECRET_NAMES_READ,
+            org_secret_matrix,
+        )
         .post(
             "/v1/orgs/{org}/secrets/match",
             &ops::SECRET_MATCH,
@@ -376,7 +558,11 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::ENVIRONMENT_PUT,
             oe::put_org_environment,
         )
-        .get("/v1/orgs/{org}/environments/{env}", oe::get_org_environment)
+        .get(
+            "/v1/orgs/{org}/environments/{env}",
+            &ops::SETTINGS_READ,
+            oe::get_org_environment,
+        )
         .delete(
             "/v1/orgs/{org}/environments/{env}",
             &ops::ENVIRONMENT_DELETE,
@@ -394,6 +580,7 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get(
             "/v1/orgs/{org}/environments/{env}/eligibility",
+            &ops::SETTINGS_READ,
             oe::get_environment_eligibility,
         )
         .put(
@@ -403,10 +590,12 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get(
             "/v1/orgs/{org}/environments/{env}/protection",
+            &ops::SETTINGS_READ,
             oe::get_environment_protection,
         )
         .get(
             "/v1/orgs/{org}/environments/{env}/projects",
+            &ops::SETTINGS_READ,
             oe::list_environment_projects,
         )
         .put(
@@ -416,6 +605,7 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get(
             "/v1/orgs/{org}/environments/{env}/projects/{project}/overlay",
+            &ops::SETTINGS_READ,
             oe::get_environment_project_overlay,
         )
         .delete(
@@ -430,6 +620,7 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get(
             "/v1/orgs/{org}/environments/{env}/projects/{project}/privilege-grant",
+            &ops::SETTINGS_READ,
             oe::get_environment_project_privilege_grant,
         )
         .delete(
@@ -438,13 +629,21 @@ pub(crate) fn governed_routes() -> Routes {
             oe::delete_environment_project_privilege_grant,
         )
         // ADR-0075: org Policies, Project typed settings, decisions, the test API.
-        .get("/v1/orgs/{org}/policies", pol::list_org_policies)
+        .get(
+            "/v1/orgs/{org}/policies",
+            &ops::SETTINGS_READ,
+            pol::list_org_policies,
+        )
         .post(
             "/v1/orgs/{org}/policies",
             &ops::POLICY_CREATE,
             pol::create_org_policy,
         )
-        .get("/v1/orgs/{org}/policies/{id}", pol::get_org_policy)
+        .get(
+            "/v1/orgs/{org}/policies/{id}",
+            &ops::SETTINGS_READ,
+            pol::get_org_policy,
+        )
         .put(
             "/v1/orgs/{org}/policies/{id}",
             &ops::POLICY_UPDATE,
@@ -457,10 +656,12 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get(
             "/v1/orgs/{org}/policies/{id}/versions",
+            &ops::SETTINGS_READ,
             pol::list_org_policy_versions,
         )
         .get(
             "/v1/orgs/{org}/projects/{project}/policies",
+            &ops::SETTINGS_READ,
             pol::list_project_policies,
         )
         .post(
@@ -470,6 +671,7 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get(
             "/v1/orgs/{org}/projects/{project}/policies/{id}",
+            &ops::SETTINGS_READ,
             pol::get_project_policy,
         )
         .put(
@@ -484,6 +686,7 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get(
             "/v1/orgs/{org}/projects/{project}/policies/{id}/versions",
+            &ops::SETTINGS_READ,
             pol::list_project_policy_versions,
         )
         .post(
@@ -503,25 +706,38 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get(
             "/v1/orgs/{org}/policy-decisions",
+            &ops::SETTINGS_READ,
             pol::list_org_policy_decisions,
         )
         .get(
             "/v1/orgs/{org}/policy-decisions/counts",
+            &ops::SETTINGS_READ,
             pol::org_policy_decision_counts,
         )
-        .get("/v1/policy-checkpoints", pol::list_policy_checkpoints)
+        .get(
+            "/v1/policy-checkpoints",
+            &ops::SETTINGS_READ,
+            pol::list_policy_checkpoints,
+        )
         .get(
             "/v1/runs/{id}/policy-decisions",
+            &ops::RUN_READ,
             pol::list_run_policy_decisions,
         )
         // ADR-0076: org-installed libraries, yanks, trusted sources.
-        .get("/v1/orgs/{org}/libraries", lib::list_libraries)
+        .get(
+            "/v1/orgs/{org}/libraries",
+            &ops::SETTINGS_READ,
+            lib::list_libraries,
+        )
         .get(
             "/v1/orgs/{org}/library-installations/{id}",
+            &ops::SETTINGS_READ,
             lib::get_library_installation,
         )
         .get(
             "/v1/orgs/{org}/library-yanks/{hash}/impact",
+            &ops::SETTINGS_READ,
             lib::get_yank_impact,
         )
         .post(
@@ -564,9 +780,14 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::PLUGIN_FETCH,
             plugins::fetch_plugin_manifest,
         )
-        .get("/v1/orgs/{org}/plugins", plugins::list_plugins)
+        .get(
+            "/v1/orgs/{org}/plugins",
+            &ops::SETTINGS_READ,
+            plugins::list_plugins,
+        )
         .get(
             "/v1/orgs/{org}/gates",
+            &ops::RUN_READ,
             crate::plugin_gates::list_pending_gates,
         )
         .post(
@@ -574,9 +795,22 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::PLUGIN_INSTALL,
             plugins::install_plugin,
         )
-        .get("/v1/orgs/{org}/plugins/{name}", plugins::get_plugin)
+        .get(
+            "/v1/orgs/{org}/plugins/{name}",
+            &ops::SETTINGS_READ,
+            plugins::get_plugin,
+        )
+        // ADR-0086 §1: a plugin's endpoint, authenticated by the caller's
+        // `oauth` token for it (`plugin_endpoint`).
+        .post_limited(
+            "/v1/orgs/{org}/plugin-installations/{id}/endpoints/{*endpoint_path}",
+            &ops::PLUGIN_ENDPOINT,
+            crate::plugin_endpoint::plugin_endpoint,
+            crate::plugin_endpoint::MAX_ENDPOINT_REQUEST_BYTES,
+        )
         .get(
             "/v1/orgs/{org}/plugin-installations/{id}",
+            &ops::SETTINGS_READ,
             plugins::get_plugin_by_id,
         )
         .delete(
@@ -616,10 +850,12 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get(
             "/v1/orgs/{org}/plugins/{name}/connections",
+            &ops::SETTINGS_READ,
             plugins::list_plugin_connections,
         )
         .get(
             "/v1/orgs/{org}/plugins/{name}/broker-journal",
+            &ops::SECURITY_READ,
             plugins::plugin_broker_journal,
         )
         .put(
@@ -632,7 +868,7 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::PLUGIN_CONNECTION_DELETE,
             plugins::delete_plugin_connection,
         )
-        .get("/v1/connections", list_connections)
+        .get("/v1/connections", &ops::SETTINGS_READ, list_connections)
         .post(
             "/v1/connections",
             &ops::CONNECTION_CREATE,
@@ -653,10 +889,22 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::CONNECTION_RESYNC,
             resync_connection,
         )
-        .get("/v1/connections/{id}/preflight", connection_preflight)
-        .get("/v1/forges/github/app", github_app_info)
-        .get("/v1/connections/{id}/available-repos", available_repos)
-        .get("/v1/orgs/{org}/repos", org_repos)
+        .get(
+            "/v1/connections/{id}/preflight",
+            &ops::SETTINGS_READ,
+            connection_preflight,
+        )
+        .get(
+            "/v1/forges/github/app",
+            &ops::SETTINGS_READ,
+            github_app_info,
+        )
+        .get(
+            "/v1/connections/{id}/available-repos",
+            &ops::SETTINGS_READ,
+            available_repos,
+        )
+        .get("/v1/orgs/{org}/repos", &ops::REPO_READ, org_repos)
         .post(
             "/v1/connections/{id}/repos",
             &ops::CONNECTION_BIND_REPO,
@@ -672,7 +920,11 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::CONNECTION_WEBHOOK,
             register_repo_webhook,
         )
-        .get("/v1/repos/{org}/{repo}/secrets/matrix", secret_matrix)
+        .get(
+            "/v1/repos/{org}/{repo}/secrets/matrix",
+            &ops::SECRET_NAMES_READ,
+            secret_matrix,
+        )
         .put(
             "/v1/repos/{org}/{repo}/secrets/matrix/silenced",
             &ops::SECRET_CELL_SILENCE,
@@ -683,10 +935,15 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::SECRET_CELL_UNSILENCE,
             unsilence_secret_cell,
         )
-        .get("/v1/repos/{org}/{repo}/refs", list_refs)
-        .get("/v1/repos/{org}/{repo}/pipelines", list_pipelines)
+        .get("/v1/repos/{org}/{repo}/refs", &ops::REPO_READ, list_refs)
+        .get(
+            "/v1/repos/{org}/{repo}/pipelines",
+            &ops::REPO_READ,
+            list_pipelines,
+        )
         .get(
             "/v1/repos/{org}/{repo}/pipelines/{name}/interface",
+            &ops::REPO_READ,
             pipeline_interface,
         )
         .post("/v1/repos/{org}/{repo}/dispatch", &ops::DISPATCH, dispatch)

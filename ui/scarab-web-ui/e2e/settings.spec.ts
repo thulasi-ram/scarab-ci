@@ -34,7 +34,7 @@ test("an admin lands on their org's settings", async ({ page }) => {
 // Account settings and an org's settings are separate pages: each sidebar
 // lists its own sections and none of the other's.
 for (const [start, heading, count] of [
-  ["/settings/profile", "Account settings", 4],
+  ["/settings/profile", "Account settings", 5],
   ["/orgs/acme/settings/connections", "Organization settings", 9],
 ] as const) {
   test(`${heading} lists only its own sections, each at its own URL`, async ({ page }) => {
