@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-28
+
 ### Breaking changes
 
 - **The OIDC issuer's key id changes.** The `kid` of the signing key, in the JWKS and in every
@@ -175,6 +177,11 @@ release.yml uses that version's section as the GitHub Release text. See
 - **A step launch reads only its Run's trigger record.** Deciding a Step's OIDC token, its fork
   status and its follow-ups read the one event Run creation records, not the Run's whole event
   log, at each launch.
+
+### Tests
+
+- **The stub identity provider's keys exist before it serves.** The login-flow tests no longer
+  fail at random when a request reaches the stub before its keys are generated.
 
 ## [0.8.4] - 2026-11-28
 
@@ -3029,7 +3036,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.4...v0.9.0
 [0.8.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.1...v0.8.2
