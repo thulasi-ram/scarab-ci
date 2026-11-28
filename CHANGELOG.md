@@ -47,6 +47,15 @@ release.yml uses that version's section as the GitHub Release text. See
   fork limits too. A re-run of that Run keeps them; once the forge answers again, start the
   pipeline again with a new push to the pull request or a dispatch at `refs/pull/<n>/head`.
 
+- **A dispatch of fork code starts no follow-up.** A manual or API dispatch whose commit no
+  branch or tag of the repository names is fork code, but its Run recorded no `fork` flag, so its
+  `on: upstream:` follow-ups started and ran the pipelines at the fork's commit with secrets and
+  write tokens. A dispatch now records `fork`, its Run starts no follow-up, and a follow-up whose
+  chain started from fork code counts as fork code at launch. Changes you may see: a manual or
+  API Run recorded before this release has no `fork` flag and is treated as fork code, so it
+  starts no follow-up when it finishes again after a re-run; a `when:` or template on a manual or
+  API trigger can read `event.fork`.
+
 ### Enhancement
 
 - **A manual or API dispatch asks the forge for one ref.** Deciding whether the dispatched commit

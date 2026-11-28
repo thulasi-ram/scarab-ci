@@ -193,8 +193,10 @@ async fn upstream_event(db: &dyn Db, msg: &OutboxMessage) -> Result<Option<Event
     let Some((trigger, actor)) = crate::run_trigger(db, run).await? else {
         return Ok(None);
     };
-    // A fork pull request's Run never starts a follow-up.
-    if trigger["fork"].as_bool() == Some(true) {
+    // A Run of fork code never starts a follow-up: a fork pull request, a
+    // dispatch of fork code, a dispatch recorded without the flag, or a
+    // follow-up whose chain started from one of those.
+    if crate::trigger_is_fork_code(db, &trigger).await? {
         return Ok(None);
     }
     let (Some(owner), Some(name), Some(sha)) = (
