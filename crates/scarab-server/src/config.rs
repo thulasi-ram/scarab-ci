@@ -753,6 +753,10 @@ pub struct Config {
     pub plugins: PluginsConfig,
     /// Step-up confirmation (ADR-0073, `SCARAB_STEP_UP`).
     pub step_up: StepUpMode,
+    /// The OAuth authorization server for Plugin endpoints (ADR-0086 §7),
+    /// `SCARAB_OAUTH_SERVER=on`. `None`: off, and every OAuth route answers
+    /// 404.
+    pub oauth_server: Option<OAuthServerConfig>,
 }
 
 /// Whether crown-jewel operations need a passkey StepUpConfirmation
@@ -1534,6 +1538,57 @@ pub enum ConfigError {
          boot (ADR-0048), so this refuses to start."
     )]
     InvalidPlugins(String),
+    #[error(
+        "the OAuth authorization server configuration is invalid (ADR-0086 §7): {0}. Refresh \
+         secrets are derived with one key every replica shares, so the server refuses to start \
+         without it rather than mint secrets another replica cannot check."
+    )]
+    InvalidOAuthServer(String),
+}
+
+/// The OAuth authorization server's settings (ADR-0086 §7).
+#[derive(Debug, Clone)]
+pub struct OAuthServerConfig {
+    /// `SCARAB_OAUTH_REFRESH_KEY`: the HMAC key refresh secrets are derived
+    /// with, the same on every replica, at least [`MIN_OAUTH_REFRESH_KEY_BYTES`].
+    pub refresh_key: Redacted,
+}
+
+/// The shortest refresh key accepted.
+pub const MIN_OAUTH_REFRESH_KEY_BYTES: usize = 32;
+
+impl OAuthServerConfig {
+    /// `SCARAB_OAUTH_SERVER` (`on` | `off`, default off) and, when on,
+    /// `SCARAB_OAUTH_REFRESH_KEY`.
+    fn resolve(env: &impl Fn(&str) -> Option<String>) -> Result<Option<Self>, ConfigError> {
+        let set = |k: &str| {
+            env(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        match set("SCARAB_OAUTH_SERVER").as_deref() {
+            None | Some("off") => Ok(None),
+            Some("on") => {
+                let key = set("SCARAB_OAUTH_REFRESH_KEY").ok_or_else(|| {
+                    ConfigError::InvalidOAuthServer(
+                        "SCARAB_OAUTH_SERVER=on needs SCARAB_OAUTH_REFRESH_KEY".into(),
+                    )
+                })?;
+                if key.len() < MIN_OAUTH_REFRESH_KEY_BYTES {
+                    return Err(ConfigError::InvalidOAuthServer(format!(
+                        "SCARAB_OAUTH_REFRESH_KEY must be at least {MIN_OAUTH_REFRESH_KEY_BYTES} \
+                         bytes"
+                    )));
+                }
+                Ok(Some(OAuthServerConfig {
+                    refresh_key: Redacted::new(&key),
+                }))
+            }
+            Some(other) => Err(ConfigError::InvalidOAuthServer(format!(
+                "SCARAB_OAUTH_SERVER must be `on` or `off`, got {other:?}"
+            ))),
+        }
+    }
 }
 
 impl Config {
@@ -2025,6 +2080,7 @@ impl Config {
             connections,
             plugins,
             step_up,
+            oauth_server: OAuthServerConfig::resolve(&env)?,
         })
     }
 

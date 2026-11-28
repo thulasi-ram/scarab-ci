@@ -20,6 +20,12 @@ pub use leak_checks::{
 
 /// Step-up confirmation ports (ADR-0073): passkeys, challenges,
 /// confirmations, requests and the OrgSecurityEventLog.
+mod oauth;
+pub use oauth::{
+    OAuthAuthorizationCode, OAuthClientMetadataHost, OAuthGrant, OAuthStore,
+    OAUTH_ACCESS_TOKEN_LIFETIME_MS, OAUTH_AUTHORIZATION_CODE_LIFETIME_MS,
+    OAUTH_GRANT_IDLE_LIFETIME_MS, OAUTH_GRANT_MAX_LIFETIME_MS, OAUTH_REFRESH_RETRY_WINDOW_MS,
+};
 mod step_up;
 pub use step_up::{
     security_event_kind, ChallengePurpose, ChallengeStore, ConfirmationKind, LoginKind,

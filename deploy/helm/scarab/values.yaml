@@ -430,6 +430,10 @@ secrets:
   githubWebhookSecret: ""
   forgejoWebhookSecret: ""
   gateTokenSecret: ""
+  # The key OAuth refresh secrets are derived with (SCARAB_OAUTH_REFRESH_KEY):
+  # at least 32 random bytes, the same on every replica. Required when
+  # oauthServer.enabled is true; the render fails without it.
+  oauthRefreshKey: ""
   resultsTokenSecret: ""
   # HMAC secret for the workspace token (ADR-0061): the credential a step Pod
   # presents to the workspace service. Set this to enable the service — the
@@ -872,3 +876,12 @@ retention:
 serviceMonitor:
   enabled: false
   interval: 30s
+
+# The OAuth authorization server for plugin endpoints (SCARAB_OAUTH_SERVER):
+# an app such as claude.ai signs a user in, asks for consent (a passkey
+# confirmation each time) and gets a token for one plugin endpoint. Off by
+# default. Needs secrets.oauthRefreshKey, and scarab.publicUrl set to the
+# address clients reach the server at: tokens are bound to endpoint URLs
+# under it.
+oauthServer:
+  enabled: false

@@ -39,6 +39,7 @@ mod leak_checks;
 /// `LibraryStore` (ADR-0076): installed libraries, their versions, yanks
 /// and the sources each org trusts with forge credentials.
 mod libraries;
+mod oauth;
 /// `OrgEnvironmentStore` (ADR-0071): the org-level Environment.
 mod org_environments;
 /// `PluginStore` (ADR-0072): PluginInstallations, the kill switch, their

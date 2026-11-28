@@ -193,6 +193,12 @@ data:
   SCARAB_PLUGIN_PLACEMENT: {{ dict "tolerations" (.Values.plugins.tolerations | default list) "nodeSelector" (.Values.plugins.nodeSelector | default dict) | toJson | quote }}
   {{- end }}
   {{- end }}
+  {{- if .Values.oauthServer.enabled }}
+  {{- if not .Values.secrets.oauthRefreshKey }}
+  {{- fail "oauthServer.enabled needs secrets.oauthRefreshKey (at least 32 random bytes, the same on every replica)" }}
+  {{- end }}
+  SCARAB_OAUTH_SERVER: "on"
+  {{- end }}
   {{- range $k, $v := .Values.scarab.extraEnv }}
   {{ $k }}: {{ $v | quote }}
   {{- end }}

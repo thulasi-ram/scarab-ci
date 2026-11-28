@@ -2431,11 +2431,15 @@ async fn the_0099_revert_leaves_a_schema_the_migrator_can_upgrade_again() {
     .await
     .unwrap();
 
-    // Back past the delegated-call tables first, then to 0.8.3 (the token
+    // Back past the OAuth and delegated-call tables first, then to 0.8.3 (the token
     // kinds), then to 0.8.2 (the gate note), then to 0.7.5 (the leak-check
     // limits), then to 0.7.2 (the saved Pipeline file, the supersede mark and
     // the pull request head), then to 0.7.1 (ADR-0083's migrations), then to
     // 0.6.
+    sqlx::raw_sql(include_str!("../rollback/0113_revert.sql"))
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
     sqlx::raw_sql(include_str!("../rollback/0112_revert.sql"))
         .execute(&tdb.pool)
         .await
