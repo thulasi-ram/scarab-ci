@@ -148,6 +148,12 @@ image_plugin_argocd:
   - ".dockerignore"
   - ".github/workflows/image.yml"
   - ".github/path-filters.yml"
+image_plugin_mcp:
+  - *cargo
+  - "docker/plugin-mcp/**"
+  - ".dockerignore"
+  - ".github/workflows/image.yml"
+  - ".github/path-filters.yml"
 
 # The Helm chart (`image.yml`'s `chart` job): lint + render on a PR that touches
 # it, so a template that only fails at render time cannot first fail in a

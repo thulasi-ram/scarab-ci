@@ -6,6 +6,9 @@
 #   - scarab-plugin-argocd    (the Argo CD plugin, ADR-0072; docker/plugin-argocd/Dockerfile,
 #                              its default `plugin` target. An org admin installs it
 #                              by digest with crates/scarab-plugin-argocd/manifest.json)
+#   - scarab-plugin-mcp       (the MCP plugin, ADR-0086 §10; docker/plugin-mcp/Dockerfile.
+#                              An org admin installs it by digest with
+#                              crates/scarab-plugin-mcp/manifest.json)
 #
 # ⚠ scarab-wsfetch is a temporally-ordered STEPPING STONE (ADR-0061 D2.3): it is
 # eager, and the CSI/FUSE node driver replaces it. git-bug 0628369 closes only
@@ -148,7 +151,7 @@ jobs:
             ok=false
           else
             echo "$GH_TOKEN" | docker login "$REGISTRY" -u "$ACTOR" --password-stdin >/dev/null
-            for img in scarab-server scarab-clone scarab-results-sidecar scarab-wsfetch scarab-plugin-argocd; do
+            for img in scarab-server scarab-clone scarab-results-sidecar scarab-wsfetch scarab-plugin-argocd scarab-plugin-mcp; do
               if ! docker buildx imagetools inspect "$IMAGE_BASE/$img:sha-$BEFORE" >/dev/null 2>&1; then
                 echo "$img:sha-$BEFORE was never published: building all"
                 ok=false
@@ -171,7 +174,7 @@ jobs:
       - name: Select the images to build
         id: select
         env:
-          ALL: '["scarab-server","scarab-clone","scarab-results-sidecar","scarab-wsfetch","scarab-plugin-argocd"]'
+          ALL: '["scarab-server","scarab-clone","scarab-results-sidecar","scarab-wsfetch","scarab-plugin-argocd","scarab-plugin-mcp"]'
           IS_PR: ${{ github.event_name == 'pull_request' }}
           # ci:full on a PR: build every image, as an unfiltered run would.
           FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
@@ -182,6 +185,7 @@ jobs:
           SIDECAR: ${{ steps.filter.outputs.image_results_sidecar }}
           WSFETCH: ${{ steps.filter.outputs.image_wsfetch }}
           PLUGIN_ARGOCD: ${{ steps.filter.outputs.image_plugin_argocd }}
+          PLUGIN_MCP: ${{ steps.filter.outputs.image_plugin_mcp }}
         run: |
           set -euo pipefail
           retag='[]'
@@ -191,10 +195,10 @@ jobs:
             images=$(jq -cn \
               --arg server "$SERVER" --arg clone "$CLONE" \
               --arg sidecar "$SIDECAR" --arg wsfetch "$WSFETCH" \
-              --arg plugin_argocd "$PLUGIN_ARGOCD" \
+              --arg plugin_argocd "$PLUGIN_ARGOCD" --arg plugin_mcp "$PLUGIN_MCP" \
               '[ {"scarab-server":$server, "scarab-clone":$clone,
                   "scarab-results-sidecar":$sidecar, "scarab-wsfetch":$wsfetch,
-                  "scarab-plugin-argocd":$plugin_argocd}
+                  "scarab-plugin-argocd":$plugin_argocd, "scarab-plugin-mcp":$plugin_mcp}
                  | to_entries[] | select(.value == "true") | .key ]')
             if [ "$IS_PR" != "true" ]; then
               retag=$(jq -cn --argjson all "$ALL" --argjson built "$images" '$all - $built')
@@ -258,6 +262,7 @@ jobs:
             # The default target, `plugin`: the Dockerfile's `fake` stage (a
             # fake Argo CD for tests) is never built or pushed here.
             scarab-plugin-argocd)   ctx=.                ; df=docker/plugin-argocd/Dockerfile ;;
+            scarab-plugin-mcp)      ctx=.                ; df=docker/plugin-mcp/Dockerfile ;;
             *)
               echo "::error::unmapped image '$IMAGE' — add it to this case AND to .github/path-filters.yml"
               exit 1
