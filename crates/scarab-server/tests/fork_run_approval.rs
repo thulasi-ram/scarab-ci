@@ -108,11 +108,18 @@ fn forge(files: &[(&str, &str)]) -> FakeForge {
 }
 
 /// A trail of a PrincipalToken of `kind`, as Run creation records it.
+/// `<kind>@<installation>` is a delegated call through that Plugin
+/// installation (PluginApi).
 fn via(kind: &str) -> DelegationTrail {
+    let (kind, plugin_installation) = match kind.split_once('@') {
+        Some((kind, installation)) => (kind, Some(installation.to_string())),
+        None => (kind, None),
+    };
     DelegationTrail {
         token_id: "t1".into(),
         token_kind: kind.into(),
         oauth_client: None,
+        plugin_installation,
     }
 }
 
@@ -177,9 +184,10 @@ fn fork_gates(ir: &Value) -> Vec<Value> {
 /// Step behind a root keeps its own `needs`. An ungated Run has no gate and
 /// its roots need nothing. `agent_started` (also the default, with no row)
 /// gates only a trail that is not an `issued` token, an unknown kind
-/// included. The setting is read whatever letter case it was stored under.
+/// included, or one that names a Plugin installation (a delegated call). The setting is read whatever letter case it was stored under.
 /// Kills: the gate on own code or under `off`; a default that gates
-/// everything or nothing; an unknown token kind read as a person; a root
+/// everything or nothing; an unknown token kind read as a person; a
+/// delegated call through a Plugin read as a person; a root
 /// left out because its `when:` is false; a setting stored as `ACME` that
 /// Run creation for `acme` does not find.
 #[tokio::test]
@@ -217,6 +225,13 @@ async fn the_setting_decides_which_runs_of_fork_code_get_the_gate() {
             false,
         ),
         ("no setting, oauth token", PR_REF, None, Some("oauth"), true),
+        (
+            "no setting, issued token through a plugin endpoint",
+            PR_REF,
+            None,
+            Some("issued@inst-1"),
+            true,
+        ),
         (
             "no setting, unknown token kind",
             PR_REF,
@@ -658,5 +673,6 @@ fn via_issued(id: &str) -> DelegationTrail {
         token_id: id.into(),
         token_kind: "issued".into(),
         oauth_client: None,
+        plugin_installation: None,
     }
 }
