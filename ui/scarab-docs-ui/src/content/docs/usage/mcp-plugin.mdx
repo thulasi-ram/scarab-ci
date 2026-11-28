@@ -83,8 +83,7 @@ the operations you ticked, so leave the writes unticked unless you need them.
 3. **Org admin:** allow the host of the client id URL claude.ai presents. claude.ai identifies
    itself by the URL of an app description, and Scarab reads it only from a host the org lists.
    We have not confirmed which host that is: Anthropic does not publish the URL. Let the first
-   connection attempt fail; the refused authorization request names the host (and the server
-   logs it), then list it with `PUT /v1/orgs/{org}/oauth/client-metadata-hosts/{host}` (it asks
+   connection attempt fail; the consent page's refusal names the host, then list it with `PUT /v1/orgs/{org}/oauth/client-metadata-hosts/{host}` (it asks
    for your passkey). To be verified against a live connection.
 
 The endpoint's URL is:
