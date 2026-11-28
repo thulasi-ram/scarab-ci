@@ -41,8 +41,9 @@ record that it came through this app, beside your name.
 
 Logs, results and commit titles can contain text written by anyone who can push to the
 repository or print in a Step, including text written to steer an agent. The plugin returns that
-text inside a block marked `<untrusted-data>` with a line telling the agent to treat it as data,
-and it never puts fetched text into a tool's description. This lowers the risk; it does not
+text inside a block marked `<untrusted-data>` with a line telling the agent to treat it as data.
+Every `<`, `>` and `&` inside the block is escaped, so the text cannot close the block or open a
+new one. The plugin never puts fetched text into a tool's description. This lowers the risk; it does not
 remove it, because the agent decides what to do with what it reads. What it can do is bounded by
 the operations you ticked, so leave the writes unticked unless you need them.
 
@@ -79,8 +80,12 @@ the operations you ticked, so leave the writes unticked unless you need them.
 
    Installing asks for your passkey, and so does each new digest. The install answer carries the
    installation's `id`.
-3. **Org admin:** list the host claude.ai publishes its app description on, `claude.ai`
-   (`PUT /v1/orgs/{org}/oauth/client-metadata-hosts/claude.ai`; it asks for your passkey).
+3. **Org admin:** allow the host of the client id URL claude.ai presents. claude.ai identifies
+   itself by the URL of an app description, and Scarab reads it only from a host the org lists.
+   We have not confirmed which host that is: Anthropic does not publish the URL. Let the first
+   connection attempt fail; the refused authorization request names the host (and the server
+   logs it), then list it with `PUT /v1/orgs/{org}/oauth/client-metadata-hosts/{host}` (it asks
+   for your passkey). To be verified against a live connection.
 
 The endpoint's URL is:
 
@@ -106,7 +111,11 @@ everyone.
 - `get_step_logs` returns at most the last 256 KiB of a log, and `pattern` filters only within
   that window. `list_runs` applies its filters to the 200 most recent Runs.
 - Answers other than logs are cut at 128 KiB.
-- The endpoint's request limits apply: 60 requests a minute and 4 at once per person, per
-  plugin. See [Connected apps](/scarab-ci/usage/connected-apps/#limits).
+- The endpoint's request limits apply: 60 requests a minute and 4 at once per person per plugin,
+  and 600 a minute and 16 at once per plugin. Each server replica counts them on its own, so
+  with two replicas a person can make up to twice as many. See
+  [Connected apps](/scarab-ci/usage/connected-apps/#limits).
+- Requests the plugin declares no operation for, and bodies that are not JSON, are answered by
+  Scarab with a 400 before they reach the plugin; the client sees that, not a JSON-RPC error.
 - The plugin keeps no session. A restart or an upgrade of its Pod drops nothing, and the next
   tool call goes to the new Pod.

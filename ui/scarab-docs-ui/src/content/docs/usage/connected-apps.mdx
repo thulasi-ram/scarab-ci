@@ -13,7 +13,8 @@ through a short-lived handle Scarab gives it per request. It never sees your tok
 An operator sets, in the chart:
 
 - `oauthServer.enabled: true` and `secrets.oauthRefreshKey` (at least 32 random bytes, the same
-  on every replica). The render fails without the key.
+  on every replica). The render fails without the key. With `secrets.existingSecret`, put it in
+  that Secret as `SCARAB_OAUTH_REFRESH_KEY` instead; setting both fails the render.
 - `scarab.publicUrl` to the address apps reach the server at. Tokens are bound to endpoint URLs
   under it.
 - `plugins.trustedPublishers` to the image repository of the plugin that registers the endpoint.
