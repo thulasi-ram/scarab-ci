@@ -99,9 +99,6 @@ release.yml uses that version's section as the GitHub Release text. See
   never raises or satisfies a step-up, and never approves a gate. Killing, uninstalling or
   upgrading the plugin to a new digest deletes its handles. The handles and journal use the
   broker's own database pool; the API handlers a delegated call runs use the main pool.
-- **A sandboxed Step of a dispatch of fork code sees `SCARAB_FORK_PR=true`.** Its sandboxed Steps
-  without `registry_auth` saw `false`, so the build library's build Step exported its cache. It now
-  does not.
 - **No step OIDC token when its subject could read another way.** A Step gets no token when the
   org, repository or Environment name holds a `/`, the ref has a path component named `env` or
   `ref` (a branch `ref/x` is `refs/heads/ref/x`), or its Environment is named `none`. Its launch
