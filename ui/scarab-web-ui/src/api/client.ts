@@ -11,6 +11,7 @@ import { refusalText, type MatchRefusal, type SecretMatchAnswer } from "../secre
 import type { LeakCheckLimits } from "../leak-checks";
 
 export type RunStatus = components["schemas"]["RunStatusResponse"];
+export type ForkRunApprovalSetting = components["schemas"]["ForkRunApprovalDto"];
 export type CreateRunRequest = components["schemas"]["CreateRunRequest"];
 export type RunSummary = components["schemas"]["RunSummaryDto"];
 export type CatalogEntry = components["schemas"]["CatalogEntry"];
@@ -2439,6 +2440,33 @@ export async function setLeakCheckLimits(
 ): Promise<LeakCheckLimits> {
   const res = await send(`/v1/orgs/${encodeURIComponent(org)}/security/leak-checks`, "PUT", limits);
   return (await res.json()) as LeakCheckLimits;
+}
+
+/** The org's Fork Run approval setting
+ * (`GET /v1/orgs/{org}/security/fork-run-approval`): whether a Run of fork
+ * code waits at an approval gate, and whether the caller may change it.
+ * `null` when the caller may not read it or the server has no such route. */
+export async function getForkRunApproval(org: string): Promise<ForkRunApprovalSetting | null> {
+  const res = await fetch(`/v1/orgs/${encodeURIComponent(org)}/security/fork-run-approval`);
+  if (res.status === 401) setUnauthenticated(true);
+  if (!res.ok) return null;
+  return (await res.json()) as ForkRunApprovalSetting;
+}
+
+/** An org admin turns Fork Run approval on or off
+ * (`PUT …/security/fork-run-approval`). Turning it off asks for a passkey
+ * confirmation, through the same step-up retry `send` does. A refusal (not
+ * an admin, a cancelled confirmation) throws the server's own message. */
+export async function setForkRunApproval(
+  org: string,
+  enabled: boolean,
+): Promise<ForkRunApprovalSetting> {
+  const res = await send(
+    `/v1/orgs/${encodeURIComponent(org)}/security/fork-run-approval`,
+    "PUT",
+    { enabled },
+  );
+  return (await res.json()) as ForkRunApprovalSetting;
 }
 
 /** An Owner resets a member's passkeys

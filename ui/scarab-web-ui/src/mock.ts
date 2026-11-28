@@ -2647,6 +2647,22 @@ const leakCheckLimits: components["schemas"]["LeakCheckLimitsDto"] = {
   max_per_day: 1000,
   caller_role: "owner",
 };
+const forkRunApproval: components["schemas"]["ForkRunApprovalDto"] = {
+  enabled: false,
+  can_change: true,
+};
+function mockForkRunApproval(method: string, body: string): Response {
+  if (method === "PUT") {
+    const req = JSON.parse(body || "{}") as { enabled?: unknown };
+    if (typeof req.enabled !== "boolean") {
+      return new Response('the body must be JSON of the form {"enabled": true} or {"enabled": false}', {
+        status: 400,
+      });
+    }
+    forkRunApproval.enabled = req.enabled;
+  }
+  return json(forkRunApproval);
+}
 function mockLeakChecks(method: string, body: string): Response {
   if (method === "PUT") {
     const req = JSON.parse(body || "{}") as { per_hour?: unknown; per_day?: unknown };
@@ -2737,6 +2753,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
   if (/^\/v1\/orgs\/[^/]+\/security\/summary$/.test(p)) return json(orgSecuritySummary);
   if (/^\/v1\/orgs\/[^/]+\/security\/leak-checks$/.test(p)) return mockLeakChecks(method, body);
+  if (/^\/v1\/orgs\/[^/]+\/security\/fork-run-approval$/.test(p)) return mockForkRunApproval(method, body);
   if (/^\/v1\/orgs\/[^/]+\/security\/events$/.test(p)) return orgEventsPage(search);
   // An owner resets a member's passkeys. The mock lets it through with no
   // step-up; an admin left with none joins the summary's list.
