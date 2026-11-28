@@ -22,7 +22,7 @@ so a released chart's default `image.tag` (its `appVersion`) always exists:
 
 ```sh
 helm upgrade --install scarab oci://ghcr.io/thulasi-ram/charts/scarab \
-  --version 0.8.3 --namespace scarab --create-namespace -f values.yaml
+  --version 0.8.4 --namespace scarab --create-namespace -f values.yaml
 ```
 
 From a checkout, point at the directory instead (and pin `image.tag`, because the
