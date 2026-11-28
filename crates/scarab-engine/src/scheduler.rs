@@ -577,14 +577,43 @@ async fn plan_rerun_over(
     // status: one left `Pending` by a Rerun that failed partway still puts the
     // path back in front of the cascade, so the target never runs while the
     // gate waits.
-    let fork_rearm = if rearm_fork_gates {
+    let fork_gates = if rearm_fork_gates {
         match db.run_ir(run).await? {
-            Some(ir) => fork_run_approval_rearm(&fork_run_approval_gate_ids(&ir), &invalid, steps),
-            None => std::collections::HashSet::new(),
+            Some(ir) => fork_run_approval_gate_ids(&ir),
+            None => Vec::new(),
         }
     } else {
-        std::collections::HashSet::new()
+        Vec::new()
     };
+    // In a Run with a Fork Run approval gate a Rerun evaluates no `when:`, so
+    // it leaves alone every Step its `when:` skipped at creation and every
+    // Step skipped only because it is behind one: they stay Skipped, as in
+    // the first Take, whether they are in the target's cascade or on the
+    // path to it. The target itself is re-armed (a `when:`-excluded target is
+    // refused before this); behind a Step that stays Skipped, the scheduler
+    // skips it again, and it re-arms no gate: the gate re-arms only in front
+    // of a Step that can run. A Run without such a gate re-arms as before.
+    let stays_skipped = if fork_gates.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        skipped_by_when(steps)
+    };
+    invalid.retain(|s| s == target || !stays_skipped.contains(s));
+    widened.retain(|s| invalid.contains(s));
+    let behind_skipped: std::collections::HashSet<StepId> = stays_skipped
+        .iter()
+        .flat_map(|e| crate::invalidation_set(e, steps))
+        .collect();
+    let can_run: std::collections::HashSet<StepId> = invalid
+        .iter()
+        .filter(|s| !behind_skipped.contains(*s))
+        .cloned()
+        .collect();
+    let fork_rearm: std::collections::HashSet<StepId> =
+        fork_run_approval_rearm(&fork_gates, &can_run, steps)
+            .into_iter()
+            .filter(|s| !stays_skipped.contains(s))
+            .collect();
     invalid.extend(fork_rearm.iter().cloned());
 
     let mut invalidated: Vec<StepId> = invalid.iter().cloned().collect();
@@ -1012,6 +1041,26 @@ pub async fn retry_step_widened(
 
     rearm_invalidation_set(db, clock, run, target, &plan, &steps, by, via).await?;
     Ok(plan)
+}
+
+/// The Steps a Rerun in a Run with a Fork Run approval gate leaves Skipped
+/// (ADR-0086 §9): each Step its `when:` skipped at creation
+/// ([`when_excluded`]), and each `Skipped` Step downstream of one, which
+/// the scheduler skipped for that need.
+fn skipped_by_when(steps: &[StepRun]) -> std::collections::HashSet<StepId> {
+    let mut out = std::collections::HashSet::new();
+    for e in steps.iter().filter(|s| when_excluded(s, steps)) {
+        out.extend(
+            crate::invalidation_set(&e.step, steps)
+                .into_iter()
+                .filter(|d| {
+                    steps
+                        .iter()
+                        .any(|s| &s.step == d && s.status == StepStatus::Skipped)
+                }),
+        );
+    }
+    out
 }
 
 /// Was `step` skipped by its `when:` at Run creation? A Step that is not a

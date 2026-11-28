@@ -24,6 +24,13 @@
 
 BEGIN;
 
+-- The DROP waits at most 5 seconds for its lock on `org_fork_run_approval`,
+-- as migration 0114 does for its own: a server still running against the
+-- database holds it, and the script then stops with `canceling statement
+-- due to lock timeout` and changes nothing. Scale the servers to zero and
+-- run it again.
+SET LOCAL lock_timeout = '5s';
+
 DROP TABLE IF EXISTS org_fork_run_approval;
 
 DELETE FROM _sqlx_migrations WHERE version = 114;
