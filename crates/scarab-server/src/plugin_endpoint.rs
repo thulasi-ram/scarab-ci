@@ -6,16 +6,23 @@
 //! `<path>` is one the installation's approved manifest registers. For each
 //! request core:
 //!
-//! 1. refuses a body over [`MAX_ENDPOINT_REQUEST_BYTES`], one that is not
+//! 0. answers 404 while the OAuth authorization server is off: no token for
+//!    an endpoint can exist then;
+//! 1. refuses a body over [`MAX_ENDPOINT_REQUEST_BYTES`] (the route's body
+//!    limit stops a larger one before it is read), one that is not
 //!    `application/json`, and one with a `Content-Encoding`;
-//! 2. reads the installation by its id: it must be of this org, enabled, not
-//!    held by the runtime, `trusted_service`, and of a publisher the operator
-//!    lists now ([`crate::plugins::check_trusted_service`]);
-//! 3. authenticates the caller's `oauth` PrincipalToken, presented as a
+//! 2. authenticates the caller's `oauth` PrincipalToken, presented as a
 //!    Bearer: live, scoped to this org, its audience equal byte for byte to
-//!    this endpoint's canonical URL ([`canonical_endpoint_url`]). A cookie is
-//!    never read, and an issued token is refused. A refusal answers 401 with
+//!    this endpoint's canonical URL ([`canonical_endpoint_url`]), built from
+//!    the path alone. Nothing about the installation is read before this, so
+//!    a caller without a token learns nothing about it. A cookie is never
+//!    read, and an issued token is refused. A refusal answers 401 with
 //!    `WWW-Authenticate` naming the protected resource metadata (RFC 9728);
+//! 3. reads the installation by its id: it must be of this org and register
+//!    the endpoint (else 404), and be enabled, not held by the runtime, and
+//!    of a publisher the operator lists now
+//!    ([`crate::plugins::check_trusted_service`]); a killed, held or
+//!    delisted installation answers 503, since it may run again;
 //! 4. counts the request against the caller's and the installation's limits
 //!    ([`PluginEndpointLimits`]), held until the request ends;
 //! 5. parses the body itself, refusing duplicate keys, and matches every
@@ -558,13 +565,12 @@ async fn forward(
         (status = 200, description = "the plugin's answer, passed on as data"),
         (status = 400, description = "a body that is not JSON, repeats a key, or matches no operation or more than one"),
         (status = 401, description = "no OAuth token for this endpoint, or one that is not usable here; `WWW-Authenticate` names the protected resource metadata"),
-        (status = 403, description = "the installation is killed, or its publisher is no longer trusted"),
-        (status = 404, description = "no such installation or endpoint in this org"),
+        (status = 404, description = "no such installation or endpoint in this org, or the OAuth authorization server is off"),
         (status = 413, description = "the body is too large"),
         (status = 415, description = "not `application/json`, or a `Content-Encoding`"),
         (status = 429, description = "the caller or the installation is at its request limit"),
         (status = 502, description = "the plugin could not be reached, or answered with something the endpoint does not pass on"),
-        (status = 503, description = "the plugin runtime holds the installation")
+        (status = 503, description = "the installation is killed, held by the plugin runtime, or its publisher is no longer trusted")
     )
 )]
 pub(crate) async fn plugin_endpoint(
@@ -573,6 +579,10 @@ pub(crate) async fn plugin_endpoint(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // 0. No OAuth server, no token for an endpoint: nothing is served.
+    if !crate::oauth_server::server_on(&st) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     // 1. The body's shape, before anything is read.
     if body.len() > MAX_ENDPOINT_REQUEST_BYTES {
         return refused(
@@ -593,7 +603,15 @@ pub(crate) async fn plugin_endpoint(
             "the endpoint takes `application/json` with no `Content-Encoding`",
         );
     }
-    // 2. The installation, read now.
+    // 2. The caller's token, for this endpoint and nothing else; its
+    //    audience comes from the path alone.
+    let audience = canonical_endpoint_url(&st.public_url, &org, &id, &endpoint_path);
+    let metadata_url = protected_resource_metadata_url(&st.public_url, &org, &id, &endpoint_path);
+    let token = match endpoint_token(&st, &headers, &org, &audience).await {
+        Ok(t) => t,
+        Err(invalid) => return unauthorized(&metadata_url, invalid),
+    };
+    // 3. The installation, read now.
     let Some(plugins) = st.plugins.as_deref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -605,9 +623,10 @@ pub(crate) async fn plugin_endpoint(
     let Some(registration) = endpoint_registration(&installation, &endpoint_path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // Killed, held or delisted: it may run again, and its grants stay.
     if installation.state != InstallationState::Enabled {
         return refused(
-            StatusCode::FORBIDDEN,
+            StatusCode::SERVICE_UNAVAILABLE,
             "plugin_killed",
             format!("plugin installation `{}` is killed", installation.name),
         );
@@ -622,20 +641,22 @@ pub(crate) async fn plugin_endpoint(
             ),
         );
     }
-    if let Err(e) = crate::plugins::check_trusted_service(
+    if crate::plugins::check_trusted_service(
         &st.plugin_policy,
         &installation.manifest,
         &installation.image,
-    ) {
-        return e.into_response();
+    )
+    .is_err()
+    {
+        return refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "plugin_publisher_not_trusted",
+            format!(
+                "plugin installation `{}` is not from a publisher this server trusts now",
+                installation.name
+            ),
+        );
     }
-    // 3. The caller's token, for this endpoint and nothing else.
-    let audience = canonical_endpoint_url(&st.public_url, &org, &id, &endpoint_path);
-    let metadata_url = protected_resource_metadata_url(&st.public_url, &org, &id, &endpoint_path);
-    let token = match endpoint_token(&st, &headers, &org, &audience).await {
-        Ok(t) => t,
-        Err(invalid) => return unauthorized(&metadata_url, invalid),
-    };
     // 4. The limits, held to the end of the request.
     let _admission = match st.plugin_endpoint_limits.admit(
         &installation.id,

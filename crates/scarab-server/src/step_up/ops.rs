@@ -99,6 +99,10 @@ pub enum OrgOf {
     Body(&'static str),
     /// A query parameter.
     Query(&'static str),
+    /// The org of the plugin endpoint whose canonical URL is the string at
+    /// this JSON pointer into the body (an OAuth `resource`); none when it is
+    /// not such a URL.
+    Resource(&'static str),
     /// The tenant of the run named by the `id` path parameter.
     Run,
     /// The Org of the forge connection named by the `id` path parameter
@@ -1392,7 +1396,7 @@ pub static OAUTH_CONSENT: Op = op(
     Class::CrownJewel(A),
     "ADR-0086 §7: granting a token is a crown jewel, as minting one is",
     VIEWER,
-    OrgOf::None,
+    OrgOf::Resource("/resource"),
     &[],
     &["body:/client_id", "body:/resource"],
 )

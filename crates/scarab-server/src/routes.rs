@@ -96,6 +96,21 @@ impl Routes {
         self.add(Method::POST, path, op, axum::routing::post(h))
     }
 
+    /// A POST whose body is refused past `limit` bytes before the handler
+    /// reads it.
+    fn post_limited<H, T>(self, path: &'static str, op: &'static Op, h: H, limit: usize) -> Self
+    where
+        H: Handler<T, AppState>,
+        T: 'static,
+    {
+        self.add(
+            Method::POST,
+            path,
+            op,
+            axum::routing::post(h).layer(axum::extract::DefaultBodyLimit::max(limit)),
+        )
+    }
+
     fn put<H, T>(self, path: &'static str, op: &'static Op, h: H) -> Self
     where
         H: Handler<T, AppState>,
@@ -775,10 +790,11 @@ fn route_list(routes: Routes) -> Routes {
         )
         // ADR-0086 §1: a plugin's endpoint, authenticated by the caller's
         // `oauth` token for it (`plugin_endpoint`).
-        .post(
+        .post_limited(
             "/v1/orgs/{org}/plugin-installations/{id}/endpoints/{*endpoint_path}",
             &ops::PLUGIN_ENDPOINT,
             crate::plugin_endpoint::plugin_endpoint,
+            crate::plugin_endpoint::MAX_ENDPOINT_REQUEST_BYTES,
         )
         .get(
             "/v1/orgs/{org}/plugin-installations/{id}",

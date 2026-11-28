@@ -34,8 +34,14 @@
 //!   `SCARAB_OAUTH_REFRESH_KEY`, which every replica shares. Using the
 //!   current one moves the grant to the next generation. Using the one
 //!   before it within [`OAUTH_REFRESH_RETRY_WINDOW_MS`] of that move (a
-//!   lost response) gets the same successor. Any other reuse revokes the
-//!   grant.
+//!   lost response) gets the same successor, once; a second retry inside
+//!   the window is refused without revoking. Any other reuse revokes the
+//!   grant. Every access token carries its grant's id, so revoking a grant
+//!   (disconnect, uninstall, a removed metadata host, a reused secret)
+//!   revokes all of its tokens in the same transaction.
+//! - **A killed, held or delisted installation** keeps its grants: the
+//!   token endpoint answers 503 `temporarily_unavailable` until it runs
+//!   again. Only an installation that is gone ends them.
 
 use std::collections::BTreeSet;
 
@@ -65,6 +71,11 @@ pub const MAX_CLIENT_METADATA_BYTES: usize = 16 * 1024;
 
 /// The domain refresh macs are computed in.
 const REFRESH_MAC_DOMAIN: &[u8] = b"scarab-oauth-refresh-v1\0";
+
+/// Is the OAuth authorization server on (its store and key are set)?
+pub(crate) fn server_on(st: &AppState) -> bool {
+    st.oauth.is_some() && st.oauth_refresh_key.is_some()
+}
 
 /// The OAuth store and key, or 404: the server is off.
 fn enabled(st: &AppState) -> Result<(&dyn OAuthStore, &[u8]), ApiError> {
@@ -183,36 +194,81 @@ pub(crate) async fn authorization_server_metadata(
     })))
 }
 
-/// The usable installation `id` of `org` and its endpoint `path`: enabled,
-/// not held, `trusted_service`, publisher listed now.
+/// Whether an endpoint can be used now.
+pub(crate) enum EndpointUse {
+    /// Enabled, not held, `trusted_service`, publisher listed now.
+    Usable(PluginInstallation),
+    /// No such installation in the org, or it registers no such endpoint:
+    /// its grants end.
+    Gone,
+    /// Killed, held by the runtime, or its publisher delisted: it may run
+    /// again, so its grants stay. Why, for the caller.
+    Unavailable(String),
+}
+
+/// Can installation `id` of `org` serve its endpoint `path` now? `Err` only
+/// when the plugin store cannot be read.
+pub(crate) async fn endpoint_use(
+    st: &AppState,
+    org: &str,
+    id: &str,
+    path: &str,
+) -> Result<EndpointUse, ApiError> {
+    let Some(plugins) = st.plugins.as_deref() else {
+        return Ok(EndpointUse::Gone);
+    };
+    let Some(installation) = plugins
+        .installation_by_id(id)
+        .await
+        .map_err(crate::plugins::plugin_store_api_error)?
+        .filter(|i| i.org == org)
+    else {
+        return Ok(EndpointUse::Gone);
+    };
+    if endpoint_registration(&installation, path).is_none() {
+        return Ok(EndpointUse::Gone);
+    }
+    if installation.state != InstallationState::Enabled {
+        return Ok(EndpointUse::Unavailable(format!(
+            "plugin installation `{}` is killed",
+            installation.name
+        )));
+    }
+    if installation.held_by_the_runtime() {
+        return Ok(EndpointUse::Unavailable(format!(
+            "plugin installation `{}` is held by the plugin runtime",
+            installation.name
+        )));
+    }
+    if let Err(e) = crate::plugins::check_trusted_service(
+        &st.plugin_policy,
+        &installation.manifest,
+        &installation.image,
+    ) {
+        return Ok(EndpointUse::Unavailable(match e {
+            ApiError::Denied(m) | ApiError::BadRequest(m) => m,
+            _ => format!(
+                "plugin installation `{}` is not from a trusted publisher",
+                installation.name
+            ),
+        }));
+    }
+    Ok(EndpointUse::Usable(installation))
+}
+
+/// The usable installation `id` of `org` and its endpoint `path`; 404 when
+/// it is gone, 503 while it cannot run.
 async fn usable_endpoint(
     st: &AppState,
     org: &str,
     id: &str,
     path: &str,
 ) -> Result<PluginInstallation, ApiError> {
-    let plugins = st.plugins.as_deref().ok_or(ApiError::NotFound)?;
-    let installation = plugins
-        .installation_by_id(id)
-        .await
-        .map_err(crate::plugins::plugin_store_api_error)?
-        .filter(|i| i.org == org)
-        .ok_or(ApiError::NotFound)?;
-    if endpoint_registration(&installation, path).is_none() {
-        return Err(ApiError::NotFound);
+    match endpoint_use(st, org, id, path).await? {
+        EndpointUse::Usable(installation) => Ok(installation),
+        EndpointUse::Gone => Err(ApiError::NotFound),
+        EndpointUse::Unavailable(why) => Err(ApiError::Unavailable(why)),
     }
-    if installation.state != InstallationState::Enabled || installation.held_by_the_runtime() {
-        return Err(ApiError::Denied(format!(
-            "plugin installation `{}` is not running",
-            installation.name
-        )));
-    }
-    crate::plugins::check_trusted_service(
-        &st.plugin_policy,
-        &installation.manifest,
-        &installation.image,
-    )?;
-    Ok(installation)
 }
 
 /// The operations a token for `installation`'s endpoint `path` may ever be
@@ -324,7 +380,7 @@ struct CheckedAuthorization {
 
 /// `org`, installation id and endpoint path of a resource URL, when it is
 /// the canonical URL of one under this server.
-fn parse_resource(public_url: &str, resource: &str) -> Option<(String, String, String)> {
+pub(crate) fn parse_resource(public_url: &str, resource: &str) -> Option<(String, String, String)> {
     let prefix = format!("{}/v1/orgs/", public_url.trim_end_matches('/'));
     let rest = resource.strip_prefix(&prefix)?;
     let (org, rest) = rest.split_once("/plugin-installations/")?;
@@ -419,6 +475,12 @@ async fn check_authorization(
     let Some((org, id, endpoint_path)) = parse_resource(&st.public_url, &p.resource) else {
         return bad("resource is not the URL of a plugin endpoint of this server");
     };
+    // A person with no role in the org learns nothing about it: not whether
+    // the installation exists, not its allowlist, and no fetch is made.
+    let role = caller
+        .role_in(st, &Scope::Org(org.clone()))
+        .await?
+        .ok_or(ApiError::NotFound)?;
     let installation = usable_endpoint(st, &org, &id, &endpoint_path).await?;
     let Some(client_host) = client_id_host(&p.client_id) else {
         return bad("client_id must be an https URL with a path (a client metadata document)");
@@ -439,20 +501,13 @@ async fn check_authorization(
         ApiError::Unavailable("this server cannot fetch client metadata documents".into())
     })?;
     let document = fetcher
-        .get(&p.client_id)
+        .get_capped(&p.client_id, MAX_CLIENT_METADATA_BYTES)
         .await
         .map_err(|e| ApiError::BadRequest(format!("the client's metadata document: {e}")))?;
-    if document.len() > MAX_CLIENT_METADATA_BYTES {
-        return bad("the client's metadata document is larger than 16 KiB");
-    }
     let document: serde_json::Value = serde_json::from_slice(&document)
         .map_err(|e| ApiError::BadRequest(format!("the client's metadata document: {e}")))?;
     check_client_metadata(&document, &p.client_id, &p.redirect_uri)
         .map_err(ApiError::BadRequest)?;
-    let role = caller
-        .role_in(st, &Scope::Org(org.clone()))
-        .await?
-        .ok_or(ApiError::Forbidden)?;
     let mut offered = grantable_operations(&installation, &endpoint_path);
     if let Some(scope) = p.scope.as_deref().filter(|s| !s.trim().is_empty()) {
         let asked: BTreeSet<&str> = scope.split_whitespace().collect();
@@ -482,8 +537,9 @@ const SELECTED_BY_DEFAULT: [&str; 2] = ["run.read", "step.logs.read"];
     responses(
         (status = 200, description = "what the consent page shows"),
         (status = 400, description = "a request that is not one this server takes"),
-        (status = 403, description = "not a person in a browser, no role in the org, or a client host the org does not allow"),
-        (status = 404, description = "no such endpoint, or the OAuth authorization server is off")
+        (status = 403, description = "not a person in a browser, or a client host the org does not allow"),
+        (status = 404, description = "no role in the org, no such endpoint, or the OAuth authorization server is off"),
+        (status = 503, description = "the plugin installation is killed, held or its publisher delisted")
     )
 )]
 pub(crate) async fn describe_authorization_request(
@@ -544,7 +600,8 @@ pub struct OAuthConsentDto {
         (status = 200, description = "where to send the browser: the client's redirect URI with the code"),
         (status = 400, description = "an operation the request does not offer, or a request this server does not take"),
         (status = 403, description = "not a person in a browser, or no confirmation"),
-        (status = 404, description = "no such endpoint, or the OAuth authorization server is off")
+        (status = 404, description = "no role in the org, no such endpoint, or the OAuth authorization server is off"),
+        (status = 503, description = "the plugin installation is killed, held or its publisher delisted")
     )
 )]
 pub(crate) async fn consent(
@@ -584,6 +641,7 @@ pub(crate) async fn consent(
                 role: c.role,
                 created_at: now,
                 expires_at: now + OAUTH_AUTHORIZATION_CODE_LIFETIME_MS,
+                grant_id: uuid::Uuid::new_v4().simple().to_string(),
             },
             &sha256_hex(&code),
         )
@@ -636,14 +694,56 @@ fn invalid_grant(description: &str) -> Response {
     oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", description)
 }
 
+/// 503 `temporarily_unavailable`: try again later; nothing is revoked.
+fn temporarily_unavailable(description: &str) -> Response {
+    oauth_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+        description,
+    )
+}
+
+/// A store failure: logged here, answered with no detail.
+fn store_failure(what: &str, e: &dyn std::fmt::Display) -> Response {
+    tracing::error!(error = %e, "oauth token endpoint: {what}");
+    temporarily_unavailable("try again later")
+}
+
+/// Whether the endpoint a code or grant names can be used now, as the
+/// token endpoint answers it: `Ok` when usable; `invalid_grant` when it is
+/// gone (`gone` true); 503 while it is killed, held or delisted.
+async fn token_endpoint_use(st: &AppState, resource: &str) -> Result<(), (Response, bool)> {
+    let Some((org, id, path)) = parse_resource(&st.public_url, resource) else {
+        return Err((
+            invalid_grant("the resource is no longer an endpoint of this server"),
+            true,
+        ));
+    };
+    match endpoint_use(st, &org, &id, &path).await {
+        Ok(EndpointUse::Usable(_)) => Ok(()),
+        Ok(EndpointUse::Gone) => Err((
+            invalid_grant("the plugin endpoint no longer exists; connect the app again"),
+            true,
+        )),
+        Ok(EndpointUse::Unavailable(_)) => Err((
+            temporarily_unavailable("the plugin endpoint is not running; try again later"),
+            false,
+        )),
+        Err(_) => Err((
+            store_failure("reading the installation", &"the plugin store failed"),
+            false,
+        )),
+    }
+}
+
 /// Mint a one-hour `oauth` access token for `grant`, stored under the
-/// restricted hash. Returns the secret and the record.
+/// restricted hash and stamped with the grant's id. Returns the secret and
+/// the record.
 async fn mint_access_token(
-    st: &AppState,
+    store: &dyn OAuthStore,
     grant: &OAuthGrant,
     now: i64,
-) -> Result<(String, PrincipalToken), ApiError> {
-    let tokens = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?;
+) -> Result<(String, PrincipalToken), scarab_identity::IdentityError> {
     let secret = format!(
         "{}{}",
         scarab_identity::OAUTH_ACCESS_TOKEN_PREFIX,
@@ -666,10 +766,9 @@ async fn mint_access_token(
         audience: Some(grant.resource.clone()),
         oauth_client: Some(grant.client_id.clone()),
     };
-    tokens
-        .put(&token, &token.stored_hash(&secret))
-        .await
-        .map_err(crate::step_up::store_err)?;
+    store
+        .put_oauth_access_token(&token, &token.stored_hash(&secret), &grant.id)
+        .await?;
     Ok((secret, token))
 }
 
@@ -682,8 +781,9 @@ async fn revoke_access_token(st: &AppState, id: Option<&str>, now: i64) {
     }
 }
 
-/// Revoke grant `id` and its access token; a revoked token stops every
-/// delegated caller handle minted for it on their next call.
+/// Revoke grant `id` and every access token minted for it (the store does
+/// both in one transaction); a revoked token stops every delegated caller
+/// handle minted for it on their next call.
 pub(crate) async fn revoke_grant(st: &AppState, id: &str, reason: &str) -> Result<bool, ApiError> {
     let (store, _) = enabled(st)?;
     let now = st.clock.now().await.0;
@@ -691,13 +791,7 @@ pub(crate) async fn revoke_grant(st: &AppState, id: &str, reason: &str) -> Resul
         .revoke_oauth_grant(id, reason, now)
         .await
         .map_err(crate::step_up::store_err)?;
-    match revoked {
-        Some(g) => {
-            revoke_access_token(st, g.access_token_id.as_deref(), now).await;
-            Ok(true)
-        }
-        None => Ok(false),
-    }
+    Ok(revoked.is_some())
 }
 
 /// Revoke every grant of an uninstalled installation (ADR-0086 §11) and
@@ -707,18 +801,11 @@ pub(crate) async fn revoke_installation_grants(st: &AppState, installation_id: &
         return;
     };
     let now = st.clock.now().await.0;
-    match store
+    if let Err(e) = store
         .revoke_installation_oauth_grants(installation_id, "plugin uninstalled", now)
         .await
     {
-        Ok(grants) => {
-            for g in grants {
-                revoke_access_token(st, g.access_token_id.as_deref(), now).await;
-            }
-        }
-        Err(e) => {
-            tracing::warn!(installation = installation_id, error = %e, "oauth: grants not revoked")
-        }
+        tracing::warn!(installation = installation_id, error = %e, "oauth: grants not revoked")
     }
 }
 
@@ -746,7 +833,8 @@ fn token_response(access: &str, token: &PrincipalToken, refresh: &str, now: i64)
     responses(
         (status = 200, description = "an access token, its lifetime and the next refresh secret"),
         (status = 400, description = "an OAuth error (RFC 6749 §5.2)"),
-        (status = 404, description = "the OAuth authorization server is off")
+        (status = 404, description = "the OAuth authorization server is off"),
+        (status = 503, description = "`temporarily_unavailable`: the plugin endpoint is not running, or the store could not be read; the grant stays")
     )
 )]
 pub(crate) async fn token(
@@ -787,17 +875,50 @@ async fn authorization_code_grant(
             "code, redirect_uri, client_id and code_verifier are required",
         );
     };
+    // The challenge from the verifier first: the code is spent only by its
+    // client, redirect URI and verifier, so a wrong guess spends nothing.
+    if !pkce_shaped(verifier) {
+        return invalid_grant("the code verifier is not a PKCE verifier");
+    }
+    let challenge = pkce_s256_challenge(verifier);
+    let code_hash = sha256_hex(code);
+    // A client that names the resource learns that the endpoint is not
+    // running before its code is spent, and can retry with it.
+    if let Some(resource) = req.resource.as_deref() {
+        if let Err((answer, _)) = token_endpoint_use(st, resource).await {
+            return answer;
+        }
+    }
     let code = match store
-        .consume_authorization_code(&sha256_hex(code), now)
+        .consume_authorization_code(&code_hash, client_id, redirect_uri, &challenge, now)
         .await
     {
         Ok(Some(c)) => c,
-        Ok(None) => return invalid_grant("the code is unknown, used or expired"),
-        Err(e) => return ApiError::Unavailable(e.to_string()).into_response(),
+        Ok(None) => {
+            // Spent already, and presented again with the right client and
+            // verifier: whoever holds it, the grant it became is revoked.
+            match store
+                .replayed_authorization_code(&code_hash, client_id, redirect_uri, &challenge)
+                .await
+            {
+                Ok(Some(grant_id)) => {
+                    if revoke_grant(st, &grant_id, "authorization code replayed")
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!(grant = %grant_id, "oauth: a replayed code's grant was not revoked");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => return store_failure("checking a replayed code", &e),
+            }
+            return invalid_grant(
+                "the code is unknown, used or expired, or was issued to another client, \
+                 redirect URI or verifier",
+            );
+        }
+        Err(e) => return store_failure("spending a code", &e),
     };
-    if code.client_id != client_id || code.redirect_uri != redirect_uri {
-        return invalid_grant("the code was issued to another client or redirect URI");
-    }
     if req.resource.as_deref().is_some_and(|r| r != code.resource) {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -805,17 +926,11 @@ async fn authorization_code_grant(
             "resource is not the one the code was issued for",
         );
     }
-    if !pkce_shaped(verifier) || pkce_s256_challenge(verifier) != code.code_challenge {
-        return invalid_grant("the code verifier does not match the challenge");
-    }
-    let Some((org, id, path)) = parse_resource(&st.public_url, &code.resource) else {
-        return invalid_grant("the code's resource is no longer an endpoint of this server");
-    };
-    if usable_endpoint(st, &org, &id, &path).await.is_err() {
-        return invalid_grant("the plugin endpoint is no longer usable");
+    if let Err((answer, _)) = token_endpoint_use(st, &code.resource).await {
+        return answer;
     }
     let mut grant = OAuthGrant {
-        id: uuid::Uuid::new_v4().simple().to_string(),
+        id: code.grant_id,
         org: code.org,
         installation_id: code.installation_id,
         resource: code.resource,
@@ -830,17 +945,18 @@ async fn authorization_code_grant(
         generation: 0,
         rotated_at: None,
         access_token_id: None,
+        retried: false,
         revoked_at: None,
         revoked_reason: None,
     };
-    let (access, token) = match mint_access_token(st, &grant, now).await {
+    let (access, token) = match mint_access_token(store, &grant, now).await {
         Ok(t) => t,
-        Err(e) => return e.into_response(),
+        Err(e) => return store_failure("storing an access token", &e),
     };
     grant.access_token_id = Some(token.id.clone());
     if let Err(e) = store.put_oauth_grant(&grant).await {
         revoke_access_token(st, Some(&token.id), now).await;
-        return ApiError::Unavailable(e.to_string()).into_response();
+        return store_failure("storing a grant", &e);
     }
     token_response(&access, &token, &refresh_secret(key, &grant.id, 0), now)
 }
@@ -867,7 +983,7 @@ async fn refresh_token_grant(
     let grant = match store.oauth_grant(&grant_id).await {
         Ok(Some(g)) => g,
         Ok(None) => return invalid_grant("the grant is unknown"),
-        Err(e) => return ApiError::Unavailable(e.to_string()).into_response(),
+        Err(e) => return store_failure("reading a grant", &e),
     };
     if grant.client_id != client_id {
         return invalid_grant("the grant belongs to another client");
@@ -883,44 +999,72 @@ async fn refresh_token_grant(
         let _ = revoke_grant(st, &grant.id, "expired").await;
         return invalid_grant("the grant has ended; connect the app again");
     }
-    let Some((org, id, path)) = parse_resource(&st.public_url, &grant.resource) else {
-        return invalid_grant("the grant's resource is no longer an endpoint of this server");
-    };
-    if usable_endpoint(st, &org, &id, &path).await.is_err() {
-        return invalid_grant("the plugin endpoint is no longer usable");
+    // The host the client's document came from must still be one the org
+    // allows: removing it ends the grants of its clients.
+    match store.client_metadata_hosts(&grant.org).await {
+        Ok(hosts) if hosts.iter().any(|h| h.host == grant.client_host) => {}
+        Ok(_) => {
+            let _ = revoke_grant(st, &grant.id, "client metadata host removed").await;
+            return invalid_grant("the org no longer allows this app's host; connect it again");
+        }
+        Err(e) => return store_failure("reading the metadata hosts", &e),
     }
+    match token_endpoint_use(st, &grant.resource).await {
+        Ok(()) => {}
+        Err((answer, true)) => {
+            let _ = revoke_grant(st, &grant.id, "plugin endpoint gone").await;
+            return answer;
+        }
+        // Killed, held or delisted: the grant stays for when it runs again.
+        Err((answer, false)) => return answer,
+    }
+    let current = generation == grant.generation;
     let retry_of_last_rotation = generation + 1 == grant.generation
         && grant
             .rotated_at
             .is_some_and(|at| now - at <= OAUTH_REFRESH_RETRY_WINDOW_MS);
-    if generation != grant.generation && !retry_of_last_rotation {
+    if !current && !retry_of_last_rotation {
         // A refresh secret used again outside the window: whoever holds it
         // is not the client that rotated it. Revoke the grant.
         let _ = revoke_grant(st, &grant.id, "refresh secret reused").await;
         return invalid_grant("the refresh secret was already used; the grant is revoked");
     }
-    let (access, token) = match mint_access_token(st, &grant, now).await {
+    if retry_of_last_rotation && grant.retried {
+        // One retry per rotation. A second one inside the window is refused
+        // without revoking: the client that rotated holds the current secret.
+        return invalid_grant(
+            "the previous refresh secret was already retried; use the latest one",
+        );
+    }
+    let (access, token) = match mint_access_token(store, &grant, now).await {
         Ok(t) => t,
-        Err(e) => return e.into_response(),
+        Err(e) => return store_failure("storing an access token", &e),
     };
-    let (moved, successor) = if generation == grant.generation {
+    let previous = grant.access_token_id.as_deref();
+    let (moved, successor) = if current {
         (
             store
-                .rotate_oauth_grant(&grant.id, generation, &token.id, now)
+                .rotate_oauth_grant(&grant.id, generation, previous, &token.id, now)
                 .await,
             generation + 1,
         )
     } else {
         (
             store
-                .replace_oauth_grant_access_token(&grant.id, grant.generation, &token.id, now)
+                .replace_oauth_grant_access_token(
+                    &grant.id,
+                    grant.generation,
+                    previous,
+                    &token.id,
+                    now,
+                )
                 .await,
             grant.generation,
         )
     };
     match moved {
         Ok(true) => {
-            revoke_access_token(st, grant.access_token_id.as_deref(), now).await;
+            revoke_access_token(st, previous, now).await;
             token_response(
                 &access,
                 &token,
@@ -935,7 +1079,7 @@ async fn refresh_token_grant(
         }
         Err(e) => {
             revoke_access_token(st, Some(&token.id), now).await;
-            ApiError::Unavailable(e.to_string()).into_response()
+            store_failure("moving a grant", &e)
         }
     }
 }
@@ -1163,8 +1307,9 @@ pub(crate) async fn put_client_metadata_host(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Stop reading client metadata documents from `host` for this org. Grants
-/// already made stay until revoked. Administer on the org.
+/// Stop reading client metadata documents from `host` for this org. Every
+/// grant of this org whose client came from the host is revoked with its
+/// access tokens. Administer on the org.
 #[utoipa::path(
     delete,
     path = "/v1/orgs/{org}/oauth/client-metadata-hosts/{host}",
@@ -1174,7 +1319,7 @@ pub(crate) async fn put_client_metadata_host(
     ),
     summary = "Stop allowing a host to serve OAuth client metadata documents",
     responses(
-        (status = 204, description = "removed"),
+        (status = 204, description = "removed; its clients' grants and tokens are revoked"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "not listed, or the OAuth authorization server is off")
     )
@@ -1192,8 +1337,9 @@ pub(crate) async fn delete_client_metadata_host(
         Some(&Scope::Org(org.clone())),
     )
     .await?;
+    let now = st.clock.now().await.0;
     if store
-        .delete_client_metadata_host(&org, &host)
+        .delete_client_metadata_host(&org, &host, now)
         .await
         .map_err(crate::step_up::store_err)?
     {

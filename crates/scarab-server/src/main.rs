@@ -613,6 +613,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pg.clone() as Arc<dyn scarab_identity::StepUpStore>,
             )),
             step_pods,
+            // Expired OAuth authorization codes (ADR-0086 §7), when the
+            // authorization server is on.
+            config
+                .oauth_server
+                .is_some()
+                .then(|| pg.clone() as Arc<dyn scarab_identity::OAuthStore>),
             Duration::from_secs(300),
         );
         if step_pod_sweep_on {

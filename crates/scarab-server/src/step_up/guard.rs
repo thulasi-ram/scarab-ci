@@ -245,6 +245,9 @@ async fn guard_route(table: &[RouteEntry], st: AppState, req: Request, next: Nex
         OrgOf::Path(name) => param(name).map(Scope::Org),
         OrgOf::Query(name) => query_param(name).map(Scope::Org),
         OrgOf::Body(ptr) => body_str(ptr).map(Scope::Org),
+        OrgOf::Resource(ptr) => body_str(ptr)
+            .and_then(|r| crate::oauth_server::parse_resource(&st.public_url, &r))
+            .map(|(org, _, _)| Scope::Org(org)),
         OrgOf::None => None,
     }
     .and_then(|scope| match scope {

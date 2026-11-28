@@ -170,6 +170,28 @@ pub async fn sweep_delegated_calls(
     Ok(handles + journal)
 }
 
+/// Delete expired OAuth authorization codes (ADR-0086 §7): a code lives two
+/// minutes and is never read after, spent or not.
+pub async fn sweep_oauth_authorization_codes(
+    db: &Arc<dyn Db>,
+    store: &dyn scarab_identity::OAuthStore,
+    clock: &Arc<dyn Clock>,
+    owner: &str,
+) -> Result<u64, String> {
+    let lease = db
+        .lease(RETENTION_LEASE, owner, RETENTION_LEASE_TTL_MS)
+        .await
+        .map_err(|e| e.to_string())?;
+    if lease.owner != owner {
+        return Ok(0);
+    }
+    let now = clock.now().await.0;
+    store
+        .delete_expired_authorization_codes(now)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// How long a `pc-*` connection credential must stay unreferenced before
 /// [`sweep_orphaned_connection_secrets`] deletes it: far longer than a bind
 /// takes between writing the secret and writing the binding that names it.
@@ -882,6 +904,7 @@ pub fn spawn_sweeper(
     connection_secrets: Option<Arc<dyn scarab_secrets::SecretProvider>>,
     step_up: Option<StepUpStores>,
     step_pods: Option<crate::step_pods::StepPodSweep>,
+    oauth: Option<Arc<dyn scarab_identity::OAuthStore>>,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -902,6 +925,15 @@ pub fn spawn_sweeper(
                     Ok(0) => {}
                     Ok(n) => tracing::info!(rows = n, "retention: pruned delegated calls"),
                     Err(e) => tracing::warn!(error = %e, "delegated call prune failed"),
+                }
+            }
+            if let Some(oauth) = &oauth {
+                match sweep_oauth_authorization_codes(&db, oauth.as_ref(), &clock, &owner).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!(codes = n, "retention: pruned OAuth authorization codes")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "OAuth authorization code prune failed"),
                 }
             }
             if let Some(plugins) = &plugins {

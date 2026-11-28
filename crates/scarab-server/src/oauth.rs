@@ -146,8 +146,12 @@ pub struct LoginFlow {
     pub link_expires_at: Option<i64>,
 }
 
-/// The longest `next` a login may carry.
-pub const MAX_NEXT_LEN: usize = 512;
+/// The longest `next` a login may carry: long enough for an OAuth
+/// authorization request (`/oauth/authorize?client_id=…&redirect_uri=…&…`)
+/// to survive the sign-in, and short enough that the state cookie, which
+/// holds it base64url-encoded (a third larger) beside the other parts, stays
+/// under the 4096 bytes browsers keep for one cookie.
+pub const MAX_NEXT_LEN: usize = 2048;
 
 /// `next` if it is a safe post-login landing: a relative path that starts
 /// with `/`, not `//` (scheme-relative: another host), with no `\` (which
