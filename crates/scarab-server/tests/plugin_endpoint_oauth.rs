@@ -749,6 +749,27 @@ async fn an_installation_that_cannot_run_answers_503_and_names_nothing_to_a_stra
     let (status, body) = read(send(&w.app, stranger).await).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(!body.contains(NAME) && !body.contains("killed"), "{body}");
+    let prm = protected_resource_metadata_url(PUBLIC, "acme", ID, "mcp")
+        .trim_start_matches(PUBLIC)
+        .to_string();
+    // Anyone can read the protected resource metadata: while the endpoint
+    // cannot run it answers one fixed 503 body, with neither the
+    // installation's name nor its image repository.
+    let metadata = |app: Router| {
+        let req = Request::builder()
+            .uri(prm.clone())
+            .body(Body::empty())
+            .unwrap();
+        async move { read(send(&app, req).await).await }
+    };
+    let fixed = "the plugin endpoint is not running";
+    let (status, body) = metadata(w.app.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "killed: {body}");
+    assert_eq!(body, fixed, "killed");
+    assert!(
+        !body.contains(NAME) && !body.contains(PUBLISHER),
+        "killed: {body}"
+    );
     let (status, body) = call_endpoint(&w.app, &token, "ok").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "killed: {body}");
     PluginStore::set_installation_state(
@@ -764,6 +785,13 @@ async fn an_installation_that_cannot_run_answers_503_and_names_nothing_to_a_stra
 
     let (status, body) = call_endpoint(&w.app_with(&[], true), &token, "ok").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "delisted: {body}");
+    let (status, body) = metadata(w.app_with(&[], true)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "delisted: {body}");
+    assert_eq!(body, fixed, "delisted");
+    assert!(
+        !body.contains(NAME) && !body.contains(PUBLISHER),
+        "delisted: {body}"
+    );
     let (status, _) = call_endpoint(&w.app_with(&[PUBLISHER], false), &token, "ok").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "OAuth server off");
 
@@ -784,6 +812,13 @@ async fn an_installation_that_cannot_run_answers_503_and_names_nothing_to_a_stra
     .unwrap());
     let (status, body) = call_endpoint(&w.app, &token, "ok").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "held: {body}");
+    let (status, body) = metadata(w.app.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "held: {body}");
+    assert_eq!(body, fixed, "held");
+    assert!(
+        !body.contains(NAME) && !body.contains(PUBLISHER),
+        "held: {body}"
+    );
 
     assert!(w.plugin_saw().is_empty());
     w.cleanup().await;
@@ -1267,14 +1302,19 @@ async fn refresh_rotates_allows_one_retry_and_revokes_on_reuse() {
         call_endpoint(&w.app, &a0, "ok").await.0,
         StatusCode::UNAUTHORIZED
     );
-    assert_eq!(call_endpoint(&w.app, &a1, "ok").await.0, StatusCode::OK);
 
+    // a1 is not used: a retry is for a lost response, so its token is unused.
     w.clock.advance(10_000);
     let (status, retried) = refresh(&w.app, &r0).await;
     assert_eq!(status, StatusCode::OK, "{retried}");
     assert_eq!(retried["refresh_token"], json!(r1), "the same successor");
     let a2 = retried["access_token"].as_str().unwrap().to_string();
     assert_ne!(a2, a1);
+    assert_eq!(
+        call_endpoint(&w.app, &a1, "ok").await.0,
+        StatusCode::UNAUTHORIZED,
+        "the retry replaced the first answer's token"
+    );
     assert_eq!(call_endpoint(&w.app, &a2, "ok").await.0, StatusCode::OK);
 
     let (status, again) = refresh(&w.app, &r0).await;
@@ -1302,6 +1342,110 @@ async fn refresh_rotates_allows_one_retry_and_revokes_on_reuse() {
         status,
         StatusCode::BAD_REQUEST,
         "the current secret died with the grant"
+    );
+    w.cleanup().await;
+}
+
+/// The one retry inside 30 s is for a lost response, whose access token the
+/// client never saw. When the token that rotation minted has been used at the
+/// endpoint, the retry is refused and the grant revoked, tokens and current
+/// secret with it.
+#[tokio::test]
+async fn a_retry_after_the_rotation_s_token_was_used_revokes_the_grant() {
+    let Some(w) = world().await else {
+        return;
+    };
+    let (_, r0) = connect(&w, 'u').await;
+    let (status, first) = refresh(&w.app, &r0).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let a1 = first["access_token"].as_str().unwrap().to_string();
+    let r1 = first["refresh_token"].as_str().unwrap().to_string();
+    assert_eq!(call_endpoint(&w.app, &a1, "ok").await.0, StatusCode::OK);
+
+    w.clock.advance(10_000);
+    let (status, answer) = refresh(&w.app, &r0).await;
+    assert_eq!(
+        (status, error_of(&answer)),
+        (StatusCode::BAD_REQUEST, "invalid_grant"),
+        "{answer}"
+    );
+    assert_eq!(
+        call_endpoint(&w.app, &a1, "ok").await.0,
+        StatusCode::UNAUTHORIZED,
+        "the used token went with the grant"
+    );
+    let (status, answer) = refresh(&w.app, &r1).await;
+    assert_eq!(
+        (status, error_of(&answer)),
+        (StatusCode::BAD_REQUEST, "invalid_grant"),
+        "the current secret died with the grant: {answer}"
+    );
+    w.cleanup().await;
+}
+
+/// The code is read before it is spent, and the endpoint and the client's
+/// host are checked first: a killed installation answers 503 and the same
+/// code works once it is enabled again (with the resource named or not); a
+/// host removed after the code was issued is `invalid_grant`.
+#[tokio::test]
+async fn a_code_is_checked_before_it_is_spent() {
+    let Some(w) = world().await else {
+        return;
+    };
+    let set = |state| {
+        PluginStore::set_installation_state(&*w.pg, "acme", NAME, state, "ada", CLOCK_START_MS)
+    };
+    for (seed, with_resource) in [('p', false), ('q', true)] {
+        let v = verifier(seed);
+        let code = consent(&w, &v).await;
+        let resource = resource(ID);
+        let mut pairs = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("client_id", CLIENT),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", v.as_str()),
+        ];
+        if with_resource {
+            pairs.push(("resource", resource.as_str()));
+        }
+        set(InstallationState::Killed).await.unwrap();
+        let (status, answer) = token_call(&w.app, &pairs).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "killed, resource {with_resource}: {answer}"
+        );
+        assert_eq!(error_of(&answer), "temporarily_unavailable");
+        set(InstallationState::Enabled).await.unwrap();
+        let (status, tokens) = token_call(&w.app, &pairs).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the code was not spent by the 503, resource {with_resource}: {tokens}"
+        );
+        let access = tokens["access_token"].as_str().unwrap();
+        assert_eq!(call_endpoint(&w.app, access, "ok").await.0, StatusCode::OK);
+    }
+
+    let v = verifier('r');
+    let code = consent(&w, &v).await;
+    assert_eq!(
+        as_bearer(
+            &w.app,
+            "DELETE",
+            "/v1/orgs/acme/oauth/client-metadata-hosts/claude.ai",
+            &w.ada,
+            None
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, answer) = exchange(&w.app, &code, CLIENT, REDIRECT, &v).await;
+    assert_eq!(
+        (status, error_of(&answer)),
+        (StatusCode::BAD_REQUEST, "invalid_grant"),
+        "{answer}"
     );
     w.cleanup().await;
 }

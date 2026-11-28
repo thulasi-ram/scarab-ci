@@ -7,7 +7,8 @@
 //!
 //! What the server's safety rests on, and so what both must agree on: a
 //! code is spent once, only by its client, redirect URI and challenge, and
-//! only before it expires, and a spent one is recognised when replayed; a
+//! only before it expires, and a spent one is recognised when replayed; it
+//! can be read without being spent, by the same four and expiry; a
 //! rotation and the one retry each move only the generation and access token
 //! they name; a revocation happens once and takes every access token minted
 //! for the grant with it, and so do removing a metadata host and an
@@ -175,7 +176,33 @@ async fn codes_spend_once_only_with_all_four_and_before_expiry(
             None,
             "{why}"
         );
+        assert_eq!(
+            oauth
+                .pending_authorization_code("h1", client, redirect, challenge, 1_500)
+                .await
+                .unwrap(),
+            None,
+            "{why}: not pending for it"
+        );
     }
+    // Reading the code spends nothing, however often it is read.
+    for _ in 0..2 {
+        assert_eq!(
+            oauth
+                .pending_authorization_code("h1", CLIENT, REDIRECT, "challenge-1", 1_500)
+                .await
+                .unwrap(),
+            Some(code("g1", 2_000))
+        );
+    }
+    assert_eq!(
+        oauth
+            .pending_authorization_code("h1", CLIENT, REDIRECT, "challenge-1", 2_000)
+            .await
+            .unwrap(),
+        None,
+        "not pending at its expiry"
+    );
     assert_eq!(
         oauth
             .replayed_authorization_code("h1", CLIENT, REDIRECT, "challenge-1")
@@ -199,6 +226,14 @@ async fn codes_spend_once_only_with_all_four_and_before_expiry(
             .unwrap(),
         None,
         "spent once"
+    );
+    assert_eq!(
+        oauth
+            .pending_authorization_code("h1", CLIENT, REDIRECT, "challenge-1", 1_500)
+            .await
+            .unwrap(),
+        None,
+        "a spent code is not pending"
     );
     assert_eq!(
         oauth
