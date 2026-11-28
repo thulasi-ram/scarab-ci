@@ -12,7 +12,8 @@
 --
 -- What is lost: every connected app. The access tokens grants minted
 -- (`oauth` rows of `api_tokens`) are revoked here, so none outlives its
--- grant; each user consents again after the next upgrade.
+-- grant; each user consents again after the next upgrade. The
+-- `api_tokens.oauth_grant_id` column and its index are dropped.
 --
 -- To go back further, run 0112_revert.sql next, then 0111_revert.sql, then
 -- 0110_revert.sql, then 0109_revert.sql, then 0106_revert.sql, then
@@ -34,6 +35,7 @@ BEGIN
 END
 $$;
 
+ALTER TABLE api_tokens DROP COLUMN IF EXISTS oauth_grant_id;
 DROP TABLE IF EXISTS oauth_grants;
 DROP TABLE IF EXISTS oauth_authorization_codes;
 DROP TABLE IF EXISTS oauth_client_metadata_hosts;
