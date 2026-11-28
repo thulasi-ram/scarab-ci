@@ -3943,6 +3943,10 @@ pub enum PlanReasonDto {
     Regenerate,
     /// A descendant of a regenerate root the target's cascade did not contain.
     RegenerateCascade,
+    /// A Rerun in a Run of fork code (ADR-0086 §9): the released Fork Run
+    /// approval gate, which waits for a release again, or a Step between it
+    /// and the target. A Retry leaves these out.
+    ForkRunApproval,
 }
 
 /// One member of a rerun plan, with its WHY (git-bug 4afaa3e).
@@ -3991,6 +3995,7 @@ fn plan_response(plan: scarab_engine::RerunPlan) -> RerunPlanResponse {
                     scarab_engine::PlanReason::RegenerateCascade => {
                         PlanReasonDto::RegenerateCascade
                     }
+                    scarab_engine::PlanReason::ForkRunApproval => PlanReasonDto::ForkRunApproval,
                 },
                 because_of: s.because_of.map(|b| b.0),
                 is_gate: s.is_gate,

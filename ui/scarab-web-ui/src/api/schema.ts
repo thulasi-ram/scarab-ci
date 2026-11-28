@@ -4858,7 +4858,7 @@ export interface components {
          * @description Why a step is in a rerun plan (git-bug 4afaa3e).
          * @enum {string}
          */
-        PlanReasonDto: "target" | "cascade" | "regenerate" | "regenerate_cascade";
+        PlanReasonDto: "target" | "cascade" | "regenerate" | "regenerate_cascade" | "fork_run_approval";
         /** @description One member of a rerun plan, with its WHY (git-bug 4afaa3e). */
         PlannedStepDto: {
             /**

@@ -13496,7 +13496,8 @@
           "target",
           "cascade",
           "regenerate",
-          "regenerate_cascade"
+          "regenerate_cascade",
+          "fork_run_approval"
         ]
       },
       "PlannedStepDto": {

@@ -30,6 +30,28 @@ function stepsOf(plan: RerunPlan): PlannedStepInfo[] {
   return plan.steps ?? [];
 }
 
+/** The plan as the given button would run it. The server previews a rerun: in
+ * a run of fork code a rerun puts the released Fork Run approval gate back in
+ * front of the step (members with reason `fork_run_approval`). A retry stays
+ * in the current version and leaves them out, so they are dropped here. */
+export function planForKind(plan: RerunPlan, kind: ConfirmKind): RerunPlan {
+  if (kind === "rerun") return plan;
+  const fork = new Set(
+    stepsOf(plan)
+      .filter((s) => s.reason === "fork_run_approval")
+      .map((s) => s.step),
+  );
+  if (fork.size === 0) return plan;
+  const keep = (id: string) => !fork.has(id);
+  const startsFrom = plan.starts_from.filter(keep);
+  return {
+    ...plan,
+    invalidated: plan.invalidated.filter(keep),
+    starts_from: startsFrom.length > 0 ? startsFrom : [plan.target],
+    steps: plan.steps?.filter((s) => keep(s.step)),
+  };
+}
+
 /** Above this many steps the one-sentence form gives way to the grouped list
  * (design §3); any widening forces the list too — regeneration deserves rows. */
 export const LIST_THRESHOLD = 4;
@@ -108,6 +130,11 @@ function rowNote(s: PlannedStepInfo, kind: ConfirmKind): string {
     case "regenerate_cascade":
       note = s.because_of ? `re-runs because ${s.because_of} re-runs` : "re-runs to regenerate";
       break;
+    case "fork_run_approval":
+      note = s.is_gate
+        ? "fork code: an approval does not carry into a new version"
+        : "between the Fork Run approval gate and the step you picked";
+      break;
     default:
       note = s.because_of ? `depends on ${s.because_of}` : "downstream of the target";
   }
@@ -115,15 +142,23 @@ function rowNote(s: PlannedStepInfo, kind: ConfirmKind): string {
   return note;
 }
 
-/** The grouped, execution-ordered list: expired regeneration first (when any),
- * then the rerun the user actually asked for. */
+/** The grouped, execution-ordered list: the Fork Run approval gate and the
+ * steps behind it first (a rerun in a run of fork code), then expired
+ * regeneration (when any), then the rerun the user actually asked for. */
 export function planGroups(plan: RerunPlan, kind: ConfirmKind): PlanGroup[] {
   const steps = stepsOf(plan);
+  const fork = steps.filter((s) => s.reason === "fork_run_approval");
   const regen = steps.filter(
     (s) => s.reason === "regenerate" || s.reason === "regenerate_cascade",
   );
   const asked = steps.filter((s) => s.reason === "target" || s.reason === "cascade");
   const groups: PlanGroup[] = [];
+  if (fork.length > 0) {
+    groups.push({
+      title: `Waits for Fork Run approval again (${fork.length})`,
+      rows: fork.map((s) => ({ step: s.step, note: rowNote(s, kind) })),
+    });
+  }
   if (regen.length > 0) {
     groups.push({
       title: `Regenerating expired inputs (${regen.length})`,
@@ -132,7 +167,7 @@ export function planGroups(plan: RerunPlan, kind: ConfirmKind): PlanGroup[] {
   }
   groups.push({
     title:
-      regen.length > 0
+      regen.length > 0 || fork.length > 0
         ? `Then the ${kind} you asked for (${asked.length})`
         : `The ${kind} you asked for (${asked.length})`,
     rows: asked.map((s) => ({ step: s.step, note: rowNote(s, kind) })),
